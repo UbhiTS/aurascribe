@@ -1,0 +1,16 @@
+.env
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+node_modules/
+frontend/dist/
+frontend/node_modules/
+*.egg-info/
+dist/
+build/
+.DS_Store
+recordings/
+*.wav
+*.mp3
