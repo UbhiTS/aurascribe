@@ -1,6 +1,7 @@
 import type { ReactNode } from "react";
 import { Sidebar, type Page } from "./Sidebar";
 import { Header } from "./Header";
+import type { LLMHealth } from "../lib/useLLMHealth";
 
 type StatusEvent =
   | "loading" | "ready" | "recording" | "processing" | "done" | "error" | "enrolling";
@@ -8,7 +9,11 @@ type StatusEvent =
 interface Props {
   page: Page;
   onNavigate: (p: Page) => void;
-  selectedDeviceName: string | null;
+  wsConnected: boolean;
+  llm: LLMHealth;
+  liveMeetingTitle: string | null;
+  activeAudioDevice: string | null;
+  isRecording: boolean;
   systemStatus: StatusEvent;
   statusMessage: string;
   obsidianConfigured: boolean;
@@ -16,7 +21,8 @@ interface Props {
 }
 
 export function Shell({
-  page, onNavigate, selectedDeviceName,
+  page, onNavigate, wsConnected, llm,
+  liveMeetingTitle, activeAudioDevice, isRecording,
   systemStatus, statusMessage, obsidianConfigured, children,
 }: Props) {
   return (
@@ -24,7 +30,11 @@ export function Shell({
       <Sidebar page={page} onNavigate={onNavigate} />
       <div className="flex-1 flex flex-col min-w-0">
         <Header
-          selectedDeviceName={selectedDeviceName}
+          wsConnected={wsConnected}
+          llm={llm}
+          liveMeetingTitle={liveMeetingTitle}
+          activeAudioDevice={activeAudioDevice}
+          isRecording={isRecording}
           systemStatus={systemStatus}
           statusMessage={statusMessage}
           obsidianConfigured={obsidianConfigured}

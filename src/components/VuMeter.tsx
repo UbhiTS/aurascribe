@@ -57,7 +57,7 @@ export function VuMeter() {
         <div
           key={i}
           className={`w-1 rounded-sm ${barColor(i, i < activeCount)}`}
-          style={{ height: `${10 + (i / (BARS - 1)) * 14}px` }}
+          style={{ height: `${10 + i}px` }}
         />
       ))}
     </div>

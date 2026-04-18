@@ -24,7 +24,7 @@ import aiosqlite
 
 from aurascribe.config import (
     DB_PATH,
-    LM_STUDIO_CONTEXT_TOKENS,
+    LLM_CONTEXT_TOKENS,
     MY_SPEAKER_LABEL,
     PROMPTS_DIR,
 )
@@ -47,7 +47,7 @@ _CHARS_PER_TOKEN = 3.5
 # focus) across many meetings needs generous room — the default `chat()`
 # cap of 2048 truncates mid-JSON. We reserve ~8% of the context window
 # for output, capped sensibly so we don't starve the input on tiny models.
-_DAILY_BRIEF_MAX_TOKENS = max(4096, min(16384, int(LM_STUDIO_CONTEXT_TOKENS * 0.08)))
+_DAILY_BRIEF_MAX_TOKENS = max(4096, min(16384, int(LLM_CONTEXT_TOKENS * 0.08)))
 
 # Reserve for the prompt template, per-meeting headers, summaries, live
 # highlights, action items, and the model's own thinking/output. What's
@@ -55,7 +55,7 @@ _DAILY_BRIEF_MAX_TOKENS = max(4096, min(16384, int(LM_STUDIO_CONTEXT_TOKENS * 0.
 _PROMPT_OVERHEAD_TOKENS = 4000
 _INPUT_BUDGET_TOKENS = max(
     2000,
-    LM_STUDIO_CONTEXT_TOKENS - _DAILY_BRIEF_MAX_TOKENS - _PROMPT_OVERHEAD_TOKENS,
+    LLM_CONTEXT_TOKENS - _DAILY_BRIEF_MAX_TOKENS - _PROMPT_OVERHEAD_TOKENS,
 )
 _TOTAL_TRANSCRIPT_BUDGET = int(_INPUT_BUDGET_TOKENS * _CHARS_PER_TOKEN)
 _MIN_PER_MEETING_TRANSCRIPT = 2000

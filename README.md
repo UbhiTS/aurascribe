@@ -2,7 +2,7 @@
 
 Windows-native, always-on meeting transcription with speaker identification, live AI coaching, and Obsidian integration. Runs entirely locally on your GPU — audio, models, and summaries never leave the machine.
 
-Built as a Tauri 2 desktop app with a Python sidecar. ASR via [faster-whisper](https://github.com/SYSTRAN/faster-whisper) (CTranslate2, bundled CUDA runtime). Speaker diarization via [pyannote.audio](https://github.com/pyannote/pyannote-audio) 3.1. LLM calls (summaries, real-time highlights, daily briefs) go to a local [LM Studio](https://lmstudio.ai) OpenAI-compatible endpoint.
+Built as a Tauri 2 desktop app with a Python sidecar. ASR via [faster-whisper](https://github.com/SYSTRAN/faster-whisper) (CTranslate2, bundled CUDA runtime). Speaker diarization via [pyannote.audio](https://github.com/pyannote/pyannote-audio) 3.1. LLM calls (summaries, real-time highlights, daily briefs) go to any OpenAI-compatible endpoint — [LM Studio](https://lmstudio.ai) locally by default, or point it at OpenAI / OpenRouter / Gemini / Anthropic-compat proxies for frontier models.
 
 ---
 
@@ -29,7 +29,7 @@ Built as a Tauri 2 desktop app with a Python sidecar. ASR via [faster-whisper](h
 ### Daily Brief
 - **End-of-day rollup** — aggregates every meeting on a given date into a single briefing: tl;dr, highlights, decisions, open threads, action items (yours + others'), per-person takeaways, themes, tomorrow's focus, coaching notes.
 - **Auto-refresh** — marked stale and rebuilt in the background whenever a meeting on that date finishes.
-- **Long-context aware** — input budget is tuned to the configured LM Studio context window (default 220k tokens) so a full day of transcripts fits in one call.
+- **Long-context aware** — input budget is tuned to the configured LLM context window (set it in Settings → LLM Provider; long-context models let a full day of transcripts fit in one call).
 
 ### Meeting editing
 - **Rename** — mid-recording or post-hoc; the Obsidian file is moved to the new filename.
@@ -52,7 +52,7 @@ Built as a Tauri 2 desktop app with a Python sidecar. ASR via [faster-whisper](h
 - **Rust** — [rustup](https://rustup.rs) + MSVC Build Tools (for `tauri build`)
 - **Node.js** — 20+
 - **Python** — 3.13 (sidecar targets `>=3.13`)
-- **LM Studio** — running locally with an OpenAI-compatible endpoint at `http://127.0.0.1:1234/v1`. Any model loaded works; long-context models (100k+) unlock the Daily Brief on busy days.
+- **An OpenAI-compatible LLM endpoint**. Works out of the box with [LM Studio](https://lmstudio.ai) locally at `http://127.0.0.1:1234/v1`; swap to OpenAI, OpenRouter, Gemini's OpenAI-compat endpoint, or any frontier provider with a compatible gateway by editing Settings → LLM Provider. Long-context models (100k+) unlock the Daily Brief on busy days.
 - **HuggingFace account** — free token is required to download the pyannote 3.1 pipeline. Accept the model licenses on the HF pages first.
 
 ---
@@ -75,7 +75,7 @@ pip install -e ".\sidecar[all]"
 npm run tauri:dev
 ```
 
-On first launch the app starts with built-in defaults. Open **Settings** in the UI to enter your HuggingFace token, LM Studio endpoint, Obsidian vault path, etc. — everything persists in `config.json` inside the data directory.
+On first launch the app starts with built-in defaults. Open **Settings** in the UI to enter your HuggingFace token, LLM provider endpoint, Obsidian vault path, etc. — everything persists in `config.json` inside the data directory.
 
 The Tauri shell spawns the Python sidecar automatically (see [src-tauri/src/lib.rs](src-tauri/src/lib.rs)). On first run the sidecar downloads the Whisper model (`~/.cache/huggingface` or `%APPDATA%\AuraScribe\models`) and, once you accept the licenses, the pyannote pipeline.
 
@@ -95,7 +95,7 @@ The sidecar's extras are split so you can install only what you need:
 pip install -e ".\sidecar"                # core FastAPI server (no ASR)
 pip install -e ".\sidecar[asr]"           # + faster-whisper, sounddevice
 pip install -e ".\sidecar[diarization]"   # + torch, torchaudio, pyannote
-pip install -e ".\sidecar[llm]"           # + openai SDK for LM Studio
+pip install -e ".\sidecar[llm]"           # + openai SDK (any OpenAI-compat provider)
 pip install -e ".\sidecar[all]"           # everything (recommended)
 pip install -e ".\sidecar[dev]"           # pytest, ruff
 ```
@@ -111,10 +111,10 @@ User-editable knobs (all in Settings UI, persisted to `config.json`):
 | Key | Default | Purpose |
 |---|---|---|
 | `hf_token` | — | HuggingFace token for pyannote downloads |
-| `lm_studio_url` | `http://127.0.0.1:1234/v1` | OpenAI-compatible endpoint |
-| `lm_studio_api_key` | `lm-studio` | LM Studio API key |
-| `lm_studio_model` | `local-model` | Model ID LM Studio should load |
-| `lm_studio_context_tokens` | `220000` | Context budget for Daily Brief |
+| `llm_base_url` | `http://127.0.0.1:1234/v1` | Root of the /v1/chat/completions endpoint |
+| `llm_api_key` | `lm-studio` | Provider API key (any non-empty string for LM Studio) |
+| `llm_model` | `local-model` | Model id the provider expects (e.g. `gpt-4o`, `gemini-2.0-flash`) |
+| `llm_context_tokens` | `4096` | Total context budget of the chosen model |
 | `whisper_model` | `large-v3-turbo` | faster-whisper model id |
 | `whisper_language` | `en` | ISO code or empty for auto-detect |
 | `my_speaker_label` | `Me` | How your enrolled voice is labeled |
@@ -141,7 +141,7 @@ Tauri shell (Rust + WebView2)
     │                                              ├── faster-whisper       (ASR, CTranslate2 + CUDA)
     │                                              ├── pyannote.audio 3.1   (diarization + embeddings)
     │                                              ├── sounddevice / scipy  (mic capture, VAD, chunking)
-    │                                              ├── LM Studio client     (summaries, real-time intel, daily brief)
+    │                                              ├── LLM client           (OpenAI-compat; summaries, real-time intel, daily brief)
     │                                              ├── SQLite (aiosqlite)   (meetings, people, utterances, embeddings)
     │                                              └── Obsidian writer      (Meetings/People/Daily markdown)
     │

@@ -87,6 +87,10 @@ export interface AppStatus {
   is_recording: boolean;
   current_meeting_id: string | null;
   audio_devices: { index: number; name: string; channels: number; host_api?: string }[];
+  // Friendly name of the mic the sidecar is actually pulling from right
+  // now. null when idle. The dropdown in the UI can lie (default-mic, name
+  // mismatch) — this is the authoritative source.
+  active_audio_device: string | null;
 }
 
 export interface DailyBriefDecision {
@@ -132,10 +136,10 @@ export interface DailyBriefData {
 export type ConfigKey =
   | "hf_token"
   | "my_speaker_label"
-  | "lm_studio_url"
-  | "lm_studio_api_key"
-  | "lm_studio_model"
-  | "lm_studio_context_tokens"
+  | "llm_base_url"
+  | "llm_api_key"
+  | "llm_model"
+  | "llm_context_tokens"
   | "whisper_model"
   | "whisper_language"
   | "obsidian_vault"

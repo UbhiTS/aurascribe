@@ -53,34 +53,52 @@ Return one JSON object, no prose, no markdown fences. Schema:
    committed to. `speaker` is their name as it appears in the transcript.
 
 4. **support_intelligence** — the heart of the live coaching. Replace this on
-   every call with 2-5 short, high-value bullet points {self_speaker} can use
-   in the *next 30-60 seconds* of dialog. Forward-looking, not a summary.
+   every call with 2-5 bullets that {self_speaker} can *speak out loud
+   verbatim* in the next 30-60 seconds. Forward-looking, not a summary.
 
-   Good support_intelligence:
-   - Names the specific tools, services, frameworks, products, standards, or
-     numbers most relevant to where the conversation is heading.
-   - Surfaces the strongest counterargument the counterpart is likely to
-     raise next, and how to address it.
-   - Points out a gap in what {self_speaker} has said so far that the
-     counterpart will probably notice.
-   - Suggests a clarifying question {self_speaker} could ask to steer the
-     conversation productively.
+   **HARD RULE — every bullet is a direct quote from {self_speaker}'s mouth
+   to the counterpart.** Write each bullet as the literal sentence
+   {self_speaker} would say. The user reads the bullet and speaks it
+   unchanged — zero mental rewriting.
 
-   Example — if the discussion is about migrating an on-prem app to cloud:
-   - "Mention Cloud Run for stateless containers — fits the workload they
-     described and avoids the GKE complexity they're worried about."
-   - "Cloud SQL Auth Proxy is the cleanest answer to their VPC peering
-     concern; brings up zero-trust posture too."
-   - "They haven't mentioned data residency yet — ask which regions are
-     in scope before recommending a region pair."
-   - "If they push back on cost, the per-request pricing of Cloud Run vs.
-     idle GKE nodes is a strong number to have ready."
+   FORBIDDEN — these are NOT first-person and must never appear:
+   - "Ask them about X" / "Ask how they..." / "Find out whether..."
+   - "Mention X" / "Bring up X" / "Point out X"
+   - "If the conversation shifts to X, do Y" (conditional meta-framing)
+   - "They haven't covered X yet" / "Consider asking..."
+   - Any sentence describing what {self_speaker} *should* do instead of
+     what {self_speaker} *says*.
+
+   REQUIRED — every bullet must:
+   - Start with a word {self_speaker} would actually say ("How", "What",
+     "When", "Have you", "Could we", "I'm wondering", "One thing I want
+     to confirm — ", "Just to make sure we're aligned — ", etc.).
+   - Be speakable in one breath (under 25 words).
+   - Usually be a question. Statements are allowed only when they're
+     something {self_speaker} would naturally say next.
+   - Reference specifics (tools, numbers, standards, names) already
+     present in the conversation, not generic filler.
+
+   Example — discussion is about migrating an on-prem app to cloud:
+   - "Have you considered Cloud Run for the stateless services? It sidesteps
+     the GKE complexity you mentioned."
+   - "What regions are in scope for your data residency requirements?"
+   - "How are you thinking about the VPC peering piece — would Cloud SQL
+     Auth Proxy work for your zero-trust posture?"
+   - "On cost, have you compared per-request pricing against idle GKE node
+     hours for your traffic pattern?"
+
+   Example — discussion is about deepfakes and AI societal impact:
+   - "Which specific societal impacts are you most worried about — elections,
+     financial fraud, something else?"
+   - "How do you see digital provenance standards like C2PA fitting into
+     the mitigations you're considering?"
+   - "What's your view on watermarking at the model layer versus at the
+     capture device?"
 
    Format as a markdown bullet list (lines starting with "- "). Plain text,
-   no headings. Be specific, not generic — "use a load balancer" is useless;
-   "GCP HTTPS Load Balancer with Cloud Armor for the WAF rules they're
-   asking about" is useful. If the conversation is small-talk or you have
-   nothing concrete, return an empty string.
+   no headings. If the conversation is small-talk or you have nothing
+   speakable, return an empty string.
 
 5. Keep every list entry under 25 words. Be concise.
 

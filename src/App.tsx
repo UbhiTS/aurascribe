@@ -9,6 +9,7 @@ import type {
   Utterance,
 } from "./lib/api";
 import { useWebSocket } from "./lib/useWebSocket";
+import { useLLMHealth } from "./lib/useLLMHealth";
 import { Shell } from "./components/Shell";
 import type { Page } from "./components/Sidebar";
 import { LiveFeed } from "./pages/LiveFeed";
@@ -149,7 +150,8 @@ export default function App() {
       }
     }
   }, []);
-  useWebSocket(handleWsMessage);
+  const { connected: wsConnected } = useWebSocket(handleWsMessage);
+  const llm = useLLMHealth();
 
   const handleMeetingStarted = (id: string) => {
     setLiveMeetingId(id);
@@ -168,14 +170,17 @@ export default function App() {
   // (Full check would need a /api/settings/obsidian endpoint.)
   const obsidianConfigured = !!(liveMeeting?.vault_path || reviewMeeting?.vault_path);
 
-  // Device name lookup for the header.
-  const activeDeviceName = appStatus?.audio_devices[0]?.name ?? null;
+  const isRecording = appStatus?.is_recording ?? false;
 
   return (
     <Shell
       page={page}
       onNavigate={setPage}
-      selectedDeviceName={activeDeviceName}
+      wsConnected={wsConnected}
+      llm={llm}
+      liveMeetingTitle={liveMeeting?.title ?? null}
+      activeAudioDevice={appStatus?.active_audio_device ?? null}
+      isRecording={isRecording}
       systemStatus={systemStatus}
       statusMessage={statusMessage}
       obsidianConfigured={obsidianConfigured}

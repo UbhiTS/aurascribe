@@ -113,7 +113,7 @@ for _name in _SEEDED_PROMPTS:
 
 # ── User config (editable via Settings UI) ───────────────────────────────────
 #
-# All user-tunable knobs — LM Studio endpoint, Whisper model, Obsidian vault,
+# All user-tunable knobs — LLM endpoint, Whisper model, Obsidian vault,
 # realtime-intel cadence — persist in config.json inside APP_DATA. Moving the
 # data dir to a new machine carries these over automatically.
 #
@@ -128,10 +128,10 @@ CONFIG_FILE: Path = APP_DATA / "config.json"
 _CONFIG_KEYS = {
     "hf_token",
     "my_speaker_label",
-    "lm_studio_url",
-    "lm_studio_api_key",
-    "lm_studio_model",
-    "lm_studio_context_tokens",
+    "llm_base_url",
+    "llm_api_key",
+    "llm_model",
+    "llm_context_tokens",
     "whisper_model",
     "whisper_language",
     "obsidian_vault",
@@ -139,6 +139,29 @@ _CONFIG_KEYS = {
     "rt_highlights_max_interval_sec",
     "rt_highlights_window_sec",
 }
+
+# One-shot rename of the old LM-Studio-specific keys to provider-agnostic
+# names. Runs every load; once the file is rewritten, the legacy keys are
+# gone and this is a no-op on subsequent loads.
+_LEGACY_KEY_MAP = {
+    "lm_studio_url":            "llm_base_url",
+    "lm_studio_api_key":        "llm_api_key",
+    "lm_studio_model":          "llm_model",
+    "lm_studio_context_tokens": "llm_context_tokens",
+}
+
+
+def _migrate_legacy_keys(data: dict) -> tuple[dict, bool]:
+    changed = False
+    out = dict(data)
+    for old, new in _LEGACY_KEY_MAP.items():
+        if old not in out:
+            continue
+        if new not in out:
+            out[new] = out[old]
+        out.pop(old, None)
+        changed = True
+    return out, changed
 
 
 def load_user_config() -> dict:
@@ -152,7 +175,15 @@ def load_user_config() -> dict:
         return {}
     if not isinstance(data, dict):
         return {}
-    return {k: v for k, v in data.items() if k in _CONFIG_KEYS}
+    migrated, changed = _migrate_legacy_keys(data)
+    if changed:
+        try:
+            CONFIG_FILE.write_text(json.dumps(migrated, indent=2), encoding="utf-8")
+        except Exception:
+            # Can't rewrite the file — in-memory migration still wins so the
+            # running process uses the new keys. Next successful write sticks.
+            pass
+    return {k: v for k, v in migrated.items() if k in _CONFIG_KEYS}
 
 
 def save_user_config(updates: dict) -> dict:
@@ -221,16 +252,20 @@ def _cfg_float(cfg_key: str, default: float) -> float:
 
 # External services --
 HF_TOKEN: str | None = _cfg_optional_str("hf_token")
-LM_STUDIO_URL: str = _cfg_str("lm_studio_url", "http://127.0.0.1:1234/v1")
-LM_STUDIO_API_KEY: str = _cfg_str("lm_studio_api_key", "lm-studio")
-# Which model to ask LM Studio to run for summaries/people-notes. Must be
-# loaded (or auto-loadable) in LM Studio. Overridable per-call.
-LM_STUDIO_MODEL: str = _cfg_str("lm_studio_model", "local-model")
-# Total context window (in tokens) of the loaded LM Studio model. Drives the
+# OpenAI-compatible LLM endpoint. Works with LM Studio, Ollama's OpenAI
+# shim, OpenAI, OpenRouter, Gemini's OpenAI-compat endpoint, Anthropic via
+# a compatible proxy — anything that speaks /v1/chat/completions.
+LLM_BASE_URL: str = _cfg_str("llm_base_url", "http://127.0.0.1:1234/v1")
+LLM_API_KEY: str = _cfg_str("llm_api_key", "lm-studio")
+# Model id sent in every chat-completions call. Must be what the provider
+# expects (e.g. "gpt-4o", "gemini-2.0-flash", or the id your local server
+# reports). Overridable per-call.
+LLM_MODEL: str = _cfg_str("llm_model", "local-model")
+# Total context window (in tokens) of the configured model. Drives the
 # input-size budgeting for long-context calls like the Daily Brief. Bump
-# this when you load a long-context model (e.g. a 220k-token variant);
+# this when you wire up a long-context model (e.g. a 200k+ variant);
 # shrink it for smaller models.
-LM_STUDIO_CONTEXT_TOKENS: int = _cfg_int("lm_studio_context_tokens", 220000)
+LLM_CONTEXT_TOKENS: int = _cfg_int("llm_context_tokens", 4096)
 
 # Obsidian vault root. None = integration disabled (transcripts still saved to DB).
 OBSIDIAN_VAULT: Path | None = _expand(_cfg_optional_str("obsidian_vault"))

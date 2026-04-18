@@ -20,6 +20,6 @@ Then hit `http://127.0.0.1:8765/api/status`.
 ```powershell
 pip install -e '.\sidecar[asr]'          # faster-whisper + audio capture
 pip install -e '.\sidecar[diarization]'  # pyannote (needs PyTorch + CUDA toolkit)
-pip install -e '.\sidecar[llm]'          # OpenAI SDK (LM Studio client)
+pip install -e '.\sidecar[llm]'          # OpenAI SDK (any OpenAI-compat provider)
 pip install -e '.\sidecar[all]'          # everything
 ```

@@ -14,9 +14,9 @@ interface Props {
 }
 
 // Fields grouped into UI sections. Save buttons apply to their own section
-// only — a bad Obsidian path shouldn't block saving LM Studio changes.
+// only — a bad Obsidian path shouldn't block saving LLM changes.
 const SECTION_KEYS = {
-  lmStudio: ["lm_studio_url", "lm_studio_api_key", "lm_studio_model", "lm_studio_context_tokens"] as ConfigKey[],
+  llm: ["llm_base_url", "llm_api_key", "llm_model", "llm_context_tokens"] as ConfigKey[],
   speech: ["whisper_model", "whisper_language", "my_speaker_label"] as ConfigKey[],
   diarization: ["hf_token"] as ConfigKey[],
   obsidian: ["obsidian_vault"] as ConfigKey[],
@@ -24,7 +24,7 @@ const SECTION_KEYS = {
 };
 
 const NUMERIC_KEYS = new Set<ConfigKey>([
-  "lm_studio_context_tokens",
+  "llm_context_tokens",
   "rt_highlights_debounce_sec",
   "rt_highlights_max_interval_sec",
   "rt_highlights_window_sec",
@@ -314,28 +314,29 @@ export function Settings({ appStatus, obsidianConfigured }: Props) {
           )}
         </section>
 
-        {/* ── LM Studio ─────────────────────────────────────────────── */}
+        {/* ── LLM Provider ──────────────────────────────────────────── */}
         <ConfigSection
           icon={<Sparkles size={14} className="text-brand-400" />}
-          title="LM Studio"
-          description="Local LLM used for meeting summaries, live intelligence, and daily briefs."
-          sectionId="lmStudio"
-          keys={SECTION_KEYS.lmStudio}
+          title="LLM Provider"
+          description="OpenAI-compatible endpoint used for summaries, live intelligence, and daily briefs. Works with LM Studio, OpenAI, OpenRouter, Gemini's OpenAI-compat endpoint, Anthropic via a compat proxy, etc."
+          sectionId="llm"
+          keys={SECTION_KEYS.llm}
           isDirty={isDirty}
           savingSection={savingSection}
           sectionErrors={sectionErrors}
           sectionSavedAt={sectionSavedAt}
-          onSave={() => saveSection("lmStudio", SECTION_KEYS.lmStudio)}
+          onSave={() => saveSection("llm", SECTION_KEYS.llm)}
         >
           <ConfigField cfg={cfg} drafts={drafts} onChange={setDraft}
-            k="lm_studio_url" label="Base URL" hint="OpenAI-compatible endpoint from LM Studio's Server tab." />
+            k="llm_base_url" label="Base URL" hint="Root of the /v1/chat/completions endpoint. E.g. http://127.0.0.1:1234/v1 for LM Studio, https://api.openai.com/v1 for OpenAI." />
           <ConfigField cfg={cfg} drafts={drafts} onChange={setDraft}
-            k="lm_studio_api_key" label="API key" type="password" hint="LM Studio accepts any non-empty string by default." />
+            k="llm_api_key" label="API key" type="password" hint="Provider's API key. LM Studio accepts any non-empty string." />
           <ConfigField cfg={cfg} drafts={drafts} onChange={setDraft}
-            k="lm_studio_model" label="Model id" hint="Must be loaded (or auto-loadable) in LM Studio." />
-          <ConfigField cfg={cfg} drafts={drafts} onChange={setDraft}
-            k="lm_studio_context_tokens" label="Context window (tokens)" type="number"
-            hint="Budget used by long-context calls like the Daily Brief." />
+            k="llm_model" label="Model id" hint="The exact id the provider expects (e.g. gpt-4o, gemini-2.0-flash, claude-sonnet-4-6, or the local model id)." />
+          <TokenSlider cfg={cfg} drafts={drafts} onChange={setDraft}
+            k="llm_context_tokens" label="Context window"
+            stops={[4096, 8192, 16384, 32768, 65536, 131072, 524288, 1048576]}
+            hint="Total token budget of the chosen model. Used to size long-context calls like the Daily Brief." />
           <p className="text-[11px] text-gray-500 mt-1">
             Status: {lmModels.length > 0
               ? `${lmModels.length} model(s) reachable — first is ${lmModels[0]}`
@@ -405,10 +406,10 @@ export function Settings({ appStatus, obsidianConfigured }: Props) {
           </p>
         </ConfigSection>
 
-        {/* ── Realtime Intelligence cadence ────────────────────────── */}
+        {/* ── Live Intelligence cadence ────────────────────────────── */}
         <ConfigSection
           icon={<Zap size={14} className="text-amber-400" />}
-          title="Realtime Intelligence"
+          title="Live Intelligence"
           description="How often the live-intel loop refires against the local LLM. Lower debounce = snappier panel, more load."
           sectionId="realtime"
           keys={SECTION_KEYS.realtime}
@@ -606,6 +607,108 @@ function ConfigField({ cfg, drafts, onChange, k, label, type = "text", hint }: C
       {showEffective && (
         <p className="text-[10px] text-gray-500 mt-1 font-mono break-all">
           currently using: {effectiveDisplay}
+        </p>
+      )}
+    </div>
+  );
+}
+
+// Stepped slider for token-count fields. Snaps to a caller-supplied list of
+// stops and writes the stop's exact integer value into drafts, so the save
+// pipeline sees a clean numeric string (no rounding ambiguity from a
+// continuous slider).
+interface TokenSliderProps {
+  cfg: AppConfig | null;
+  drafts: Partial<Record<ConfigKey, string>>;
+  onChange: (k: ConfigKey, v: string) => void;
+  k: ConfigKey;
+  label: string;
+  stops: number[];
+  hint?: string;
+}
+
+function fmtTokens(n: number): string {
+  if (n >= 1_000_000) return `${Math.round(n / 1_048_576)}M`;
+  if (n >= 1_000) return `${Math.round(n / 1024)}k`;
+  return String(n);
+}
+
+function nearestStopIndex(value: number, stops: number[]): number {
+  let best = 0;
+  let bestDiff = Math.abs(stops[0] - value);
+  for (let i = 1; i < stops.length; i++) {
+    const d = Math.abs(stops[i] - value);
+    if (d < bestDiff) { best = i; bestDiff = d; }
+  }
+  return best;
+}
+
+function TokenSlider({ cfg, drafts, onChange, k, label, stops, hint }: TokenSliderProps) {
+  const field = cfg?.settings[k];
+  const draft = drafts[k] ?? "";
+  const overridden = field?.override !== null && field?.override !== undefined;
+  const effective = field?.effective;
+
+  // Prefer the draft (latest user intent); fall back to effective or default
+  // so the slider has a sensible starting position even before the user
+  // touches it.
+  const currentNum = (() => {
+    const fromDraft = draft ? Number(draft) : NaN;
+    if (!Number.isNaN(fromDraft) && fromDraft > 0) return fromDraft;
+    if (typeof effective === "number") return effective;
+    if (typeof field?.default === "number") return field.default;
+    return stops[0];
+  })();
+
+  const idx = nearestStopIndex(currentNum, stops);
+  const snapped = stops[idx];
+  // Surface when the running process is on a non-stop value (e.g. legacy
+  // 220000); the slider alone can't fully represent it, so show the raw
+  // number too so nothing looks silently wrong.
+  const offStop =
+    typeof effective === "number" && !stops.includes(effective);
+
+  return (
+    <div>
+      <div className="flex items-center gap-2 mb-1">
+        <span className="text-[10px] uppercase tracking-wider text-gray-500">{label}</span>
+        {overridden ? (
+          <span className="text-[9px] uppercase tracking-wider text-brand-400 px-1.5 py-0.5 rounded bg-brand-500/10 border border-brand-700/40">
+            custom
+          </span>
+        ) : (
+          <span className="text-[9px] uppercase tracking-wider text-gray-500 px-1.5 py-0.5 rounded bg-gray-800/60 border border-gray-700">
+            default
+          </span>
+        )}
+        <span className="ml-auto text-xs font-mono text-gray-200 tabular-nums">
+          {fmtTokens(snapped)} <span className="text-gray-500">tokens</span>
+        </span>
+      </div>
+      <input
+        type="range"
+        min={0}
+        max={stops.length - 1}
+        step={1}
+        value={idx}
+        disabled={!cfg}
+        onChange={(e) => onChange(k, String(stops[Number(e.target.value)]))}
+        className="w-full accent-brand-500 disabled:opacity-50 cursor-pointer"
+      />
+      <div className="flex justify-between mt-1 px-0.5 text-[10px] font-mono text-gray-500 select-none">
+        {stops.map((s, i) => (
+          <span
+            key={s}
+            className={i === idx ? "text-brand-400" : ""}
+          >
+            {fmtTokens(s)}
+          </span>
+        ))}
+      </div>
+      {hint && <p className="text-[10px] text-gray-500 mt-2">{hint}</p>}
+      {offStop && (
+        <p className="text-[10px] text-gray-500 mt-1 font-mono">
+          currently using: {effective} (not on a stop — save to snap to {fmtTokens(snapped)})
         </p>
       )}
     </div>

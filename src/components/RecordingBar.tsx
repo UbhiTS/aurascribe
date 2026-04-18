@@ -17,6 +17,7 @@ export function RecordingBar({ isRecording, devices, onStarted, onStopped }: Pro
   const [loading, setLoading] = useState(false);
   const [elapsed, setElapsed] = useState(0);
   const timerRef = useState<ReturnType<typeof setInterval> | null>(null);
+  const selectedDeviceName = devices.find((d) => d.index === deviceIndex)?.name ?? null;
 
   const startTimer = () => {
     if (timerRef[0]) clearInterval(timerRef[0]);
@@ -58,7 +59,7 @@ export function RecordingBar({ isRecording, devices, onStarted, onStopped }: Pro
   };
 
   return (
-    <MicAudioProvider>
+    <MicAudioProvider deviceName={selectedDeviceName}>
     <div className={`flex items-center gap-3 px-4 py-3 rounded-xl border transition-all ${
       isRecording ? "bg-red-950/40 border-red-800/50" : "bg-gray-900 border-gray-800"
     }`}>

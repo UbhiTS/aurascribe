@@ -595,10 +595,10 @@ async def put_settings_data_dir(req: DataDirSettings) -> dict:
 _CONFIG_FIELDS: list[tuple[str, object]] = [
     ("hf_token",                       None),
     ("my_speaker_label",               "Me"),
-    ("lm_studio_url",                  "http://127.0.0.1:1234/v1"),
-    ("lm_studio_api_key",              "lm-studio"),
-    ("lm_studio_model",                "local-model"),
-    ("lm_studio_context_tokens",       220000),
+    ("llm_base_url",                   "http://127.0.0.1:1234/v1"),
+    ("llm_api_key",                    "lm-studio"),
+    ("llm_model",                      "local-model"),
+    ("llm_context_tokens",             4096),
     ("whisper_model",                  "large-v3-turbo"),
     ("whisper_language",               "en"),
     ("obsidian_vault",                 None),
@@ -615,10 +615,10 @@ def _effective_for(key: str) -> object:
     readers: dict = {
         "hf_token":                       config.HF_TOKEN,
         "my_speaker_label":               config.MY_SPEAKER_LABEL,
-        "lm_studio_url":                  config.LM_STUDIO_URL,
-        "lm_studio_api_key":              config.LM_STUDIO_API_KEY,
-        "lm_studio_model":                config.LM_STUDIO_MODEL,
-        "lm_studio_context_tokens":       config.LM_STUDIO_CONTEXT_TOKENS,
+        "llm_base_url":                   config.LLM_BASE_URL,
+        "llm_api_key":                    config.LLM_API_KEY,
+        "llm_model":                      config.LLM_MODEL,
+        "llm_context_tokens":             config.LLM_CONTEXT_TOKENS,
         "whisper_model":                  config.WHISPER_MODEL,
         "whisper_language":               config.WHISPER_LANGUAGE,
         "obsidian_vault":                 str(config.OBSIDIAN_VAULT) if config.OBSIDIAN_VAULT else None,
@@ -634,10 +634,10 @@ class UserConfigUpdate(BaseModel):
     # they're changing. None or "" clears the override → default on restart.
     hf_token: str | None = None
     my_speaker_label: str | None = None
-    lm_studio_url: str | None = None
-    lm_studio_api_key: str | None = None
-    lm_studio_model: str | None = None
-    lm_studio_context_tokens: int | None = None
+    llm_base_url: str | None = None
+    llm_api_key: str | None = None
+    llm_model: str | None = None
+    llm_context_tokens: int | None = None
     whisper_model: str | None = None
     whisper_language: str | None = None
     obsidian_vault: str | None = None
@@ -705,6 +705,7 @@ async def get_status() -> dict:
         "is_recording": manager.is_recording,
         "current_meeting_id": manager.current_meeting_id,
         "audio_devices": manager.list_audio_devices(),
+        "active_audio_device": manager.active_device_name,
     }
 
 

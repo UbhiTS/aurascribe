@@ -1,13 +1,18 @@
-import { Cpu, Mic, FolderCheck, FolderX } from "lucide-react";
+import { Brain, FolderCheck, FolderX, Mic, Plug, PlugZap, Radio } from "lucide-react";
+import type { LLMHealth } from "../lib/useLLMHealth";
 
 type StatusEvent =
   | "loading" | "ready" | "recording" | "processing" | "done" | "error" | "enrolling";
 
 interface Props {
-  selectedDeviceName: string | null;
+  wsConnected: boolean;
+  llm: LLMHealth;
+  liveMeetingTitle: string | null;
+  activeAudioDevice: string | null;
+  isRecording: boolean;
+  obsidianConfigured: boolean;
   systemStatus: StatusEvent;
   statusMessage: string;
-  obsidianConfigured: boolean;
 }
 
 function StatusPill({ status, message }: { status: StatusEvent; message: string }) {
@@ -30,32 +35,97 @@ function StatusPill({ status, message }: { status: StatusEvent; message: string 
   );
 }
 
-export function Header({ selectedDeviceName, systemStatus, statusMessage, obsidianConfigured }: Props) {
-  const deviceLabel = selectedDeviceName || "Default";
+export function Header({
+  wsConnected, llm, liveMeetingTitle, activeAudioDevice,
+  isRecording, obsidianConfigured, systemStatus, statusMessage,
+}: Props) {
+  // Provider online when the model list is non-empty. Prefer the configured
+  // model name for display; fall back to whatever the provider reports.
+  const aiLabel = llm.configuredModel || llm.loadedModels[0] || null;
+  const aiMisconfigured = !!(
+    llm.online && llm.configuredModel &&
+    !llm.loadedModels.includes(llm.configuredModel)
+  );
+
   return (
-    <header className="flex items-center gap-4 px-4 py-2.5 border-b border-gray-800 bg-gray-950/80 backdrop-blur-sm flex-shrink-0">
-      <div className="flex items-center gap-2 text-xs text-gray-400">
-        <Cpu size={13} className="text-gray-500" />
-        <span className="text-gray-300">CUDA</span>
-        <span className="text-gray-500">·</span>
-        <span className="text-gray-500">RTX</span>
-      </div>
-      <div className="h-4 w-px bg-gray-800" />
-      <div className="flex items-center gap-1.5 text-xs text-gray-400">
-        <Mic size={13} className="text-gray-500" />
-        <span className="text-gray-300 truncate max-w-[220px]">{deviceLabel}</span>
-      </div>
-      <div className="h-4 w-px bg-gray-800" />
-      <div className="flex items-center gap-1.5 text-xs text-gray-400">
-        {obsidianConfigured
-          ? <FolderCheck size={13} className="text-emerald-400" />
-          : <FolderX size={13} className="text-gray-500" />}
-        <span className="text-gray-300">
-          Obsidian: <span className={obsidianConfigured ? "text-emerald-400" : "text-gray-500"}>{obsidianConfigured ? "Configured" : "Not set"}</span>
+    <header className="flex items-center gap-3 px-4 py-2.5 border-b border-gray-800 bg-gray-950/80 backdrop-blur-sm flex-shrink-0">
+      {/* Sidecar WS connection */}
+      <div
+        className="flex items-center gap-1.5 text-xs"
+        title={wsConnected ? "Sidecar connected" : "Reconnecting to sidecar…"}
+      >
+        {wsConnected
+          ? <PlugZap size={13} className="text-emerald-400" />
+          : <Plug size={13} className="text-amber-400 animate-pulse" />}
+        <span className={wsConnected ? "text-gray-300" : "text-amber-400"}>
+          {wsConnected ? "Sidecar" : "Reconnecting"}
         </span>
       </div>
 
+      <div className="h-4 w-px bg-gray-800" />
+
+      {/* AI model provider */}
+      <div
+        className="flex items-center gap-1.5 text-xs min-w-0"
+        title={
+          llm.online
+            ? aiMisconfigured
+              ? `Configured model "${llm.configuredModel}" not reported by the provider. Available: ${llm.loadedModels.join(", ") || "none"}.`
+              : `AI provider online. Available: ${llm.loadedModels.join(", ") || "none"}.`
+            : "AI provider unreachable — live intelligence and summaries will fail. Check Settings → LLM Provider."
+        }
+      >
+        <Brain
+          size={13}
+          className={
+            !llm.online ? "text-red-400"
+            : aiMisconfigured ? "text-amber-400"
+            : "text-emerald-400"
+          }
+        />
+        <span className={!llm.online ? "text-red-400" : "text-gray-300"}>AI</span>
+        <span className="text-gray-500">·</span>
+        <span className={`truncate max-w-[220px] ${
+          !llm.online ? "text-red-400"
+          : aiMisconfigured ? "text-amber-400"
+          : "text-gray-300"
+        }`}>
+          {llm.online ? (aiLabel ?? "ready") : "offline"}
+        </span>
+      </div>
+
+      {/* Active recording mic — only while recording */}
+      {isRecording && (
+        <>
+          <div className="h-4 w-px bg-gray-800" />
+          <div className="flex items-center gap-1.5 text-xs min-w-0">
+            <Radio size={13} className="text-red-400 animate-pulse flex-shrink-0" />
+            <span className="text-gray-300 truncate max-w-[220px]">
+              {liveMeetingTitle || "Recording…"}
+            </span>
+            <span className="text-gray-500">·</span>
+            <Mic size={12} className="text-gray-500 flex-shrink-0" />
+            <span
+              className="text-gray-400 truncate max-w-[220px]"
+              title={activeAudioDevice ?? "Default mic"}
+            >
+              {activeAudioDevice ?? "Default mic"}
+            </span>
+          </div>
+        </>
+      )}
+
       <div className="flex-1" />
+
+      {/* Obsidian — icon only, detail in tooltip */}
+      <div
+        className="flex items-center"
+        title={obsidianConfigured ? "Obsidian vault configured" : "Obsidian vault not set — meetings won't be written to markdown"}
+      >
+        {obsidianConfigured
+          ? <FolderCheck size={14} className="text-emerald-400" />
+          : <FolderX size={14} className="text-gray-600" />}
+      </div>
 
       <StatusPill status={systemStatus} message={statusMessage} />
     </header>

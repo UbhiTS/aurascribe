@@ -1,4 +1,4 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 
 export type WSMessage =
   | { type: "utterances"; meeting_id: string; data: { id?: string; speaker: string; text: string; start_time: number; end_time: number; match_distance?: number | null }[] }
@@ -7,11 +7,12 @@ export type WSMessage =
 
 type Handler = (msg: WSMessage) => void;
 
-export function useWebSocket(onMessage: Handler) {
+export function useWebSocket(onMessage: Handler): { connected: boolean } {
   // Keep a live reference to the handler so onmessage always calls the
   // latest closure, without needing to reattach.
   const handlerRef = useRef(onMessage);
   handlerRef.current = onMessage;
+  const [connected, setConnected] = useState(false);
 
   useEffect(() => {
     // Using refs here is a trap under React 19 StrictMode — the
@@ -28,6 +29,10 @@ export function useWebSocket(onMessage: Handler) {
       const proto = window.location.protocol === "https:" ? "wss" : "ws";
       socket = new WebSocket(`${proto}://${window.location.host}/ws`);
 
+      socket.onopen = () => {
+        if (!cancelled) setConnected(true);
+      };
+
       socket.onmessage = (e) => {
         try {
           handlerRef.current(JSON.parse(e.data) as WSMessage);
@@ -38,6 +43,7 @@ export function useWebSocket(onMessage: Handler) {
 
       socket.onclose = () => {
         if (cancelled) return;
+        setConnected(false);
         retry = window.setTimeout(connect, 2000);
       };
     };
@@ -50,4 +56,6 @@ export function useWebSocket(onMessage: Handler) {
       socket?.close();
     };
   }, []);
+
+  return { connected };
 }

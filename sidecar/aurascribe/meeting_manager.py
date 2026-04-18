@@ -72,6 +72,10 @@ class MeetingManager:
         self._status_callbacks: list[StatusCallback] = []
         self._running = False
         self._ready = False
+        # Friendly name of the mic currently feeding AudioCapture. None when
+        # idle. Surfaced via /api/status so the UI can show which device is
+        # actually recording, not just what was picked in the dropdown.
+        self._active_device_name: str | None = None
         self._task: asyncio.Task | None = None
         self._spec_task: asyncio.Task | None = None
         self._transcribe_sem = asyncio.Semaphore(1)
@@ -123,6 +127,7 @@ class MeetingManager:
                 await db.execute("DELETE FROM meetings WHERE id = ?", (meeting_id,))
                 await db.commit()
             raise
+        self._active_device_name = self._resolve_device_name(device)
 
         audio_path = AUDIO_DIR / f"{meeting_id}.opus"
         try:
@@ -149,6 +154,7 @@ class MeetingManager:
             raise RuntimeError("No active recording")
 
         self._running = False
+        self._active_device_name = None
         await self.capture.stop()
         self.capture.stop_recording()
         if self._spec_task:
@@ -592,6 +598,29 @@ class MeetingManager:
 
     def list_audio_devices(self) -> list[dict]:
         return self.capture.list_devices()
+
+    def _resolve_device_name(self, device: int | None) -> str | None:
+        """Friendly name for the sounddevice index that was just opened.
+
+        device=None means "OS default" — sounddevice doesn't give a stable
+        name for that synthetic slot, so we resolve it to the physical input
+        it actually bound to. Failures fall back to None rather than killing
+        the recording.
+        """
+        try:
+            import sounddevice as sd
+            if device is None:
+                info = sd.query_devices(kind="input")
+            else:
+                info = sd.query_devices(device, kind="input")
+            name = info.get("name") if isinstance(info, dict) else None
+            return name if isinstance(name, str) and name else None
+        except Exception:
+            return None
+
+    @property
+    def active_device_name(self) -> str | None:
+        return self._active_device_name
 
     @property
     def is_recording(self) -> bool:

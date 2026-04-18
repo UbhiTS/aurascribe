@@ -1,12 +1,17 @@
-"""LM Studio client — all LLM calls route through here.
+"""Provider-agnostic LLM client — all chat-completions calls route through here.
 
 The `openai` package is a soft dep — imported lazily so the sidecar boots even
 when the `[llm]` extra isn't installed. `chat()` raises ImportError in that
 case, which callers translate to 503.
+
+The Python `openai` SDK speaks OpenAI-compatible HTTP, which covers LM Studio,
+Ollama's OpenAI shim, OpenAI itself, OpenRouter, Gemini's OpenAI-compat
+endpoint, and most commercial gateways. Swap providers by pointing
+`llm_base_url` / `llm_api_key` / `llm_model` at the new target in Settings.
 """
 from __future__ import annotations
 
-from aurascribe.config import LM_STUDIO_API_KEY, LM_STUDIO_MODEL, LM_STUDIO_URL
+from aurascribe.config import LLM_API_KEY, LLM_BASE_URL, LLM_MODEL
 
 _client = None
 
@@ -16,7 +21,7 @@ def get_client():
     if _client is None:
         from openai import AsyncOpenAI
 
-        _client = AsyncOpenAI(base_url=LM_STUDIO_URL, api_key=LM_STUDIO_API_KEY)
+        _client = AsyncOpenAI(base_url=LLM_BASE_URL, api_key=LLM_API_KEY)
     return _client
 
 
@@ -32,15 +37,15 @@ async def chat(
     max_tokens: int = 2048,
     temperature: float = 0.3,
 ) -> str:
-    """Single-turn chat. Raises LLMUnavailableError if LM Studio is unreachable.
+    """Single-turn chat. Raises LLMUnavailableError if the provider is unreachable.
 
-    `model` defaults to the `LM_STUDIO_MODEL` env var (see config.py).
+    `model` defaults to the configured `llm_model` (see config.py).
     `max_tokens` caps the response length — callers producing long
     structured output (e.g. daily briefs aggregating many meetings) should
     raise this; otherwise the response gets truncated mid-JSON.
     """
     if model is None:
-        model = LM_STUDIO_MODEL
+        model = LLM_MODEL
     client = get_client()
     messages: list[dict] = []
     if system:
@@ -58,12 +63,12 @@ async def chat(
     except Exception as e:
         msg = str(e).lower()
         if "connect" in msg or "connection" in msg or "refused" in msg:
-            raise LLMUnavailableError(f"LM Studio not reachable at {LM_STUDIO_URL}") from e
+            raise LLMUnavailableError(f"LLM provider not reachable at {LLM_BASE_URL}") from e
         raise
 
 
 async def get_available_models() -> list[str]:
-    """List models currently loaded in LM Studio."""
+    """List models the configured provider reports as available."""
     try:
         client = get_client()
         models = await client.models.list()
