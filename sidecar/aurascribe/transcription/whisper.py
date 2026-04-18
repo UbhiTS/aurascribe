@@ -5,7 +5,7 @@ One pipeline does all the speaker work:
   speaker-turn boundaries + a centroid embedding per detected speaker.
 - We slice audio per turn, run whisper on each slice, and use the
   pipeline's own 256-dim centroid as the embedding — no separate
-  `pyannote/embedding` inference needed. Enrollments use the same
+  `pyannote/embedding` inference needed. Voice tags use the same
   pipeline so every embedding lives in one vector space.
 
 If the pipeline fails to load (licence not accepted, HF_TOKEN missing,
@@ -40,8 +40,13 @@ log = logging.getLogger("aurascribe.whisper")
 _THRESH_MULTI = 0.55
 _THRESH_SOLO = 0.70
 # Ratio test: best speaker must beat second-best by this margin. Rejects
-# ambiguous chunks where two enrolled speakers are near-tied.
+# ambiguous chunks where two voices are near-tied.
 _RATIO_MARGIN = 0.80
+# Min embeddings a Voice needs before it participates in auto-matching. One
+# or two tagged snippets isn't enough signal — the k-NN match is unstable
+# and fires false-positives. Below the gate, a Voice only applies when the
+# user directly tags a line; live auto-ID stays silent until the pool grows.
+_MIN_VOICE_SAMPLES = 3
 
 
 def _valid_embedding(emb) -> bool:
@@ -72,15 +77,15 @@ class WhisperEngine:
         self._model = None
         self._diarization_pipeline = None
         self._enable_speaker_id = enable_speaker_id
-        # {speaker_name: [embedding, ...]} — one name accumulates embeddings
-        # as online learning grows their pool.
-        self._enrolled_pools: dict[str, list[np.ndarray]] = {}
+        # {voice_name: [embedding, ...]} — the pool accumulates tagged
+        # snippets as the user assigns utterances to voices.
+        self._voice_pools: dict[str, list[np.ndarray]] = {}
         self._ready = False
 
     async def load(self) -> None:
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, self._load_sync)
-        await self._load_enrolled()
+        await self._load_voices()
         self._ready = True
 
     def _load_sync(self) -> None:
@@ -115,73 +120,28 @@ class WhisperEngine:
                 )
                 self._diarization_pipeline = None
 
-    async def _load_enrolled(self) -> None:
+    async def _load_voices(self) -> None:
         pools: dict[str, list[np.ndarray]] = {}
         try:
             async with aiosqlite.connect(DB_PATH) as db:
                 cursor = await db.execute(
-                    "SELECT p.name, se.embedding FROM speaker_enrollment se "
-                    "JOIN people p ON p.id = se.person_id"
+                    "SELECT v.name, ve.embedding FROM voice_embeddings ve "
+                    "JOIN voices v ON v.id = ve.voice_id"
                 )
                 async for name, emb_bytes in cursor:
                     if emb_bytes is None:
                         continue
                     pools.setdefault(name, []).append(pickle.loads(emb_bytes))
         except Exception as e:
-            log.warning("Could not load enrolled speakers: %s", e)
-        self._enrolled_pools = pools
+            log.warning("Could not load voices: %s", e)
+        self._voice_pools = pools
         log.info(
-            "Enrolled speakers: %s",
+            "Voices loaded: %s",
             {name: len(pool) for name, pool in pools.items()},
         )
 
-    async def reload_enrolled(self) -> None:
-        await self._load_enrolled()
-
-    async def embed_for_enrollment(self, audio: np.ndarray) -> np.ndarray:
-        """Compute a single enrollment embedding from a recorded sample.
-
-        Runs the diarization pipeline (same one the live loop uses) and
-        returns the centroid of the dominant speaker. Raises if the pipeline
-        isn't available or if no speech is detected.
-        """
-        if self._diarization_pipeline is None:
-            raise RuntimeError(
-                "Diarization pipeline unavailable — enrollment requires it. "
-                f"Accept the license at https://hf.co/{DIARIZATION_MODEL} and set HF_TOKEN."
-            )
-        loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(None, self._embed_for_enrollment_sync, audio)
-
-    def _embed_for_enrollment_sync(self, audio: np.ndarray) -> np.ndarray:
-        import torch
-
-        waveform = torch.from_numpy(audio).unsqueeze(0)
-        result = self._diarization_pipeline(
-            {"waveform": waveform, "sample_rate": SAMPLE_RATE}
-        )
-
-        emb_matrix = getattr(result, "speaker_embeddings", None)
-        source = getattr(result, "speaker_diarization", None)
-        if emb_matrix is None or source is None:
-            raise RuntimeError(
-                "Diarization did not return centroids — pipeline version mismatch."
-            )
-
-        labels = list(source.labels())
-        if not labels:
-            raise RuntimeError(
-                "No speech detected in enrollment sample. Try recording again."
-            )
-
-        # Use the dominant (most-speaking) label's centroid; enrollment audio
-        # is usually single-speaker but pyannote can briefly mis-segment.
-        durations = {lbl: 0.0 for lbl in labels}
-        for segment, _track, lbl in source.itertracks(yield_label=True):
-            durations[lbl] += float(segment.end) - float(segment.start)
-        dominant = max(durations, key=durations.get)
-        idx = labels.index(dominant)
-        return np.asarray(emb_matrix[idx])
+    async def reload_voices(self) -> None:
+        await self._load_voices()
 
     async def transcribe(
         self,
@@ -196,6 +156,81 @@ class WhisperEngine:
         return await loop.run_in_executor(
             None, self._transcribe_sync, audio, on_partial, diarize
         )
+
+    async def diarize_full_audio(
+        self, audio: np.ndarray
+    ) -> list[tuple[float, float, str, float | None]]:
+        """Run pyannote on an entire meeting's audio in one pass.
+
+        Unlike the live path (which runs per VAD chunk), this sees the whole
+        conversation at once — the extra context lets pyannote split clusters
+        it previously merged within a chunk. Used by the Recompute endpoint to
+        re-label past meetings after the Voices DB has grown.
+
+        Returns [(start, end, voice_name_or_Unknown, match_distance)]. Times
+        are in seconds relative to the start of `audio`. The caller maps
+        these onto stored utterances via their `audio_start` field.
+        """
+        if self._diarization_pipeline is None:
+            raise RuntimeError(
+                "Diarization pipeline unavailable — accept the license at "
+                f"https://hf.co/{DIARIZATION_MODEL} and set HF_TOKEN."
+            )
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, self._diarize_full_audio_sync, audio)
+
+    def _diarize_full_audio_sync(
+        self, audio: np.ndarray
+    ) -> list[tuple[float, float, str, float | None]]:
+        import torch
+
+        waveform = torch.from_numpy(audio).unsqueeze(0)
+        result = self._diarization_pipeline(
+            {"waveform": waveform, "sample_rate": SAMPLE_RATE}
+        )
+
+        annotation = result
+        for attr in ("exclusive_speaker_diarization", "speaker_diarization", "annotation"):
+            if hasattr(result, attr):
+                annotation = getattr(result, attr)
+                break
+        if not hasattr(annotation, "itertracks"):
+            log.warning(
+                "Full diarization returned unexpected type %s",
+                type(result).__name__,
+            )
+            return []
+
+        # Resolve each local label to a voice once, using its centroid.
+        label_embeddings: dict[str, np.ndarray] = {}
+        emb_matrix = getattr(result, "speaker_embeddings", None)
+        if emb_matrix is not None:
+            try:
+                source = getattr(result, "speaker_diarization", annotation)
+                labels = list(source.labels())
+                arr = np.asarray(emb_matrix)
+                for i, lbl in enumerate(labels):
+                    if i < arr.shape[0]:
+                        label_embeddings[str(lbl)] = arr[i]
+            except Exception as e:
+                log.warning("Could not harvest full-meeting embeddings: %s", e)
+
+        label_resolution: dict[str, tuple[str, float | None]] = {}
+        for lbl, emb in label_embeddings.items():
+            if not _valid_embedding(emb):
+                label_resolution[lbl] = ("Unknown", None)
+                continue
+            speaker, distance = self._match_speaker(emb)
+            label_resolution[lbl] = (speaker, distance)
+
+        turns: list[tuple[float, float, str, float | None]] = []
+        for segment, _track, label in annotation.itertracks(yield_label=True):
+            start = float(segment.start)
+            end = float(segment.end)
+            speaker, distance = label_resolution.get(str(label), ("Unknown", None))
+            turns.append((start, end, speaker, distance))
+        turns.sort(key=lambda t: t[0])
+        return turns
 
     def _transcribe_sync(
         self,
@@ -405,25 +440,34 @@ class WhisperEngine:
                     on_partial(speaker, text)
         return utterances
 
-    # ── Speaker matching against enrolled pool ────────────────────────────
+    # ── Voice matching ────────────────────────────────────────────────────────
 
     def _match_speaker(self, embedding) -> tuple[str, float | None]:
-        """Match `embedding` against the enrolled pool.
+        """Match `embedding` against the Voices pool.
 
-        Returns (speaker, distance). `distance` is the cosine distance to the
-        winning centroid when we're confident enough to name a speaker; None
-        when the result is "Unknown" (no match).
+        Returns (voice_name, distance). `distance` is the cosine distance to
+        the winning centroid when we're confident enough to name a voice;
+        None when the result is "Unknown" (no match).
+
+        A Voice only participates once it has ≥ _MIN_VOICE_SAMPLES embeddings
+        — fewer than that, the pool isn't stable enough to auto-assign.
         """
-        if not self._enrolled_pools:
+        # Filter voices that haven't passed the min-samples gate. Apply it
+        # before the matching math so an under-gated voice can't win just by
+        # being alone in the pool.
+        eligible: dict[str, list[np.ndarray]] = {
+            name: pool
+            for name, pool in self._voice_pools.items()
+            if len(pool) >= _MIN_VOICE_SAMPLES
+        }
+        if not eligible:
             return "Unknown", None
 
         from scipy.spatial.distance import cosine
 
-        # For each enrolled speaker, take the MIN distance across their pool.
+        # For each eligible voice, take the MIN distance across their pool.
         per_speaker: list[tuple[str, float]] = []
-        for name, pool in self._enrolled_pools.items():
-            if not pool:
-                continue
+        for name, pool in eligible.items():
             best = min(float(cosine(embedding, emb)) for emb in pool)
             per_speaker.append((name, best))
         if not per_speaker:
@@ -441,7 +485,7 @@ class WhisperEngine:
         decision = best_name if matched else "Unknown"
 
         log.info(
-            "speaker-id: per_speaker=%s best=%s dist=%.3f second=%.3f "
+            "voice-match: per_voice=%s best=%s dist=%.3f second=%.3f "
             "thresh=%.2f ratio_margin=%.2f abs=%s ratio=%s -> %s",
             [(n, round(d, 3)) for n, d in per_speaker],
             best_name, best_dist, second_dist, threshold, _RATIO_MARGIN,

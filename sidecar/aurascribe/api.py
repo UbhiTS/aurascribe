@@ -18,6 +18,7 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import aiosqlite
+import numpy as np
 from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
@@ -412,7 +413,7 @@ class SplitMeetingRequest(BaseModel):
 async def split_meeting(meeting_id: str, req: SplitMeetingRequest) -> dict:
     """Split a meeting in two at timestamp `at`.
 
-    Creates a new meeting; moves utterances (and their speaker_enrollment rows)
+    Creates a new meeting; moves utterances (and their voice_embeddings rows)
     with start_time >= at to it, rebasing their timestamps to 0. The original
     meeting keeps utterances before the cut. Both meetings get fresh vault files
     and their summaries cleared (stale post-split).
@@ -467,7 +468,7 @@ async def split_meeting(meeting_id: str, req: SplitMeetingRequest) -> dict:
             (new_meeting_id, shift, shift, meeting_id, req.at),
         )
         await db.execute(
-            "UPDATE speaker_enrollment SET meeting_id = ? "
+            "UPDATE voice_embeddings SET meeting_id = ? "
             "WHERE meeting_id = ? AND utterance_id IN "
             "(SELECT id FROM utterances WHERE meeting_id = ?)",
             (new_meeting_id, meeting_id, new_meeting_id),
@@ -946,55 +947,247 @@ async def open_prompt(req: OpenPromptRequest) -> dict:
     return {"ok": True, "path": abs_target}
 
 
-# ── People + enrollment ──────────────────────────────────────────────────────
+# ── Voices ───────────────────────────────────────────────────────────────────
+#
+# Voices replace the old enroll-first model: speakers are identified over time
+# by tagging utterances in meetings. Each tag folds that utterance's centroid
+# embedding into the Voice's pool, so matching improves with every tag.
+# Unknown clusters in a live meeting surface as provisional "Speaker N" —
+# tagging bulk-assigns every pill in that cluster to the chosen Voice.
+
+_PROVISIONAL_LABEL_RE = re.compile(r"^Speaker \d+$")
+
+# Palette for auto-assigning a Voice color on creation. Cycles by creation
+# order so the first N voices each get a distinct hue.
+_VOICE_COLORS = [
+    "#a78bfa",  # purple
+    "#34d399",  # emerald
+    "#22d3ee",  # cyan
+    "#fbbf24",  # amber
+    "#f472b6",  # pink
+    "#fb7185",  # rose
+    "#2dd4bf",  # teal
+    "#818cf8",  # indigo
+]
 
 
-@app.get("/api/people")
-async def list_people() -> list[dict]:
+async def _next_voice_color(db: aiosqlite.Connection) -> str:
+    cursor = await db.execute("SELECT COUNT(*) FROM voices")
+    row = await cursor.fetchone()
+    n = int(row[0]) if row and row[0] is not None else 0
+    return _VOICE_COLORS[n % len(_VOICE_COLORS)]
+
+
+async def _get_or_create_voice(
+    db: aiosqlite.Connection, name: str
+) -> str:
+    """Return voice_id for `name`, creating the row with a fresh color if new.
+    Works whether or not the caller has set a row_factory — positional [0]
+    access is supported by both tuples and aiosqlite.Row."""
+    cursor = await db.execute("SELECT id FROM voices WHERE name = ?", (name,))
+    row = await cursor.fetchone()
+    if row is not None:
+        return str(row[0])
+    voice_id = str(uuid.uuid4())
+    color = await _next_voice_color(db)
+    now = datetime.now().isoformat()
+    await db.execute(
+        "INSERT INTO voices (id, name, color, created_at, updated_at) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (voice_id, name, color, now, now),
+    )
+    return voice_id
+
+
+@app.get("/api/voices")
+async def list_voices() -> list[dict]:
+    """Every Voice, with aggregate stats. The frontend uses `snippet_count`
+    to render the samples-gate indicator (≥3 = active in auto-match)."""
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
-            "SELECT id, name, vault_path, created_at FROM people ORDER BY name"
+            """
+            SELECT v.id, v.name, v.color, v.created_at, v.updated_at,
+                   COUNT(ve.id) AS snippet_count,
+                   COALESCE(SUM(COALESCE(ve.end_time, 0) - COALESCE(ve.start_time, 0)), 0) AS total_seconds,
+                   MAX(ve.created_at) AS last_tagged_at
+              FROM voices v
+              LEFT JOIN voice_embeddings ve ON ve.voice_id = v.id
+             GROUP BY v.id
+             ORDER BY v.name
+            """
         )
         rows = await cursor.fetchall()
     return [dict(r) for r in rows]
 
 
-class EnrollRequest(BaseModel):
-    name: str
-    duration: float = 10.0
-
-
-@app.post("/api/enroll/start")
-async def enroll_start(req: EnrollRequest) -> dict:
-    try:
-        from aurascribe.audio.enrollment import record_enrollment_sample, save_enrollment
-    except ImportError as e:
-        raise HTTPException(
-            503, f"Enrollment requires the [diarization] extra. Install with: pip install -e .\\sidecar[diarization]. ({e})"
+@app.get("/api/voices/{voice_id}")
+async def get_voice(voice_id: str) -> dict:
+    """Voice detail + every tagged snippet with enough metadata for the UI
+    to play each clip via the existing per-meeting audio endpoint."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            "SELECT id, name, color, created_at, updated_at FROM voices WHERE id = ?",
+            (voice_id,),
         )
-    await _broadcast(
-        {"type": "status", "event": "enrolling", "message": f"Recording {req.duration}s sample for {req.name}..."}
-    )
-    try:
-        audio = await record_enrollment_sample(req.duration)
-        person_id = await save_enrollment(manager.engine, req.name, audio)
-    except Exception as e:
-        # Clear the "enrolling" header status on the way out.
-        await _broadcast({"type": "status", "event": "ready", "message": ""})
-        msg = str(e)
-        if "401" in msg or "Unauthorized" in msg or "gated" in msg.lower() or "GatedRepo" in msg:
-            raise HTTPException(
-                503,
-                "Diarization model could not be downloaded. Set your HuggingFace token in "
-                "Settings → Speaker Diarization and accept the license at "
-                "https://hf.co/pyannote/speaker-diarization-3.1. Then restart the app.",
+        row = await cursor.fetchone()
+        if not row:
+            raise HTTPException(404, "Voice not found")
+        voice = dict(row)
+
+        cursor = await db.execute(
+            """
+            SELECT ve.id, ve.meeting_id, ve.utterance_id, ve.start_time, ve.end_time,
+                   ve.source, ve.created_at,
+                   m.title AS meeting_title, m.started_at AS meeting_started_at,
+                   u.text AS utterance_text, u.audio_start AS audio_start
+              FROM voice_embeddings ve
+              LEFT JOIN meetings m ON m.id = ve.meeting_id
+              LEFT JOIN utterances u ON u.id = ve.utterance_id
+             WHERE ve.voice_id = ?
+             ORDER BY ve.created_at DESC
+            """,
+            (voice_id,),
+        )
+        snippets = [dict(r) for r in await cursor.fetchall()]
+    voice["snippets"] = snippets
+    voice["snippet_count"] = len(snippets)
+    return voice
+
+
+class VoicePatch(BaseModel):
+    name: str | None = None
+    color: str | None = None
+
+
+@app.patch("/api/voices/{voice_id}")
+async def update_voice(voice_id: str, req: VoicePatch) -> dict:
+    """Rename and/or recolor. Rename cascades into utterances.speaker across
+    every meeting so the pills update everywhere. Caller should follow up
+    with a rewrite of affected vault files if that matters."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute("SELECT name FROM voices WHERE id = ?", (voice_id,))
+        row = await cursor.fetchone()
+        if not row:
+            raise HTTPException(404, "Voice not found")
+        old_name = row["name"]
+
+        new_name = req.name.strip() if req.name else None
+        if new_name and new_name != old_name:
+            # Prevent collision with an existing voice.
+            cursor = await db.execute(
+                "SELECT id FROM voices WHERE name = ? AND id != ?", (new_name, voice_id)
             )
-        raise HTTPException(500, f"Enrollment failed: {msg}")
-    await manager.engine.reload_enrolled()
-    # Counterpart to the "enrolling" broadcast above — unsticks the header.
-    await _broadcast({"type": "status", "event": "ready", "message": ""})
-    return {"person_id": person_id, "name": req.name}
+            if await cursor.fetchone() is not None:
+                raise HTTPException(409, f"A voice named '{new_name}' already exists")
+            await db.execute(
+                "UPDATE voices SET name = ?, updated_at = ? WHERE id = ?",
+                (new_name, datetime.now().isoformat(), voice_id),
+            )
+            await db.execute(
+                "UPDATE utterances SET speaker = ? WHERE speaker = ?",
+                (new_name, old_name),
+            )
+
+        if req.color is not None:
+            await db.execute(
+                "UPDATE voices SET color = ?, updated_at = ? WHERE id = ?",
+                (req.color, datetime.now().isoformat(), voice_id),
+            )
+        await db.commit()
+
+    await manager.engine.reload_voices()
+    return {"ok": True}
+
+
+@app.delete("/api/voices/{voice_id}")
+async def delete_voice(voice_id: str) -> dict:
+    """Delete a Voice + all its embeddings. Every utterance previously
+    tagged with this voice's name reverts to 'Unknown'."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute("SELECT name FROM voices WHERE id = ?", (voice_id,))
+        row = await cursor.fetchone()
+        if not row:
+            raise HTTPException(404, "Voice not found")
+        name = row["name"]
+
+        # voice_embeddings has ON DELETE CASCADE, but cascade only fires with
+        # PRAGMA foreign_keys enabled for this connection — set it explicitly.
+        await db.execute("PRAGMA foreign_keys = ON")
+        await db.execute("DELETE FROM voices WHERE id = ?", (voice_id,))
+        await db.execute(
+            "UPDATE utterances SET speaker = 'Unknown' WHERE speaker = ?",
+            (name,),
+        )
+        await db.commit()
+
+    await manager.engine.reload_voices()
+    return {"ok": True}
+
+
+@app.delete("/api/voices/{voice_id}/snippets/{snippet_id}")
+async def delete_voice_snippet(voice_id: str, snippet_id: str) -> dict:
+    """Remove one tagged snippet from a Voice's pool. The utterance itself
+    keeps its speaker label — only the pool entry goes, so future matches
+    rely on the remaining embeddings."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "DELETE FROM voice_embeddings WHERE id = ? AND voice_id = ?",
+            (snippet_id, voice_id),
+        )
+        await db.commit()
+        if cursor.rowcount == 0:
+            raise HTTPException(404, "Snippet not found")
+
+    await manager.engine.reload_voices()
+    return {"ok": True}
+
+
+class VoiceMergeRequest(BaseModel):
+    from_id: str
+    into_id: str
+
+
+@app.post("/api/voices/merge")
+async def merge_voices(req: VoiceMergeRequest) -> dict:
+    """Fold Voice `from_id` into `into_id`: move every embedding over,
+    rewrite every utterance.speaker from the old name to the new, then
+    delete the source Voice. Can't undo in one click — use snippet-delete
+    to back out individual embeddings if needed."""
+    if req.from_id == req.into_id:
+        raise HTTPException(400, "from_id and into_id must differ")
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            "SELECT id, name FROM voices WHERE id IN (?, ?)", (req.from_id, req.into_id)
+        )
+        rows = {r["id"]: r["name"] for r in await cursor.fetchall()}
+        if req.from_id not in rows or req.into_id not in rows:
+            raise HTTPException(404, "One or both voices not found")
+        from_name = rows[req.from_id]
+        into_name = rows[req.into_id]
+
+        await db.execute(
+            "UPDATE voice_embeddings SET voice_id = ? WHERE voice_id = ?",
+            (req.into_id, req.from_id),
+        )
+        await db.execute(
+            "UPDATE utterances SET speaker = ? WHERE speaker = ?",
+            (into_name, from_name),
+        )
+        await db.execute("DELETE FROM voices WHERE id = ?", (req.from_id,))
+        await db.execute(
+            "UPDATE voices SET updated_at = ? WHERE id = ?",
+            (datetime.now().isoformat(), req.into_id),
+        )
+        await db.commit()
+
+    await manager.engine.reload_voices()
+    return {"ok": True, "merged_into": req.into_id}
 
 
 class RenameSpeakerRequest(BaseModel):
@@ -1003,20 +1196,16 @@ class RenameSpeakerRequest(BaseModel):
     new_name: str
 
 
-_PROVISIONAL_LABEL_RE = re.compile(r"^Speaker \d+$")
-
-
 @app.post("/api/meetings/{meeting_id}/rename-speaker")
 async def rename_speaker(meeting_id: str, req: RenameSpeakerRequest) -> dict:
-    """Bulk-rename a speaker across one meeting.
+    """Bulk-tag every pill in a cluster/name within one meeting to a Voice.
 
     Two modes:
-    - Rename provisional ("Speaker N") → real name: creates/finds the person,
-      folds every embedding from matching utterances into their enrollment pool,
-      and drops the provisional label from the in-memory pool so new chunks
-      match via the enrolled matcher.
-    - Rename one real name → another: also updates the `people` row so the
-      enrollment follows.
+    - Provisional ("Speaker N") → Voice: create/find the Voice and fold
+      every matching utterance's embedding into its pool, then drop the
+      provisional label so new chunks match via the Voices matcher.
+    - One Voice name → another (existing or new): cascades the rename
+      through `utterances.speaker` and creates the target Voice if needed.
     """
     new_name = req.new_name.strip()
     if not new_name:
@@ -1026,53 +1215,47 @@ async def rename_speaker(meeting_id: str, req: RenameSpeakerRequest) -> dict:
 
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
+        voice_id = await _get_or_create_voice(db, new_name)
 
         if is_provisional:
             cursor = await db.execute(
-                "SELECT id, embedding FROM utterances "
+                "SELECT id, embedding, start_time, end_time FROM utterances "
                 "WHERE meeting_id = ? AND speaker = ?",
                 (meeting_id, req.old_name),
             )
             matching = await cursor.fetchall()
-
-            cursor = await db.execute("SELECT id FROM people WHERE name = ?", (new_name,))
-            person_row = await cursor.fetchone()
-            if person_row is None:
-                person_id = str(uuid.uuid4())
-                await db.execute(
-                    "INSERT INTO people (id, name, created_at) VALUES (?, ?, ?)",
-                    (person_id, new_name, datetime.now().isoformat()),
-                )
-            else:
-                person_id = str(person_row["id"])
 
             now = datetime.now().isoformat()
             for row in matching:
                 if row["embedding"] is None:
                     continue
                 await db.execute(
-                    "INSERT INTO speaker_enrollment "
-                    "(id, person_id, embedding, utterance_id, meeting_id, created_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?)",
-                    (str(uuid.uuid4()), person_id, row["embedding"], row["id"], meeting_id, now),
+                    "INSERT INTO voice_embeddings "
+                    "(id, voice_id, meeting_id, utterance_id, embedding, "
+                    " start_time, end_time, source, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, 'manual', ?)",
+                    (
+                        str(uuid.uuid4()), voice_id, meeting_id, row["id"],
+                        row["embedding"], row["start_time"], row["end_time"], now,
+                    ),
                 )
 
         await db.execute(
             "UPDATE utterances SET speaker = ? WHERE meeting_id = ? AND speaker = ?",
             (new_name, meeting_id, req.old_name),
         )
-        if not is_provisional:
-            await db.execute(
-                "UPDATE people SET name = ? WHERE name = ?",
-                (new_name, req.old_name),
-            )
+        await db.execute(
+            "UPDATE voices SET updated_at = ? WHERE id = ?",
+            (datetime.now().isoformat(), voice_id),
+        )
         await db.commit()
 
     if is_provisional:
         manager.release_provisional_label(meeting_id, req.old_name)
-    await manager.engine.reload_enrolled()
+    await manager.engine.reload_voices()
     await _rewrite_vault(meeting_id)
-    return {"ok": True}
+    _schedule_recompute_debounced(meeting_id)
+    return {"ok": True, "voice_id": voice_id}
 
 
 class AssignUtteranceSpeakerRequest(BaseModel):
@@ -1084,11 +1267,11 @@ class AssignUtteranceSpeakerRequest(BaseModel):
 async def assign_utterance_speaker(
     meeting_id: str, utterance_id: str, req: AssignUtteranceSpeakerRequest
 ) -> dict:
-    """Assign (or re-assign, or clear) the speaker for one utterance.
+    """Tag (or retag, or clear) one utterance.
 
-    Side-effect: folds this utterance's embedding into the speaker's pool
-    so the matcher improves online. Re-tagging first removes the prior
-    learning tied to this utterance — mistakes are fully undoable.
+    Side-effect: folds this utterance's embedding into the Voice's pool.
+    Retagging first removes any prior learning tied to this utterance so
+    mistakes are fully undoable.
     """
     new_speaker = req.speaker.strip()
     is_clear = not new_speaker or new_speaker.lower() == "unknown"
@@ -1096,7 +1279,8 @@ async def assign_utterance_speaker(
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
-            "SELECT embedding FROM utterances WHERE id = ? AND meeting_id = ?",
+            "SELECT embedding, start_time, end_time FROM utterances "
+            "WHERE id = ? AND meeting_id = ?",
             (utterance_id, meeting_id),
         )
         row = await cursor.fetchone()
@@ -1107,7 +1291,7 @@ async def assign_utterance_speaker(
         # Undo any prior learning from this utterance before applying the
         # new one — guarantees re-tagging mistakes is lossless.
         await db.execute(
-            "DELETE FROM speaker_enrollment WHERE utterance_id = ?",
+            "DELETE FROM voice_embeddings WHERE utterance_id = ?",
             (utterance_id,),
         )
 
@@ -1117,34 +1301,231 @@ async def assign_utterance_speaker(
                 (utterance_id,),
             )
         else:
-            cursor = await db.execute("SELECT id FROM people WHERE name = ?", (new_speaker,))
-            person_row = await cursor.fetchone()
-            if person_row is None:
+            # Find or create the Voice (always, so a tag with no embedding
+            # still registers the name and color).
+            cursor = await db.execute(
+                "SELECT id FROM voices WHERE name = ?", (new_speaker,)
+            )
+            voice_row = await cursor.fetchone()
+            if voice_row is None:
                 if not req.create_if_new:
                     raise HTTPException(
-                        400, f"Speaker '{new_speaker}' not found and create_if_new=false"
+                        400, f"Voice '{new_speaker}' not found and create_if_new=false"
                     )
-                person_id = str(uuid.uuid4())
-                await db.execute(
-                    "INSERT INTO people (id, name, created_at) VALUES (?, ?, ?)",
-                    (person_id, new_speaker, datetime.now().isoformat()),
-                )
+                voice_id = await _get_or_create_voice(db, new_speaker)
             else:
-                person_id = str(person_row["id"])
+                voice_id = str(voice_row["id"])
 
             await db.execute(
                 "UPDATE utterances SET speaker = ? WHERE id = ?",
                 (new_speaker, utterance_id),
             )
             if embedding is not None:
-                enrollment_id = str(uuid.uuid4())
                 await db.execute(
-                    "INSERT INTO speaker_enrollment (id, person_id, embedding, utterance_id, meeting_id, created_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?)",
-                    (enrollment_id, person_id, embedding, utterance_id, meeting_id, datetime.now().isoformat()),
+                    "INSERT INTO voice_embeddings "
+                    "(id, voice_id, meeting_id, utterance_id, embedding, "
+                    " start_time, end_time, source, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, 'manual', ?)",
+                    (
+                        str(uuid.uuid4()), voice_id, meeting_id, utterance_id,
+                        embedding, row["start_time"], row["end_time"],
+                        datetime.now().isoformat(),
+                    ),
                 )
+            await db.execute(
+                "UPDATE voices SET updated_at = ? WHERE id = ?",
+                (datetime.now().isoformat(), voice_id),
+            )
         await db.commit()
 
-    await manager.engine.reload_enrolled()
+    await manager.engine.reload_voices()
     await _rewrite_vault(meeting_id)
+    _schedule_recompute_debounced(meeting_id)
     return {"ok": True, "speaker": "Unknown" if is_clear else new_speaker}
+
+
+# ── Recompute (apply current Voices DB to a past meeting) ────────────────────
+
+
+def _load_meeting_audio_sync(path: Path) -> np.ndarray:
+    """Decode an .opus file to 16kHz float32 mono for pyannote. Runs in an
+    executor — soundfile decoding can take a second on long meetings."""
+    import soundfile as sf
+
+    data, sr = sf.read(str(path), dtype="float32", always_2d=False)
+    if data.ndim > 1:
+        data = data.mean(axis=1)
+    if sr != 16_000:
+        # Meetings recorded by us are already 16kHz, but fall back cleanly
+        # if someone drops in a file from elsewhere.
+        try:
+            from scipy.signal import resample_poly
+            g = np.gcd(sr, 16_000)
+            data = resample_poly(data, 16_000 // g, sr // g).astype(np.float32)
+        except Exception:
+            raise RuntimeError(f"Unexpected sample rate {sr} and scipy unavailable")
+    return np.ascontiguousarray(data, dtype=np.float32)
+
+
+class RecomputeSkipped(Exception):
+    """Raised by _do_recompute when the meeting can't be recomputed — still
+    recording, no audio file, diarization pipeline missing. Carries an HTTP
+    status hint so the endpoint can map it; the debounce path just swallows."""
+
+    def __init__(self, status: int, detail: str) -> None:
+        super().__init__(detail)
+        self.status = status
+        self.detail = detail
+
+
+async def _do_recompute(meeting_id: str) -> dict:
+    """Core recompute logic, shared by the explicit endpoint and the
+    debounced auto-trigger. Raises RecomputeSkipped on precondition failures;
+    successful runs return {turns, updated}."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            "SELECT audio_path, status FROM meetings WHERE id = ?", (meeting_id,)
+        )
+        row = await cursor.fetchone()
+        if not row:
+            raise RecomputeSkipped(404, "Meeting not found")
+        if row["status"] == "recording":
+            raise RecomputeSkipped(400, "Cannot recompute a meeting that is still recording")
+        audio_path_s = row["audio_path"]
+
+    candidates = [Path(audio_path_s)] if audio_path_s else []
+    candidates.append(AUDIO_DIR / f"{meeting_id}.opus")
+    audio_path = next((p for p in candidates if p.exists()), None)
+    if audio_path is None:
+        raise RecomputeSkipped(400, "No audio recording found for this meeting")
+
+    loop = asyncio.get_running_loop()
+    try:
+        audio = await loop.run_in_executor(None, _load_meeting_audio_sync, audio_path)
+    except Exception as e:
+        raise RecomputeSkipped(500, f"Could not decode audio: {e}")
+
+    try:
+        turns = await manager.engine.diarize_full_audio(audio)
+    except RuntimeError as e:
+        raise RecomputeSkipped(503, str(e))
+
+    if not turns:
+        return {"turns": 0, "updated": 0}
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            "SELECT id, audio_start, start_time, end_time FROM utterances "
+            "WHERE meeting_id = ? ORDER BY start_time",
+            (meeting_id,),
+        )
+        utterances = await cursor.fetchall()
+
+        updated = 0
+        for u in utterances:
+            anchor = u["audio_start"]
+            if anchor is None:
+                continue
+            u_start = float(anchor)
+            u_end = u_start + max(0.0, float(u["end_time"]) - float(u["start_time"]))
+            best_speaker = "Unknown"
+            best_distance: float | None = None
+            best_overlap = 0.0
+            for t_start, t_end, speaker, distance in turns:
+                overlap = max(0.0, min(u_end, t_end) - max(u_start, t_start))
+                if overlap > best_overlap:
+                    best_overlap = overlap
+                    best_speaker = speaker
+                    best_distance = distance
+            if best_overlap <= 0.0:
+                best_speaker = "Unknown"
+                best_distance = None
+            await db.execute(
+                "UPDATE utterances SET speaker = ?, match_distance = ? WHERE id = ?",
+                (best_speaker, best_distance, u["id"]),
+            )
+            updated += 1
+        await db.commit()
+
+    await _rewrite_vault(meeting_id)
+    return {"turns": len(turns), "updated": updated}
+
+
+@app.post("/api/meetings/{meeting_id}/recompute")
+async def recompute_meeting_speakers(meeting_id: str) -> dict:
+    """Re-label a meeting's utterances using the current Voices DB.
+
+    Runs full-meeting diarization (not per-chunk like the live path), matches
+    each new turn's centroid against Voices, then rewrites every utterance's
+    speaker by picking the turn that covers its audio_start. Text is never
+    re-ASRed — only the speaker column changes. Finally rewrites the vault
+    file so Obsidian reflects the new tags.
+    """
+    try:
+        result = await _do_recompute(meeting_id)
+    except RecomputeSkipped as e:
+        raise HTTPException(e.status, e.detail)
+    return {"ok": True, **result}
+
+
+# ── Debounced auto-recompute after tagging ───────────────────────────────────
+#
+# When the user tags a pill, we don't recompute immediately — a flurry of
+# tags during a review session would thrash the diarization pipeline. Instead
+# we schedule a single debounced run per meeting: every new tag cancels the
+# pending timer and starts a fresh one, so the actual recompute only fires
+# 10s after the user stops tagging.
+
+_RECOMPUTE_DEBOUNCE_SEC = 10.0
+_recompute_timers: dict[str, asyncio.Task] = {}
+
+
+def _schedule_recompute_debounced(meeting_id: str) -> None:
+    """Kick the debounce timer for `meeting_id`. Replaces any pending task."""
+    existing = _recompute_timers.get(meeting_id)
+    if existing is not None and not existing.done():
+        existing.cancel()
+    _recompute_timers[meeting_id] = asyncio.create_task(
+        _debounced_recompute_job(meeting_id)
+    )
+
+
+async def _debounced_recompute_job(meeting_id: str) -> None:
+    try:
+        await asyncio.sleep(_RECOMPUTE_DEBOUNCE_SEC)
+    except asyncio.CancelledError:
+        # Replaced by a newer schedule call — quietly exit.
+        return
+
+    await _broadcast({"type": "recompute_started", "meeting_id": meeting_id})
+    import logging as _log
+    log = _log.getLogger("aurascribe")
+    try:
+        result = await _do_recompute(meeting_id)
+    except RecomputeSkipped as e:
+        # Precondition failure (still recording, no audio, pipeline missing).
+        # Not worth surfacing — the user is tagging, not asking for recompute.
+        log.info("debounced recompute skipped for %s: %s", meeting_id, e.detail)
+        await _broadcast({
+            "type": "recompute_done",
+            "meeting_id": meeting_id,
+            "skipped": e.detail,
+        })
+        return
+    except Exception as e:
+        log.warning("debounced recompute failed for %s: %s", meeting_id, e, exc_info=True)
+        await _broadcast({
+            "type": "recompute_done",
+            "meeting_id": meeting_id,
+            "error": str(e),
+        })
+        return
+
+    await _broadcast({
+        "type": "recompute_done",
+        "meeting_id": meeting_id,
+        "turns": result["turns"],
+        "updated": result["updated"],
+    })

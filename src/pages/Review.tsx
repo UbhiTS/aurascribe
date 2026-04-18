@@ -1,31 +1,41 @@
-import { useMemo, useState } from "react";
-import { ArrowLeft, Clock, Loader, Pencil, Sparkles, CheckSquare, Square, FileText } from "lucide-react";
+import { useEffect, useMemo, useState } from "react";
+import { ArrowLeft, Clock, Loader, Pencil, Sparkles, CheckSquare, Square, FileText, Wand2 } from "lucide-react";
 import { api } from "../lib/api";
-import type { Meeting, Person } from "../lib/api";
+import type { Meeting, Voice } from "../lib/api";
 import { TranscriptView } from "../components/TranscriptView";
 
 interface Props {
   meeting: Meeting | null;
   meetingId: string | null;
   setMeeting: (m: Meeting | null) => void;
-  enrolled: Person[];
-  onEnrolledChanged: () => void;
+  voices: Voice[];
+  onVoicesChanged: () => void;
   onBack: () => void;
   onMeetingChanged: () => void;  // bump refreshKey so library re-loads
   onOpenMeeting: (id: string) => void;  // navigate to another meeting (e.g. part 2 after split)
+  // Incremented by App when a debounced auto-recompute lands on THIS meeting.
+  // Used to re-fetch transcript utterances without a navigation.
+  externalRefreshTick?: number;
 }
 
 export function Review({
-  meeting, meetingId, setMeeting, enrolled, onEnrolledChanged,
-  onBack, onMeetingChanged, onOpenMeeting,
+  meeting, meetingId, setMeeting, voices, onVoicesChanged,
+  onBack, onMeetingChanged, onOpenMeeting, externalRefreshTick = 0,
 }: Props) {
   const [editingTitle, setEditingTitle] = useState(false);
   const [titleDraft, setTitleDraft] = useState("");
   const [summarizing, setSummarizing] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [recomputing, setRecomputing] = useState(false);
   const [transcriptKey, setTranscriptKey] = useState(0);
 
-  const selfSpeaker = enrolled.find((p) => p.name === "Me")?.name ?? "Me";
+  // When the backend's debounced recompute finishes, App bumps this tick.
+  // Bump our own transcript key so TranscriptView re-fetches utterances.
+  useEffect(() => {
+    if (externalRefreshTick > 0) setTranscriptKey((k) => k + 1);
+  }, [externalRefreshTick]);
+
+  const selfSpeaker = voices.find((v) => v.name === "Me")?.name ?? "Me";
   const actionItems = useMemo(() => parseActionItems(meeting?.action_items ?? null), [meeting]);
   const duration = useMemo(() => {
     if (!meeting?.started_at || !meeting?.ended_at) return null;
@@ -84,6 +94,19 @@ export function Review({
     }
   };
 
+  const handleRecompute = async () => {
+    if (!meetingId || recomputing) return;
+    setRecomputing(true);
+    try {
+      await api.meetings.recompute(meetingId);
+      await reloadMeeting();
+    } catch (e: any) {
+      alert(`Recompute failed: ${e.message ?? e}`);
+    } finally {
+      setRecomputing(false);
+    }
+  };
+
   if (!meeting) {
     return (
       <div className="h-full flex items-center justify-center text-gray-500">
@@ -119,14 +142,25 @@ export function Review({
 
           <div className="ml-auto flex items-center gap-2">
             {meeting.status === "done" && (
-              <button
-                onClick={handleSummarize}
-                disabled={summarizing || busy}
-                className="flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-medium rounded-lg border transition-colors disabled:opacity-50 border-brand-700 text-brand-400 bg-brand-600/10 hover:bg-brand-600/20"
-              >
-                {summarizing ? <Loader size={12} className="animate-spin" /> : <Sparkles size={12} />}
-                AI Summary
-              </button>
+              <>
+                <button
+                  onClick={handleRecompute}
+                  disabled={recomputing || busy || summarizing}
+                  title="Re-run diarization against the current Voices DB — fixes mislabeled or merged speaker pills"
+                  className="flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-medium rounded-lg border transition-colors disabled:opacity-50 border-gray-700 text-gray-300 bg-gray-800/60 hover:border-gray-500 hover:bg-gray-800"
+                >
+                  {recomputing ? <Loader size={12} className="animate-spin" /> : <Wand2 size={12} />}
+                  Recompute voices
+                </button>
+                <button
+                  onClick={handleSummarize}
+                  disabled={summarizing || busy}
+                  className="flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-medium rounded-lg border transition-colors disabled:opacity-50 border-brand-700 text-brand-400 bg-brand-600/10 hover:bg-brand-600/20"
+                >
+                  {summarizing ? <Loader size={12} className="animate-spin" /> : <Sparkles size={12} />}
+                  AI Summary
+                </button>
+              </>
             )}
           </div>
         </div>
@@ -174,8 +208,8 @@ export function Review({
                 livePartial={null}
                 isRecording={false}
                 selfSpeaker={selfSpeaker}
-                enrolled={enrolled}
-                onEnrolledChanged={onEnrolledChanged}
+                voices={voices}
+                onVoicesChanged={onVoicesChanged}
                 editable
                 onTrim={handleTrim}
                 onSplit={handleSplit}

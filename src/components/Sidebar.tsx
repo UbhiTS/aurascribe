@@ -1,7 +1,7 @@
 import { Activity, FolderClosed, Calendar, Settings as SettingsIcon, Users } from "lucide-react";
 import { Logo } from "./Logo";
 
-export type Page = "live" | "library" | "review" | "daily" | "enrollment" | "settings";
+export type Page = "live" | "library" | "review" | "daily" | "voices" | "settings";
 
 interface Props {
   page: Page;
@@ -12,7 +12,7 @@ const NAV: { id: Page; label: string; icon: typeof Activity }[] = [
   { id: "live", label: "Live Feed", icon: Activity },
   { id: "library", label: "Meeting Library", icon: FolderClosed },
   { id: "daily", label: "Daily Briefs", icon: Calendar },
-  { id: "enrollment", label: "Voice Enrollment", icon: Users },
+  { id: "voices", label: "Voices", icon: Users },
   { id: "settings", label: "Settings", icon: SettingsIcon },
 ];
 

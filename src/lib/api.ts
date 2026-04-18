@@ -75,11 +75,41 @@ function safeJsonArray<T>(raw: string | null): T[] {
   }
 }
 
-export interface Person {
+export interface Voice {
   id: string;
   name: string;
-  vault_path: string | null;
+  color: string | null;
   created_at: string;
+  updated_at: string;
+  // Aggregates returned by /api/voices list view.
+  snippet_count: number;
+  total_seconds: number;
+  last_tagged_at: string | null;
+}
+
+export interface VoiceSnippet {
+  id: string;
+  meeting_id: string | null;
+  utterance_id: string | null;
+  start_time: number | null;
+  end_time: number | null;
+  source: "manual" | "auto_match" | "merge";
+  created_at: string;
+  meeting_title: string | null;
+  meeting_started_at: string | null;
+  utterance_text: string | null;
+  // Wall-clock seek offset into the meeting's .opus file for playback.
+  audio_start: number | null;
+}
+
+export interface VoiceDetail {
+  id: string;
+  name: string;
+  color: string | null;
+  created_at: string;
+  updated_at: string;
+  snippet_count: number;
+  snippets: VoiceSnippet[];
 }
 
 export interface AppStatus {
@@ -262,10 +292,32 @@ export const api = {
         method: "POST",
         body: JSON.stringify({ at, new_title: newTitle }),
       }),
+    recompute: (id: string) =>
+      request<{ ok: boolean; turns: number; updated: number }>(
+        `/meetings/${id}/recompute`,
+        { method: "POST" },
+      ),
     audioUrl: (id: string) => `${BASE}/meetings/${id}/audio`,
   },
-  people: {
-    list: () => request<Person[]>("/people"),
+  voices: {
+    list: () => request<Voice[]>("/voices"),
+    get: (id: string) => request<VoiceDetail>(`/voices/${id}`),
+    update: (id: string, patch: { name?: string; color?: string | null }) =>
+      request<{ ok: boolean }>(`/voices/${id}`, {
+        method: "PATCH",
+        body: JSON.stringify(patch),
+      }),
+    delete: (id: string) =>
+      request<{ ok: boolean }>(`/voices/${id}`, { method: "DELETE" }),
+    deleteSnippet: (voiceId: string, snippetId: string) =>
+      request<{ ok: boolean }>(`/voices/${voiceId}/snippets/${snippetId}`, {
+        method: "DELETE",
+      }),
+    merge: (fromId: string, intoId: string) =>
+      request<{ ok: boolean; merged_into: string }>("/voices/merge", {
+        method: "POST",
+        body: JSON.stringify({ from_id: fromId, into_id: intoId }),
+      }),
   },
   llm: {
     models: () => request<{ models: string[] }>("/models"),
@@ -282,13 +334,6 @@ export const api = {
       request<{ ok: boolean; path: string }>("/intel/open-prompt", {
         method: "POST",
         body: JSON.stringify({ filename }),
-      }),
-  },
-  enroll: {
-    start: (name: string, duration?: number) =>
-      request<{ person_id: string; name: string }>("/enroll/start", {
-        method: "POST",
-        body: JSON.stringify({ name, duration: duration ?? 10 }),
       }),
   },
   settings: {

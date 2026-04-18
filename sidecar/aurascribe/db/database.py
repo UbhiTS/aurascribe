@@ -41,21 +41,24 @@ CREATE TABLE IF NOT EXISTS utterances (
     created_at     TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
-CREATE TABLE IF NOT EXISTS people (
+CREATE TABLE IF NOT EXISTS voices (
     id          TEXT PRIMARY KEY,
     name        TEXT NOT NULL UNIQUE,
-    speaker_id  TEXT,
-    vault_path  TEXT,
-    created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+    color       TEXT,
+    created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at  TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
-CREATE TABLE IF NOT EXISTS speaker_enrollment (
-    id          TEXT PRIMARY KEY,
-    person_id   TEXT REFERENCES people(id),
-    embedding   BLOB NOT NULL,
-    utterance_id TEXT REFERENCES utterances(id),
-    meeting_id  TEXT REFERENCES meetings(id),
-    created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+CREATE TABLE IF NOT EXISTS voice_embeddings (
+    id           TEXT PRIMARY KEY,
+    voice_id     TEXT NOT NULL REFERENCES voices(id) ON DELETE CASCADE,
+    meeting_id   TEXT REFERENCES meetings(id) ON DELETE CASCADE,
+    utterance_id TEXT REFERENCES utterances(id) ON DELETE SET NULL,
+    embedding    BLOB NOT NULL,
+    start_time   REAL,
+    end_time     REAL,
+    source       TEXT NOT NULL DEFAULT 'manual',
+    created_at   TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
 CREATE TABLE IF NOT EXISTS schema_meta (
@@ -73,27 +76,76 @@ CREATE TABLE IF NOT EXISTS daily_briefs (
 );
 
 CREATE INDEX IF NOT EXISTS idx_utterances_meeting ON utterances(meeting_id);
-CREATE INDEX IF NOT EXISTS idx_speaker_enrollment_utterance ON speaker_enrollment(utterance_id);
-CREATE INDEX IF NOT EXISTS idx_speaker_enrollment_person ON speaker_enrollment(person_id);
+CREATE INDEX IF NOT EXISTS idx_voice_embeddings_voice ON voice_embeddings(voice_id);
+CREATE INDEX IF NOT EXISTS idx_voice_embeddings_meeting ON voice_embeddings(meeting_id);
+CREATE INDEX IF NOT EXISTS idx_voice_embeddings_utterance ON voice_embeddings(utterance_id);
 """
 
 # Current embedding dimension produced by the speaker pipeline. When the DB's
-# stored value doesn't match, we drop all embedding data (enrollments + stored
-# per-utterance embeddings) since cross-dim comparison isn't meaningful.
+# stored value doesn't match, we drop all embedding data since cross-dim
+# comparison isn't meaningful.
 _CURRENT_EMBEDDING_DIM = "256"
+
+# Schema generation. Bump when the table shape changes in a way that prior
+# data can't be carried across. On mismatch we DROP the legacy tables so a
+# fresh schema can be created from scratch — meetings, utterances, voices
+# all get wiped. This is a single-user personal app; migrations aren't
+# worth the engineering cost.
+_CURRENT_SCHEMA_VERSION = "voices-1"
 
 
 async def init_db() -> None:
     async with aiosqlite.connect(DB_PATH) as db:
+        # Foreign keys off by default in SQLite — turn them on so the
+        # ON DELETE CASCADE/SET NULL clauses on voice_embeddings actually
+        # fire when a meeting or voice is deleted.
+        await db.execute("PRAGMA foreign_keys = ON")
+
+        # Schema-version gate. On a version bump, drop every table that
+        # might be shaped differently and let the schema block below
+        # recreate them cleanly. Only `schema_meta` survives.
+        cursor = await db.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='schema_meta'"
+        )
+        has_meta = await cursor.fetchone() is not None
+        stored_version: str | None = None
+        if has_meta:
+            cursor = await db.execute(
+                "SELECT value FROM schema_meta WHERE key = 'schema_version'"
+            )
+            row = await cursor.fetchone()
+            stored_version = row[0] if row else None
+
+        if stored_version != _CURRENT_SCHEMA_VERSION:
+            # Drop in child-before-parent order so FK constraints don't bite.
+            for table in (
+                "voice_embeddings",
+                "speaker_enrollment",  # legacy
+                "utterances",
+                "voices",
+                "people",              # legacy
+                "meetings",
+                "daily_briefs",
+            ):
+                await db.execute(f"DROP TABLE IF EXISTS {table}")
+
         for statement in SCHEMA.split(";"):
             s = statement.strip()
             if s:
                 await db.execute(s)
 
+        await db.execute(
+            "INSERT OR REPLACE INTO schema_meta (key, value) VALUES ('schema_version', ?)",
+            (_CURRENT_SCHEMA_VERSION,),
+        )
+        await db.execute(
+            "INSERT OR REPLACE INTO schema_meta (key, value) VALUES ('embedding_dim', ?)",
+            (_CURRENT_EMBEDDING_DIM,),
+        )
+
         # Crash-recovery reconciliation. If the sidecar was killed mid-meeting
         # (taskkill, crash, power loss), the row is still status='recording'.
-        # The utterances that made it to disk are the truth — finalize the
-        # row with ended_at = last utterance's timestamp.
+        # Finalize with ended_at = last utterance's timestamp.
         await db.execute(
             """
             UPDATE meetings
@@ -107,43 +159,5 @@ async def init_db() -> None:
              WHERE status = 'recording'
             """
         )
-
-        # Idempotent column adds for forward-only schema changes on existing
-        # DBs (CREATE TABLE IF NOT EXISTS doesn't touch existing tables).
-        cursor = await db.execute("PRAGMA table_info(utterances)")
-        utterance_cols = {row[1] async for row in cursor}
-        if "match_distance" not in utterance_cols:
-            await db.execute("ALTER TABLE utterances ADD COLUMN match_distance REAL")
-        if "audio_start" not in utterance_cols:
-            await db.execute("ALTER TABLE utterances ADD COLUMN audio_start REAL")
-
-        cursor = await db.execute("PRAGMA table_info(meetings)")
-        meeting_cols = {row[1] async for row in cursor}
-        for col in (
-            "live_highlights",
-            "live_action_items_self",
-            "live_action_items_others",
-            "live_support_intelligence",
-            "live_support_intelligence_history",
-            "audio_path",
-        ):
-            if col not in meeting_cols:
-                await db.execute(f"ALTER TABLE meetings ADD COLUMN {col} TEXT")
-
-        # Embedding-dimension migration. If the stored dimension doesn't match
-        # what the current pipeline produces, wipe the old-dim data — mixing
-        # dimensions makes cosine-distance comparisons crash.
-        cursor = await db.execute(
-            "SELECT value FROM schema_meta WHERE key = 'embedding_dim'"
-        )
-        row = await cursor.fetchone()
-        stored_dim = row[0] if row else None
-        if stored_dim != _CURRENT_EMBEDDING_DIM:
-            await db.execute("DELETE FROM speaker_enrollment")
-            await db.execute("UPDATE utterances SET embedding = NULL")
-            await db.execute(
-                "INSERT OR REPLACE INTO schema_meta (key, value) VALUES ('embedding_dim', ?)",
-                (_CURRENT_EMBEDDING_DIM,),
-            )
 
         await db.commit()

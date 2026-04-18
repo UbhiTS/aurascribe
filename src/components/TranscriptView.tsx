@@ -4,7 +4,7 @@ import {
   ArrowUpToLine, ArrowDownToLine, Play, Pause,
 } from "lucide-react";
 import { api } from "../lib/api";
-import type { Person, Utterance } from "../lib/api";
+import type { Utterance, Voice } from "../lib/api";
 import { Avatar } from "./Avatar";
 
 // Distance threshold below which we consider a speaker match confident enough
@@ -87,8 +87,8 @@ interface Props {
   livePartial: { speaker: string; text: string } | null;
   isRecording: boolean;
   selfSpeaker?: string;  // name that should render right-aligned (yours)
-  enrolled?: Person[];
-  onEnrolledChanged?: () => void;
+  voices?: Voice[];
+  onVoicesChanged?: () => void;
   editable?: boolean;    // show trim/split tools on each bubble
   onTrim?: (opts: { before?: number; after?: number }) => Promise<void> | void;
   onSplit?: (at: number) => Promise<void> | void;
@@ -97,7 +97,7 @@ interface Props {
 
 export function TranscriptView({
   meetingId, liveUtterances, livePartial, isRecording,
-  selfSpeaker = "Me", enrolled = [], onEnrolledChanged,
+  selfSpeaker = "Me", voices = [], onVoicesChanged,
   editable = false, onTrim, onSplit, refreshToken = 0,
 }: Props) {
   const [utterances, setUtterances] = useState<Utterance[]>([]);
@@ -264,8 +264,8 @@ export function TranscriptView({
     // Provisional labels ("Speaker 1", "Speaker 2"...) always rename in bulk:
     // the user is telling us who the mystery speaker is, so every line tagged
     // with that number should flip — and the embeddings get folded into the
-    // new person's enrollment so future chunks match automatically. Clearing
-    // to "Unknown" stays per-utterance (single-line fix, not "forget them").
+    // Voice so future chunks match automatically. Clearing to "Unknown" stays
+    // per-utterance (single-line fix, not "forget them").
     const isProvisional = /^Speaker \d+$/.test(oldSpeaker);
     const isClear = !speaker || speaker.toLowerCase() === "unknown";
     const idSet = new Set(utteranceIds);
@@ -284,7 +284,7 @@ export function TranscriptView({
           prev.map((u) => (u.id === anchor ? { ...u, speaker: res.speaker } : u))
         );
       } else {
-        // Enrolled assignment on a merged bubble — apply to every underlying
+        // Voice assignment on a merged bubble — apply to every underlying
         // utterance so the whole pill flips (and every embedding folds in).
         for (const id of utteranceIds) {
           await api.meetings.assignSpeaker(meetingId, id, speaker);
@@ -298,7 +298,7 @@ export function TranscriptView({
     }
     setAssignOpen(null);
     setNewSpeakerDraft("");
-    onEnrolledChanged?.();
+    onVoicesChanged?.();
   };
 
   // Hooks must run unconditionally; keep this above any early returns.
@@ -338,7 +338,7 @@ export function TranscriptView({
               key={anchorId ?? i}
               u={anchor}
               mine={g.speaker === selfSpeaker}
-              enrolled={enrolled}
+              voices={voices}
               selfSpeaker={selfSpeaker}
               assignOpen={anchorId !== undefined && assignOpen === anchorId}
               onOpenAssign={() =>
@@ -394,7 +394,7 @@ export function TranscriptView({
 interface BubbleProps {
   u: Utterance;
   mine: boolean;
-  enrolled: Person[];
+  voices: Voice[];
   selfSpeaker: string;
   assignOpen: boolean;
   onOpenAssign: () => void;
@@ -415,7 +415,7 @@ interface BubbleProps {
 }
 
 function Bubble({
-  u, mine, enrolled, selfSpeaker, assignOpen,
+  u, mine, voices, selfSpeaker, assignOpen,
   onOpenAssign, onAssign, newSpeakerDraft, onNewSpeakerDraft,
   editable, toolsOpen, onOpenTools, onTrimBefore, onTrimAfter, onSplitHere,
   isFirst, isLast, canPlay, isPlaying, onTogglePlay,
@@ -514,17 +514,17 @@ function Bubble({
               <div className="px-2 py-1 text-[10px] uppercase tracking-wider text-gray-500">
                 {/^Speaker \d+$/.test(u.speaker) ? `Tag all ${u.speaker} lines as` : "Assign this line to"}
               </div>
-              {enrolled.length === 0 && (
-                <div className="px-2 py-2 text-xs text-gray-500 italic">No enrolled speakers yet</div>
+              {voices.length === 0 && (
+                <div className="px-2 py-2 text-xs text-gray-500 italic">No voices yet — add one below</div>
               )}
-              {enrolled.map((p) => (
+              {voices.map((v) => (
                 <button
-                  key={p.id}
-                  onClick={() => onAssign(p.name)}
+                  key={v.id}
+                  onClick={() => onAssign(v.name)}
                   className="w-full text-left px-2 py-1 text-sm rounded hover:bg-gray-800 flex items-center gap-2"
                 >
-                  <Avatar name={p.name} size="xs" />
-                  <span className={p.name === selfSpeaker ? "text-brand-400" : ""}>{p.name}</span>
+                  <Avatar name={v.name} size="xs" />
+                  <span className={v.name === selfSpeaker ? "text-brand-400" : ""}>{v.name}</span>
                 </button>
               ))}
               <button
@@ -542,7 +542,7 @@ function Bubble({
                     onKeyDown={(e) => {
                       if (e.key === "Enter" && newSpeakerDraft.trim()) onAssign(newSpeakerDraft.trim());
                     }}
-                    placeholder="New speaker"
+                    placeholder="New voice"
                     className="flex-1 text-sm bg-transparent outline-none text-gray-200 py-1"
                   />
                   {newSpeakerDraft.trim() && (

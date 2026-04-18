@@ -40,7 +40,7 @@ PartialCallback = Callable[[str, str], None]  # (speaker, partial_text)
 
 class TranscriptionEngine(Protocol):
     async def load(self) -> None: ...
-    async def reload_enrolled(self) -> None: ...
+    async def reload_voices(self) -> None: ...
     async def transcribe(
         self,
         audio: np.ndarray,
@@ -59,7 +59,7 @@ class StubEngine:
     async def load(self) -> None:
         self._ready = True
 
-    async def reload_enrolled(self) -> None:
+    async def reload_voices(self) -> None:
         pass
 
     async def transcribe(

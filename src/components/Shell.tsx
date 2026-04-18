@@ -4,14 +4,13 @@ import { Header } from "./Header";
 import type { LLMHealth } from "../lib/useLLMHealth";
 
 type StatusEvent =
-  | "loading" | "ready" | "recording" | "processing" | "done" | "error" | "enrolling";
+  | "loading" | "ready" | "recording" | "processing" | "done" | "error";
 
 interface Props {
   page: Page;
   onNavigate: (p: Page) => void;
   wsConnected: boolean;
   llm: LLMHealth;
-  liveMeetingTitle: string | null;
   activeAudioDevice: string | null;
   isRecording: boolean;
   systemStatus: StatusEvent;
@@ -22,7 +21,7 @@ interface Props {
 
 export function Shell({
   page, onNavigate, wsConnected, llm,
-  liveMeetingTitle, activeAudioDevice, isRecording,
+  activeAudioDevice, isRecording,
   systemStatus, statusMessage, obsidianConfigured, children,
 }: Props) {
   return (
@@ -32,7 +31,6 @@ export function Shell({
         <Header
           wsConnected={wsConnected}
           llm={llm}
-          liveMeetingTitle={liveMeetingTitle}
           activeAudioDevice={activeAudioDevice}
           isRecording={isRecording}
           systemStatus={systemStatus}

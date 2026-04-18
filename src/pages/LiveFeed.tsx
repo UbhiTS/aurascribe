@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { Sparkles, Loader, Pencil, CheckSquare, Square, RefreshCw, Lightbulb } from "lucide-react";
-import type { AppStatus, LiveIntel, Meeting, Person, Utterance } from "../lib/api";
+import type { AppStatus, LiveIntel, Meeting, Utterance, Voice } from "../lib/api";
 import { api } from "../lib/api";
 import { RecordingBar } from "../components/RecordingBar";
 import { TranscriptView } from "../components/TranscriptView";
@@ -15,8 +15,8 @@ interface Props {
   livePartial: { speaker: string; text: string } | null;
   liveIntel: LiveIntel;
   intelTick: number;
-  enrolled: Person[];
-  onEnrolledChanged: () => void;
+  voices: Voice[];
+  onVoicesChanged: () => void;
   onMeetingStarted: (id: string) => void;
   onMeetingStopped: () => void;
   bumpRefreshKey: () => void;
@@ -24,7 +24,7 @@ interface Props {
 
 export function LiveFeed({
   appStatus, meeting, setMeeting, meetingId,
-  liveUtterances, livePartial, liveIntel, intelTick, enrolled, onEnrolledChanged,
+  liveUtterances, livePartial, liveIntel, intelTick, voices, onVoicesChanged,
   onMeetingStarted, onMeetingStopped, bumpRefreshKey,
 }: Props) {
   const [editingTitle, setEditingTitle] = useState(false);
@@ -33,8 +33,8 @@ export function LiveFeed({
   const [refreshingIntel, setRefreshingIntel] = useState(false);
 
   const isRecording = appStatus?.is_recording ?? false;
-  // Self speaker name = whatever's enrolled with id matching — default "Me".
-  const selfSpeaker = enrolled.find((p) => p.name === "Me")?.name ?? "Me";
+  // Self speaker name — default "Me" unless a Voice has been tagged as such.
+  const selfSpeaker = voices.find((v) => v.name === "Me")?.name ?? "Me";
 
   const handleRenameTitle = async () => {
     if (!meetingId || !titleDraft.trim()) { setEditingTitle(false); return; }
@@ -139,8 +139,8 @@ export function LiveFeed({
                 livePartial={livePartial}
                 isRecording={isRecording}
                 selfSpeaker={selfSpeaker}
-                enrolled={enrolled}
-                onEnrolledChanged={onEnrolledChanged}
+                voices={voices}
+                onVoicesChanged={onVoicesChanged}
               />
             </div>
           </div>

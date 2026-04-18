@@ -5,8 +5,8 @@ import type {
   AppStatus,
   LiveIntel,
   Meeting,
-  Person,
   Utterance,
+  Voice,
 } from "./lib/api";
 import { useWebSocket } from "./lib/useWebSocket";
 import { useLLMHealth } from "./lib/useLLMHealth";
@@ -15,12 +15,12 @@ import type { Page } from "./components/Sidebar";
 import { LiveFeed } from "./pages/LiveFeed";
 import { MeetingLibrary } from "./pages/MeetingLibrary";
 import { Review } from "./pages/Review";
-import { Enrollment } from "./pages/Enrollment";
+import { Voices } from "./pages/Voices";
 import { DailyBrief } from "./pages/DailyBrief";
 import { Settings } from "./pages/Settings";
 
 type StatusEvent =
-  | "loading" | "ready" | "recording" | "processing" | "done" | "error" | "enrolling";
+  | "loading" | "ready" | "recording" | "processing" | "done" | "error";
 
 export default function App() {
   const [page, setPage] = useState<Page>("live");
@@ -41,7 +41,11 @@ export default function App() {
   const [statusMessage, setStatusMessage] = useState("Loading models...");
   const [systemStatus, setSystemStatus] = useState<StatusEvent>("loading");
   const [refreshKey, setRefreshKey] = useState(0);
-  const [enrolled, setEnrolled] = useState<Person[]>([]);
+  const [voices, setVoices] = useState<Voice[]>([]);
+  // Bumped whenever the sidecar finishes an auto-recompute for the currently
+  // selected review meeting. Review passes this into TranscriptView so the
+  // transcript re-fetches even though the meeting id didn't change.
+  const [reviewRecomputeTick, setReviewRecomputeTick] = useState(0);
   // Pushed by WS whenever the daily brief for a given date changes state.
   // DailyBrief watches this and refetches when the date matches its view.
   const [dailyBriefSignal, setDailyBriefSignal] = useState<
@@ -100,10 +104,10 @@ export default function App() {
     return () => { cancelled = true; };
   }, []);
 
-  const refreshEnrolled = useCallback(() => {
-    api.people.list().then(setEnrolled).catch(() => {});
+  const refreshVoices = useCallback(() => {
+    api.voices.list().then(setVoices).catch(() => {});
   }, []);
-  useEffect(() => { refreshEnrolled(); }, [refreshEnrolled]);
+  useEffect(() => { refreshVoices(); }, [refreshVoices]);
 
   const handleWsMessage = useCallback((msg: any) => {
     if (msg.type === "partial_utterance" && msg.meeting_id === liveMeetingIdRef.current) {
@@ -127,6 +131,23 @@ export default function App() {
         supportIntelligence: typeof msg.support_intelligence === "string" ? msg.support_intelligence : "",
       });
       setIntelTick((t) => t + 1);
+    }
+    if (msg.type === "recompute_done" && typeof msg.meeting_id === "string") {
+      // The debounced auto-recompute just landed. Refetch the affected
+      // meeting so whatever pane is showing it picks up the new speakers.
+      const mid = msg.meeting_id;
+      if (mid === liveMeetingIdRef.current) {
+        api.meetings.get(mid).then(setLiveMeeting).catch(() => {});
+      }
+      // Review has its own id state — if it matches, refetch + bump the
+      // transcript tick so TranscriptView re-fetches utterances too.
+      setReviewMeetingId((currentId) => {
+        if (currentId === mid) {
+          api.meetings.get(mid).then(setReviewMeeting).catch(() => {});
+          setReviewRecomputeTick((t) => t + 1);
+        }
+        return currentId;
+      });
     }
     if (msg.type === "daily_brief_updated" && typeof msg.date === "string") {
       setDailyBriefSignal((prev) => ({
@@ -159,11 +180,15 @@ export default function App() {
     setLivePartial(null);
     setLiveIntel(EMPTY_LIVE_INTEL);
     setAppStatus((s) => s ? { ...s, is_recording: true, current_meeting_id: id } : s);
+    // Hand-patching the local status above leaves `active_audio_device`
+    // stale — the initial /api/status polling stopped once engine_ready.
+    // Pull fresh so the header reflects the mic the sidecar actually opened.
+    api.status().then(setAppStatus).catch(() => {});
     setRefreshKey((k) => k + 1);
   };
 
   const handleMeetingStopped = () => {
-    setAppStatus((s) => s ? { ...s, is_recording: false, current_meeting_id: null } : s);
+    setAppStatus((s) => s ? { ...s, is_recording: false, current_meeting_id: null, active_audio_device: null } : s);
   };
 
   // Heuristic: if the current live or review meeting has a vault_path, Obsidian is writing.
@@ -178,7 +203,6 @@ export default function App() {
       onNavigate={setPage}
       wsConnected={wsConnected}
       llm={llm}
-      liveMeetingTitle={liveMeeting?.title ?? null}
       activeAudioDevice={appStatus?.active_audio_device ?? null}
       isRecording={isRecording}
       systemStatus={systemStatus}
@@ -195,8 +219,8 @@ export default function App() {
           livePartial={livePartial}
           liveIntel={liveIntel}
           intelTick={intelTick}
-          enrolled={enrolled}
-          onEnrolledChanged={refreshEnrolled}
+          voices={voices}
+          onVoicesChanged={refreshVoices}
           onMeetingStarted={handleMeetingStarted}
           onMeetingStopped={handleMeetingStopped}
           bumpRefreshKey={() => setRefreshKey((k) => k + 1)}
@@ -216,15 +240,16 @@ export default function App() {
           meeting={reviewMeeting}
           meetingId={reviewMeetingId}
           setMeeting={setReviewMeeting}
-          enrolled={enrolled}
-          onEnrolledChanged={refreshEnrolled}
+          voices={voices}
+          onVoicesChanged={refreshVoices}
           onBack={() => setPage("library")}
           onMeetingChanged={() => setRefreshKey((k) => k + 1)}
           onOpenMeeting={(id) => { setReviewMeetingId(id); }}
+          externalRefreshTick={reviewRecomputeTick}
         />
       )}
-      {page === "enrollment" && (
-        <Enrollment enrolled={enrolled} onEnrolledChanged={refreshEnrolled} />
+      {page === "voices" && (
+        <Voices voices={voices} onVoicesChanged={refreshVoices} />
       )}
       {page === "daily" && <DailyBrief signal={dailyBriefSignal} />}
       {page === "settings" && <Settings appStatus={appStatus} obsidianConfigured={obsidianConfigured} />}
