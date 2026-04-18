@@ -24,10 +24,20 @@ class LLMUnavailableError(Exception):
     pass
 
 
-async def chat(prompt: str, system: str = "", model: str | None = None) -> str:
+async def chat(
+    prompt: str,
+    system: str = "",
+    model: str | None = None,
+    *,
+    max_tokens: int = 2048,
+    temperature: float = 0.3,
+) -> str:
     """Single-turn chat. Raises LLMUnavailableError if LM Studio is unreachable.
 
     `model` defaults to the `LM_STUDIO_MODEL` env var (see config.py).
+    `max_tokens` caps the response length — callers producing long
+    structured output (e.g. daily briefs aggregating many meetings) should
+    raise this; otherwise the response gets truncated mid-JSON.
     """
     if model is None:
         model = LM_STUDIO_MODEL
@@ -41,8 +51,8 @@ async def chat(prompt: str, system: str = "", model: str | None = None) -> str:
         response = await client.chat.completions.create(
             model=model,
             messages=messages,
-            temperature=0.3,
-            max_tokens=2048,
+            temperature=temperature,
+            max_tokens=max_tokens,
         )
         return response.choices[0].message.content.strip()
     except Exception as e:

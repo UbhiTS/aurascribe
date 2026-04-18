@@ -25,6 +25,11 @@ LM_STUDIO_API_KEY: str = os.environ.get("LM_STUDIO_API_KEY", "lm-studio")
 # Which model to ask LM Studio to run for summaries/people-notes. Must be
 # loaded (or auto-loadable) in LM Studio. Overridable per-call.
 LM_STUDIO_MODEL: str = os.environ.get("LM_STUDIO_MODEL", "local-model")
+# Total context window (in tokens) of the loaded LM Studio model. Drives the
+# input-size budgeting for long-context calls like the Daily Brief. Bump
+# this when you load a long-context model (e.g. a 220k-token variant);
+# shrink it for smaller models. Overridable via env for per-machine tuning.
+LM_STUDIO_CONTEXT_TOKENS: int = int(os.environ.get("LM_STUDIO_CONTEXT_TOKENS", "220000"))
 
 # Obsidian vault root. None = integration disabled (transcripts still saved to DB).
 OBSIDIAN_VAULT: Path | None = _expand(os.environ.get("OBSIDIAN_VAULT"))

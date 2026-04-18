@@ -14,17 +14,18 @@ import subprocess
 import sys
 import uuid
 from contextlib import asynccontextmanager
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import aiosqlite
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from aurascribe import __version__
 from aurascribe.config import DB_PATH
 from aurascribe.db.database import init_db
+from aurascribe.llm import daily_brief as daily_brief_mod
 from aurascribe.llm.client import LLMUnavailableError, chat, get_available_models
 from aurascribe.llm.prompts import MEETING_SUMMARY_SYSTEM, format_transcript, meeting_summary_prompt
 from aurascribe.meeting_manager import MeetingManager
@@ -66,6 +67,11 @@ async def lifespan(app: FastAPI):
 
     async def on_status(event: str, data: dict) -> None:
         await _broadcast({"type": "status", "event": event, **data})
+        # Meeting finished → the Daily Brief for that meeting's date is now
+        # stale. Mark + regenerate in the background so the user's next
+        # visit to the Daily Briefs page is already fresh.
+        if event == "done" and data.get("meeting_id"):
+            asyncio.create_task(_regen_brief_for_meeting(data["meeting_id"]))
 
     manager.on_utterance(on_utterance)
     manager.on_partial(on_partial)
@@ -522,10 +528,153 @@ async def intel_prompt_path() -> dict:
     return {"path": str(_ensure_prompt_file())}
 
 
+# ── Daily Brief ──────────────────────────────────────────────────────────────
+
+
+async def _regen_brief_for_meeting(meeting_id: str) -> None:
+    """Find the date a meeting belongs to, mark that day's brief stale, and
+    rebuild it. Broadcasts `daily_brief_updated` on completion so the UI
+    refetches automatically. All failures are swallowed — this is a
+    best-effort background task."""
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                "SELECT started_at FROM meetings WHERE id = ?", (meeting_id,)
+            )
+            row = await cursor.fetchone()
+        if row is None or not row["started_at"]:
+            return
+        brief_date = daily_brief_mod.date_of_iso(row["started_at"])
+    except Exception as e:
+        import logging as _log
+        _log.getLogger("aurascribe").warning(
+            "daily_brief: could not resolve date for meeting %s: %s", meeting_id, e
+        )
+        return
+
+    await daily_brief_mod.mark_stale(brief_date)
+    await _broadcast({
+        "type": "daily_brief_updated",
+        "date": brief_date,
+        "status": "refreshing",
+    })
+    try:
+        result = await daily_brief_mod.build_brief(brief_date)
+    except LLMUnavailableError as e:
+        import logging as _log
+        _log.getLogger("aurascribe").info(
+            "daily_brief: LLM unavailable while regenerating %s: %s", brief_date, e
+        )
+        await _broadcast({
+            "type": "daily_brief_updated",
+            "date": brief_date,
+            "status": "stale",
+        })
+        return
+    except Exception as e:
+        import logging as _log
+        _log.getLogger("aurascribe").warning(
+            "daily_brief: regen failed for %s: %s", brief_date, e, exc_info=True
+        )
+        await _broadcast({
+            "type": "daily_brief_updated",
+            "date": brief_date,
+            "status": "stale",
+        })
+        return
+    await _broadcast({
+        "type": "daily_brief_updated",
+        "date": brief_date,
+        "status": "ready",
+        "generated_at": result.get("generated_at"),
+    })
+
+
+@app.get("/api/daily-brief")
+async def get_daily_brief(date_param: str | None = Query(None, alias="date")) -> dict:
+    """Return the cached brief for `date` (defaults to today). Fast — does
+    NOT call the LLM. If the brief is missing or marked stale, the UI can
+    trigger `/api/daily-brief/refresh` to rebuild it."""
+    brief_date = date_param or daily_brief_mod.today_str()
+    try:
+        date.fromisoformat(brief_date)
+    except ValueError:
+        raise HTTPException(400, f"Invalid date (expected YYYY-MM-DD): {brief_date}")
+
+    cached = await daily_brief_mod.get_cached(brief_date)
+    # Still report the meeting count for the date even if no brief exists yet
+    # — lets the UI say "2 meetings on this day, tap refresh to build brief".
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            "SELECT id, title, started_at, ended_at, status FROM meetings "
+            "WHERE started_at >= ? AND started_at < date(?, '+1 day') "
+            "ORDER BY started_at",
+            (brief_date, brief_date),
+        )
+        meetings = [dict(r) for r in await cursor.fetchall()]
+
+    return {
+        "date": brief_date,
+        "brief": cached.get("brief") if cached else None,
+        "meeting_count": len(meetings),
+        "meeting_ids": cached.get("meeting_ids", []) if cached else [],
+        "meetings": meetings,
+        "generated_at": cached.get("generated_at") if cached else None,
+        "is_stale": cached.get("is_stale", True) if cached else True,
+        "exists": cached is not None and cached.get("brief") is not None,
+    }
+
+
+@app.post("/api/daily-brief/refresh")
+async def refresh_daily_brief(date_param: str | None = Query(None, alias="date")) -> dict:
+    """Force regeneration of the brief for `date`. Blocks until complete.
+    Broadcasts `daily_brief_updated` on the way out so any other clients
+    refresh too."""
+    brief_date = date_param or daily_brief_mod.today_str()
+    try:
+        date.fromisoformat(brief_date)
+    except ValueError:
+        raise HTTPException(400, f"Invalid date (expected YYYY-MM-DD): {brief_date}")
+
+    await _broadcast({
+        "type": "daily_brief_updated",
+        "date": brief_date,
+        "status": "refreshing",
+    })
+    try:
+        result = await daily_brief_mod.build_brief(brief_date)
+    except LLMUnavailableError as e:
+        await _broadcast({
+            "type": "daily_brief_updated",
+            "date": brief_date,
+            "status": "stale",
+        })
+        raise HTTPException(503, str(e))
+
+    await _broadcast({
+        "type": "daily_brief_updated",
+        "date": brief_date,
+        "status": "ready",
+        "generated_at": result.get("generated_at"),
+    })
+    return {
+        "date": brief_date,
+        "brief": result["brief"],
+        "meeting_count": result["meeting_count"],
+        "meeting_ids": result["meeting_ids"],
+        "generated_at": result["generated_at"],
+        "is_stale": False,
+        "exists": True,
+    }
+
+
 # Friendly display names for the prompt files we know about. Anything else in
 # PROMPTS_DIR is shown with its raw filename so the user can still find it.
 _PROMPT_LABELS = {
     "realtime_highlights.md": "Real-Time Highlights",
+    "daily_brief.md": "Daily Brief",
 }
 
 

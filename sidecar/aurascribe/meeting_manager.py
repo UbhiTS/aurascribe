@@ -250,19 +250,18 @@ class MeetingManager:
         """Delete the vault file named after `(started_at, title)`, if any.
 
         Called when a mid-recording rename leaves a stale file behind. Safe
-        even if the file doesn't exist.
+        even if the file doesn't exist. Uses the shared path helper so it
+        agrees with the writer on where a given meeting lives.
         """
-        from aurascribe.config import VAULT_MEETINGS
+        from aurascribe.obsidian.writer import meeting_file_path
 
-        if VAULT_MEETINGS is None:
+        path = meeting_file_path(started_at, title)
+        if path is None or not path.exists():
             return
-        filename = f"{started_at.strftime('%Y-%m-%d')} {title}.md"
-        path = VAULT_MEETINGS / filename
-        if path.exists():
-            try:
-                path.unlink()
-            except Exception as e:
-                log.warning("Could not delete stale vault file %s: %s", path, e)
+        try:
+            path.unlink()
+        except Exception as e:
+            log.warning("Could not delete stale vault file %s: %s", path, e)
 
     async def _speculative_loop(self, meeting_id: str) -> None:
         """Every 1.5s, transcribe the last 4s of audio for live partial display."""
@@ -467,7 +466,7 @@ class MeetingManager:
                     speaker_lines = "\n".join(u.text for u in utterances if u.speaker == speaker)
                     existing = await self._get_existing_person_note(speaker)
                     updated = await chat(people_notes_prompt(speaker, existing, speaker_lines))
-                    await update_person_note(speaker, updated, title)
+                    await update_person_note(speaker, updated, title, started_at)
             except Exception as e:
                 log.warning(f"LLM unavailable — transcript saved without summary: {e}")
         else:

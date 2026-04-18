@@ -61,6 +61,15 @@ CREATE TABLE IF NOT EXISTS schema_meta (
     value TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS daily_briefs (
+    date          TEXT PRIMARY KEY,
+    brief_json    TEXT,
+    meeting_ids   TEXT NOT NULL DEFAULT '[]',
+    meeting_count INTEGER NOT NULL DEFAULT 0,
+    generated_at  TEXT,
+    is_stale      INTEGER NOT NULL DEFAULT 1
+);
+
 CREATE INDEX IF NOT EXISTS idx_utterances_meeting ON utterances(meeting_id);
 CREATE INDEX IF NOT EXISTS idx_speaker_enrollment_utterance ON speaker_enrollment(utterance_id);
 CREATE INDEX IF NOT EXISTS idx_speaker_enrollment_person ON speaker_enrollment(person_id);

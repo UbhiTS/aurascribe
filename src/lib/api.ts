@@ -84,6 +84,54 @@ export interface AppStatus {
   audio_devices: { index: number; name: string; channels: number; host_api?: string }[];
 }
 
+export interface DailyBriefDecision {
+  decision: string;
+  context: string;
+}
+
+export interface DailyBriefActionSelf {
+  item: string;
+  due: string;
+  source: string;
+  priority: "high" | "medium" | "low";
+}
+
+export interface DailyBriefActionOther {
+  speaker: string;
+  item: string;
+  due: string;
+  source: string;
+}
+
+export interface DailyBriefPerson {
+  name: string;
+  takeaway: string;
+}
+
+export interface DailyBriefData {
+  tldr: string;
+  highlights: string[];
+  decisions: DailyBriefDecision[];
+  action_items_self: DailyBriefActionSelf[];
+  action_items_others: DailyBriefActionOther[];
+  open_threads: string[];
+  people: DailyBriefPerson[];
+  themes: string[];
+  tomorrow_focus: string[];
+  coaching: string[];
+}
+
+export interface DailyBriefResponse {
+  date: string;
+  brief: DailyBriefData | null;
+  meeting_count: number;
+  meeting_ids: string[];
+  meetings: { id: string; title: string; started_at: string; ended_at: string | null; status: string }[];
+  generated_at: string | null;
+  is_stale: boolean;
+  exists: boolean;
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(BASE + path, {
     headers: { "Content-Type": "application/json" },
@@ -178,6 +226,14 @@ export const api = {
       request<{ person_id: string; name: string }>("/enroll/start", {
         method: "POST",
         body: JSON.stringify({ name, duration: duration ?? 10 }),
+      }),
+  },
+  dailyBrief: {
+    get: (date: string) =>
+      request<DailyBriefResponse>(`/daily-brief?date=${encodeURIComponent(date)}`),
+    refresh: (date: string) =>
+      request<DailyBriefResponse>(`/daily-brief/refresh?date=${encodeURIComponent(date)}`, {
+        method: "POST",
       }),
   },
 };

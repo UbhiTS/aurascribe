@@ -41,6 +41,11 @@ export default function App() {
   const [systemStatus, setSystemStatus] = useState<StatusEvent>("loading");
   const [refreshKey, setRefreshKey] = useState(0);
   const [enrolled, setEnrolled] = useState<Person[]>([]);
+  // Pushed by WS whenever the daily brief for a given date changes state.
+  // DailyBrief watches this and refetches when the date matches its view.
+  const [dailyBriefSignal, setDailyBriefSignal] = useState<
+    { date: string; status: "refreshing" | "ready" | "stale"; tick: number } | null
+  >(null);
   // WS utterance filter keys off the LIVE meeting only — library loads can't redirect the stream.
   const liveMeetingIdRef = useRef<string | null>(null);
 
@@ -121,6 +126,15 @@ export default function App() {
         supportIntelligence: typeof msg.support_intelligence === "string" ? msg.support_intelligence : "",
       });
       setIntelTick((t) => t + 1);
+    }
+    if (msg.type === "daily_brief_updated" && typeof msg.date === "string") {
+      setDailyBriefSignal((prev) => ({
+        date: msg.date,
+        status: (msg.status === "refreshing" || msg.status === "ready" || msg.status === "stale")
+          ? msg.status
+          : "ready",
+        tick: (prev?.tick ?? 0) + 1,
+      }));
     }
     if (msg.type === "status") {
       setSystemStatus(msg.event as StatusEvent);
@@ -207,7 +221,7 @@ export default function App() {
       {page === "enrollment" && (
         <Enrollment enrolled={enrolled} onEnrolledChanged={refreshEnrolled} />
       )}
-      {page === "daily" && <DailyBrief />}
+      {page === "daily" && <DailyBrief signal={dailyBriefSignal} />}
       {page === "settings" && <Settings appStatus={appStatus} obsidianConfigured={obsidianConfigured} />}
     </Shell>
   );
