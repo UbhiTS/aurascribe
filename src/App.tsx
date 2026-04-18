@@ -1,6 +1,13 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { api } from "./lib/api";
-import type { AppStatus, Meeting, Person, Utterance } from "./lib/api";
+import { api, EMPTY_LIVE_INTEL, liveIntelFromMeeting } from "./lib/api";
+import type {
+  ActionItemOther,
+  AppStatus,
+  LiveIntel,
+  Meeting,
+  Person,
+  Utterance,
+} from "./lib/api";
 import { useWebSocket } from "./lib/useWebSocket";
 import { Shell } from "./components/Shell";
 import type { Page } from "./components/Sidebar";
@@ -27,6 +34,9 @@ export default function App() {
   const [reviewMeeting, setReviewMeeting] = useState<Meeting | null>(null);
   const [liveUtterances, setLiveUtterances] = useState<Utterance[]>([]);
   const [livePartial, setLivePartial] = useState<{ speaker: string; text: string } | null>(null);
+  const [liveIntel, setLiveIntel] = useState<LiveIntel>(EMPTY_LIVE_INTEL);
+  // Bumped on each WS push so the UI can flash an indicator.
+  const [intelTick, setIntelTick] = useState(0);
   const [statusMessage, setStatusMessage] = useState("Loading models...");
   const [systemStatus, setSystemStatus] = useState<StatusEvent>("loading");
   const [refreshKey, setRefreshKey] = useState(0);
@@ -37,8 +47,11 @@ export default function App() {
   useEffect(() => { liveMeetingIdRef.current = liveMeetingId; }, [liveMeetingId]);
 
   useEffect(() => {
-    if (!liveMeetingId) { setLiveMeeting(null); return; }
-    api.meetings.get(liveMeetingId).then(setLiveMeeting).catch(console.error);
+    if (!liveMeetingId) { setLiveMeeting(null); setLiveIntel(EMPTY_LIVE_INTEL); return; }
+    api.meetings.get(liveMeetingId).then((m) => {
+      setLiveMeeting(m);
+      setLiveIntel(liveIntelFromMeeting(m));
+    }).catch(console.error);
   }, [liveMeetingId]);
 
   // Re-adopt an in-flight recording if the sidecar outlived the frontend
@@ -98,6 +111,17 @@ export default function App() {
       setLivePartial(null);
       setLiveUtterances((prev) => [...prev, ...msg.data]);
     }
+    if (msg.type === "realtime_intelligence" && msg.meeting_id === liveMeetingIdRef.current) {
+      setLiveIntel({
+        highlights: Array.isArray(msg.highlights) ? msg.highlights : [],
+        actionItemsSelf: Array.isArray(msg.action_items_self) ? msg.action_items_self : [],
+        actionItemsOthers: Array.isArray(msg.action_items_others)
+          ? (msg.action_items_others as ActionItemOther[])
+          : [],
+        supportIntelligence: typeof msg.support_intelligence === "string" ? msg.support_intelligence : "",
+      });
+      setIntelTick((t) => t + 1);
+    }
     if (msg.type === "status") {
       setSystemStatus(msg.event as StatusEvent);
       setStatusMessage(msg.message ?? "");
@@ -117,6 +141,7 @@ export default function App() {
     setLiveMeetingId(id);
     setLiveUtterances([]);
     setLivePartial(null);
+    setLiveIntel(EMPTY_LIVE_INTEL);
     setAppStatus((s) => s ? { ...s, is_recording: true, current_meeting_id: id } : s);
     setRefreshKey((k) => k + 1);
   };
@@ -149,6 +174,8 @@ export default function App() {
           meetingId={liveMeetingId}
           liveUtterances={liveUtterances}
           livePartial={livePartial}
+          liveIntel={liveIntel}
+          intelTick={intelTick}
           enrolled={enrolled}
           onEnrolledChanged={refreshEnrolled}
           onMeetingStarted={handleMeetingStarted}

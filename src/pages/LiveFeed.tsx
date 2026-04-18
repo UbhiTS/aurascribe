@@ -1,6 +1,6 @@
-import { useState } from "react";
-import { Sparkles, Loader, Pencil, CheckSquare, Square } from "lucide-react";
-import type { AppStatus, Meeting, Person, Utterance } from "../lib/api";
+import { useEffect, useRef, useState } from "react";
+import { Sparkles, Loader, Pencil, CheckSquare, Square, RefreshCw, Lightbulb } from "lucide-react";
+import type { AppStatus, LiveIntel, Meeting, Person, Utterance } from "../lib/api";
 import { api } from "../lib/api";
 import { RecordingBar } from "../components/RecordingBar";
 import { TranscriptView } from "../components/TranscriptView";
@@ -13,6 +13,8 @@ interface Props {
   meetingId: string | null;
   liveUtterances: Utterance[];
   livePartial: { speaker: string; text: string } | null;
+  liveIntel: LiveIntel;
+  intelTick: number;
   enrolled: Person[];
   onEnrolledChanged: () => void;
   onMeetingStarted: (id: string) => void;
@@ -22,12 +24,13 @@ interface Props {
 
 export function LiveFeed({
   appStatus, meeting, setMeeting, meetingId,
-  liveUtterances, livePartial, enrolled, onEnrolledChanged,
+  liveUtterances, livePartial, liveIntel, intelTick, enrolled, onEnrolledChanged,
   onMeetingStarted, onMeetingStopped, bumpRefreshKey,
 }: Props) {
   const [editingTitle, setEditingTitle] = useState(false);
   const [titleDraft, setTitleDraft] = useState("");
   const [summarizing, setSummarizing] = useState(false);
+  const [refreshingIntel, setRefreshingIntel] = useState(false);
 
   const isRecording = appStatus?.is_recording ?? false;
   // Self speaker name = whatever's enrolled with id matching — default "Me".
@@ -52,7 +55,19 @@ export function LiveFeed({
     }
   };
 
-  const actionItems = parseActionItems(meeting?.action_items ?? null);
+  const handleRefreshIntel = async () => {
+    if (!meetingId || refreshingIntel) return;
+    setRefreshingIntel(true);
+    try {
+      await api.intel.refresh(meetingId);
+    } catch (e) {
+      console.warn("Intel refresh failed", e);
+    } finally {
+      setRefreshingIntel(false);
+    }
+  };
+
+  const finalActionItems = parseActionItems(meeting?.action_items ?? null);
 
   return (
     <div className="h-full flex flex-col min-h-0">
@@ -133,28 +148,70 @@ export function LiveFeed({
 
         {/* Live Intelligence */}
         <aside className="min-h-0 overflow-y-auto space-y-3">
-          <h2 className="text-xl font-bold text-gray-100 tracking-tight px-1 pt-1">Live Intelligence</h2>
+          <div className="flex items-center justify-between px-1 pt-1">
+            <h2 className="text-xl font-bold text-gray-100 tracking-tight">Live Intelligence</h2>
+            {isRecording && meetingId && (
+              <button
+                onClick={handleRefreshIntel}
+                disabled={refreshingIntel}
+                title="Refresh now (skip the debounce timer)"
+                className="text-gray-500 hover:text-brand-400 disabled:opacity-40 transition-colors"
+              >
+                <RefreshCw size={14} className={refreshingIntel ? "animate-spin" : ""} />
+              </button>
+            )}
+          </div>
+
+          <SupportIntelligenceCard text={liveIntel.supportIntelligence} tick={intelTick} />
+
+          <Card title="Action Items — You">
+            {liveIntel.actionItemsSelf.length === 0 && finalActionItems.length === 0 ? (
+              <p className="text-xs text-gray-500 italic">Nothing yet.</p>
+            ) : (
+              <ul className="space-y-1.5">
+                {liveIntel.actionItemsSelf.map((item, i) => (
+                  <ActionItem key={`live-${i}`} text={item} />
+                ))}
+                {finalActionItems.map((item, i) => (
+                  <ActionItem key={`final-${i}`} text={item} />
+                ))}
+              </ul>
+            )}
+          </Card>
+
+          {liveIntel.actionItemsOthers.length > 0 && (
+            <Card title="Action Items — Others">
+              <ul className="space-y-1.5">
+                {liveIntel.actionItemsOthers.map((item, i) => (
+                  <li key={i} className="text-xs flex items-start gap-2">
+                    <span className="font-medium text-brand-300 flex-shrink-0">{item.speaker}:</span>
+                    <span className="text-gray-300">{item.item}</span>
+                  </li>
+                ))}
+              </ul>
+            </Card>
+          )}
+
           <Card title="Real-Time Highlights" gradient>
-            {meeting?.summary ? (
+            {liveIntel.highlights.length > 0 ? (
+              <ul className="space-y-1.5">
+                {liveIntel.highlights.map((h, i) => (
+                  <li key={i} className="text-xs text-gray-200 leading-relaxed flex gap-2">
+                    <span className="text-brand-400 select-none">•</span>
+                    <span>{h}</span>
+                  </li>
+                ))}
+              </ul>
+            ) : meeting?.summary ? (
               <pre className="text-xs text-gray-300 whitespace-pre-wrap font-sans leading-relaxed">
                 {extractHighlights(meeting.summary)}
               </pre>
             ) : (
               <p className="text-xs text-gray-500 italic">
-                Highlights appear here after you click AI Summary on a finished meeting.
+                {isRecording
+                  ? "Highlights appear here as the conversation progresses."
+                  : "Start recording — highlights stream in every ~20s."}
               </p>
-            )}
-          </Card>
-
-          <Card title="Action Items">
-            {actionItems.length === 0 ? (
-              <p className="text-xs text-gray-500 italic">No action items yet.</p>
-            ) : (
-              <ul className="space-y-1.5">
-                {actionItems.map((item, i) => (
-                  <ActionItem key={i} text={item} />
-                ))}
-              </ul>
             )}
           </Card>
 
@@ -171,7 +228,11 @@ export function LiveFeed({
 
 // ── Helpers ──────────────────────────────────────────────────────────────
 
-function Card({ title, children, gradient }: { title: string; children: React.ReactNode; gradient?: boolean }) {
+function Card({ title, children, gradient }: {
+  title: string;
+  children: React.ReactNode;
+  gradient?: boolean;
+}) {
   return (
     <div className={`rounded-xl border p-3.5 ${
       gradient
@@ -182,6 +243,60 @@ function Card({ title, children, gradient }: { title: string; children: React.Re
       {children}
     </div>
   );
+}
+
+function SupportIntelligenceCard({ text, tick }: { text: string; tick: number }) {
+  // Brief flash on each WS push so the user notices the panel changed.
+  const [flash, setFlash] = useState(false);
+  const firstRender = useRef(true);
+  useEffect(() => {
+    if (firstRender.current) { firstRender.current = false; return; }
+    setFlash(true);
+    const t = setTimeout(() => setFlash(false), 1200);
+    return () => clearTimeout(t);
+  }, [tick]);
+
+  const bullets = parseBullets(text);
+  return (
+    <div className={`rounded-xl border p-3.5 transition-all ${
+      flash
+        ? "bg-gradient-to-br from-amber-900/50 to-amber-950/40 border-amber-500/60 shadow-lg shadow-amber-500/20"
+        : "bg-gradient-to-br from-amber-950/30 to-gray-900/40 border-amber-800/40 shadow-md shadow-amber-500/5"
+    }`}>
+      <div className="flex items-center gap-1.5 mb-2">
+        <Lightbulb size={11} className="text-amber-400" />
+        <div className="text-[10px] uppercase tracking-wider text-amber-300 font-semibold">
+          Support Intelligence
+        </div>
+      </div>
+      {bullets.length > 0 ? (
+        <ul className="space-y-1.5">
+          {bullets.map((b, i) => (
+            <li key={i} className="text-xs text-gray-200 leading-relaxed flex gap-2">
+              <span className="text-amber-400 select-none">→</span>
+              <span>{b}</span>
+            </li>
+          ))}
+        </ul>
+      ) : text ? (
+        <p className="text-xs text-gray-300 whitespace-pre-wrap leading-relaxed">{text}</p>
+      ) : (
+        <p className="text-xs text-gray-500 italic">
+          Talking-point nudges appear here based on where the conversation is heading.
+        </p>
+      )}
+    </div>
+  );
+}
+
+function parseBullets(text: string): string[] {
+  if (!text) return [];
+  return text
+    .split("\n")
+    .map((l) => l.trim())
+    .filter((l) => l.startsWith("- ") || l.startsWith("* "))
+    .map((l) => l.slice(2).trim())
+    .filter(Boolean);
 }
 
 function ActionItem({ text }: { text: string }) {

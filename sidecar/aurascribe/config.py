@@ -68,3 +68,16 @@ CHANNELS: int = 1
 CHUNK_DURATION: float = 10.0      # seconds per transcription chunk
 SILENCE_DURATION: float = 0.6     # seconds of silence before ending an utterance
 VAD_THRESHOLD: float = 0.5
+
+# ── Realtime intelligence (live highlights / action items / talking points) ──
+
+# Debounce: fire this many seconds after the last new utterance lands. Shorter
+# = snappier panel updates, more LLM load. Local LMStudio handles ~1 call/15s
+# comfortably with a 7-8B model.
+RT_HIGHLIGHTS_DEBOUNCE_SEC: float = float(os.environ.get("RT_HIGHLIGHTS_DEBOUNCE_SEC", "20"))
+# Hard cap: even during nonstop speech, never wait longer than this between
+# refreshes. Keeps the support-intelligence card feeling alive.
+RT_HIGHLIGHTS_MAX_INTERVAL_SEC: float = float(os.environ.get("RT_HIGHLIGHTS_MAX_INTERVAL_SEC", "60"))
+# Recent transcript window the LLM sees. Older context lives in the
+# already-extracted highlights/action items, which we also send back.
+RT_HIGHLIGHTS_WINDOW_SEC: float = float(os.environ.get("RT_HIGHLIGHTS_WINDOW_SEC", "180"))

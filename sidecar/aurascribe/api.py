@@ -8,10 +8,14 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import re
+import subprocess
+import sys
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
+from pathlib import Path
 
 import aiosqlite
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
@@ -24,7 +28,7 @@ from aurascribe.db.database import init_db
 from aurascribe.llm.client import LLMUnavailableError, chat, get_available_models
 from aurascribe.llm.prompts import MEETING_SUMMARY_SYSTEM, format_transcript, meeting_summary_prompt
 from aurascribe.meeting_manager import MeetingManager
-from aurascribe.obsidian.writer import cleanup_vault_stragglers, write_meeting
+from aurascribe.obsidian.writer import cleanup_vault_stragglers, rewrite_meeting_vault
 from aurascribe.transcription import Utterance
 
 manager = MeetingManager()
@@ -66,6 +70,7 @@ async def lifespan(app: FastAPI):
     manager.on_utterance(on_utterance)
     manager.on_partial(on_partial)
     manager.on_status(on_status)
+    manager.intel.set_broadcast(_broadcast)
     asyncio.create_task(manager.initialize())
     yield
 
@@ -201,37 +206,10 @@ async def get_meeting(meeting_id: str) -> dict:
 
 
 async def _rewrite_vault(meeting_id: str) -> None:
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        cursor = await db.execute(
-            "SELECT title, started_at, summary, action_items FROM meetings WHERE id = ?",
-            (meeting_id,),
-        )
-        row = await cursor.fetchone()
-        if not row:
-            return
-        title = row["title"]
-        started_at = datetime.fromisoformat(row["started_at"])
-        summary = row["summary"] or ""
-        action_items = json.loads(row["action_items"]) if row["action_items"] else []
-        cursor = await db.execute(
-            "SELECT id, speaker, text, start_time, end_time FROM utterances "
-            "WHERE meeting_id = ? ORDER BY start_time",
-            (meeting_id,),
-        )
-        rows = await cursor.fetchall()
-    utterances = [
-        Utterance(speaker=r["speaker"], text=r["text"], start=r["start_time"], end=r["end_time"])
-        for r in rows
-    ]
-    await write_meeting(
-        meeting_id=meeting_id,
-        title=title,
-        started_at=started_at,
-        utterances=utterances,
-        summary=summary,
-        action_items=action_items,
-    )
+    """Wrapper kept for the existing call sites — delegates to the shared
+    helper in obsidian.writer. The helper also handles the live-intel
+    section that the realtime loop accumulates."""
+    await rewrite_meeting_vault(meeting_id)
 
 
 @app.delete("/api/meetings/{meeting_id}")
@@ -520,6 +498,98 @@ async def get_status() -> dict:
 @app.get("/api/models")
 async def list_models() -> dict:
     return {"models": await get_available_models()}
+
+
+@app.post("/api/meetings/{meeting_id}/intel/refresh")
+async def refresh_intel(meeting_id: str) -> dict:
+    """Force a realtime-intelligence run now, bypassing debounce. No-op if
+    the meeting isn't currently active in the manager."""
+    if manager.current_meeting_id != meeting_id:
+        raise HTTPException(400, "Meeting is not currently recording")
+    try:
+        await manager.intel.trigger_now(meeting_id)
+    except LLMUnavailableError as e:
+        raise HTTPException(503, str(e))
+    return {"ok": True}
+
+
+@app.get("/api/intel/prompt-path")
+async def intel_prompt_path() -> dict:
+    """Return the absolute path of the user-editable realtime-intelligence
+    prompt file. Lets the UI surface 'edit me' affordances."""
+    from aurascribe.llm.realtime import _ensure_prompt_file
+
+    return {"path": str(_ensure_prompt_file())}
+
+
+# Friendly display names for the prompt files we know about. Anything else in
+# PROMPTS_DIR is shown with its raw filename so the user can still find it.
+_PROMPT_LABELS = {
+    "realtime_highlights.md": "Real-Time Highlights",
+}
+
+
+@app.get("/api/intel/prompts")
+async def list_prompts() -> dict:
+    """Enumerate every .md file alongside the realtime intel module — i.e.
+    in the repo. Edits to these files are picked up live; no APPDATA copy."""
+    from aurascribe.llm.realtime import PROMPTS_DIR_REPO
+
+    items: list[dict] = []
+    for path in sorted(PROMPTS_DIR_REPO.glob("*.md")):
+        items.append({
+            "name": _PROMPT_LABELS.get(path.name, path.name),
+            "filename": path.name,
+            "path": str(path),
+        })
+    return {"dir": str(PROMPTS_DIR_REPO), "prompts": items}
+
+
+class OpenPromptRequest(BaseModel):
+    filename: str
+
+
+@app.post("/api/intel/open-prompt")
+async def open_prompt(req: OpenPromptRequest) -> dict:
+    """Open a prompt file in the user's default editor.
+
+    Sidesteps tauri-plugin-shell's URL-only `open` scope. The filename is
+    validated against the prompts dir (basename only — no path traversal) so
+    this endpoint can't be coaxed into opening arbitrary files."""
+    from aurascribe.llm.realtime import PROMPTS_DIR_REPO
+
+    # Reject anything that isn't a bare basename — guards against ../ etc.
+    safe_name = Path(req.filename).name
+    if safe_name != req.filename or not safe_name:
+        raise HTTPException(400, "Invalid filename")
+    target = PROMPTS_DIR_REPO / safe_name
+    if not target.exists() or not target.is_file():
+        raise HTTPException(404, f"Prompt file not found: {safe_name}")
+
+    abs_target = str(target.resolve())
+    import logging as _log
+    _log.getLogger("aurascribe").info("open-prompt: dispatching to OS shell: %r", abs_target)
+
+    try:
+        if sys.platform == "win32":
+            # `cmd /c start "" "<path>"` is the canonical Windows pattern for
+            # "open with default handler". The empty title arg ("") is
+            # required because `start` interprets the first quoted argument
+            # as a window title — without it, our path becomes the title and
+            # the actual file arg is missing. More reliable than os.startfile,
+            # which has had path-resolution quirks on certain Windows builds.
+            subprocess.Popen(
+                ["cmd", "/c", "start", "", abs_target],
+                shell=False,
+                close_fds=True,
+            )
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", abs_target])
+        else:
+            subprocess.Popen(["xdg-open", abs_target])
+    except Exception as e:
+        raise HTTPException(500, f"Failed to open file: {e}")
+    return {"ok": True, "path": abs_target}
 
 
 # ── People + enrollment ──────────────────────────────────────────────────────

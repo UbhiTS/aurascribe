@@ -29,7 +29,14 @@ from aurascribe.llm.prompts import (
     meeting_summary_prompt,
     people_notes_prompt,
 )
-from aurascribe.obsidian.writer import update_person_note, write_meeting
+from aurascribe.llm.realtime import RealtimeIntelligence
+from aurascribe.obsidian.writer import (
+    forget_meeting_throttle,
+    note_chunk_arrived,
+    time_since_write,
+    update_person_note,
+    write_meeting,
+)
 from aurascribe.transcription import TranscriptionEngine, Utterance, default_engine
 
 log = logging.getLogger("aurascribe")
@@ -42,6 +49,14 @@ log = logging.getLogger("aurascribe")
 # merge too eagerly (lower) or split across many labels (raise).
 _PROVISIONAL_THRESH = float(os.environ.get("SPEAKER_PROVISIONAL_THRESH", "0.50"))
 _PROVISIONAL_LABEL_RE = re.compile(r"^Speaker \d+$")
+
+# Vault-write throttle for the live recording loop. We want the file to look
+# alive, but writing on every ~10s chunk thrashes Obsidian sync watchers.
+# Write only when EITHER the time gate OR the chunk gate trips — whichever
+# fires first. The intel loop's writes naturally reset both via the writer
+# module's shared throttle state.
+_VAULT_WRITE_INTERVAL_SEC = float(os.environ.get("VAULT_WRITE_INTERVAL_SEC", "15"))
+_VAULT_WRITE_CHUNKS = int(os.environ.get("VAULT_WRITE_CHUNKS", "5"))
 
 UtteranceCallback = Callable[[str, list[Utterance]], Awaitable[None]]
 PartialCallback = Callable[[str, str, str], Awaitable[None]]
@@ -66,6 +81,9 @@ class MeetingManager:
         # speaker reuse that label; novel ones get the next "Speaker N".
         self._provisional_pools: dict[str, dict[str, list[np.ndarray]]] = {}
         self._provisional_next_n: dict[str, int] = {}
+        # Real-time intelligence loop. The api layer wires its broadcast
+        # callback in via `intel.set_broadcast(...)` during lifespan setup.
+        self.intel = RealtimeIntelligence()
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -106,6 +124,7 @@ class MeetingManager:
                 await db.execute("DELETE FROM meetings WHERE id = ?", (meeting_id,))
                 await db.commit()
             raise
+        await self.intel.prepare_meeting(meeting_id)
         self._task = asyncio.create_task(self._record_loop(meeting_id))
         self._spec_task = asyncio.create_task(self._speculative_loop(meeting_id))
         await self._emit_status("recording", {"meeting_id": meeting_id, "title": title})
@@ -133,6 +152,9 @@ class MeetingManager:
         self._current_meeting_id = None
         self._provisional_pools.pop(meeting_id, None)
         self._provisional_next_n.pop(meeting_id, None)
+        await self.intel.flush_and_clear(meeting_id)
+        # Drop throttle counters — finalize will do the last write itself.
+        forget_meeting_throttle(meeting_id)
 
         status_msg = "Generating summary..." if summarize else "Saving transcript..."
         await self._emit_status("processing", {"meeting_id": meeting_id, "message": status_msg})
@@ -180,29 +202,45 @@ class MeetingManager:
                     await self._save_utterances(meeting_id, utterances)
                     for cb in self._utterance_callbacks:
                         await cb(meeting_id, utterances)
-                    try:
-                        # Re-fetch the title on every write — user can rename
-                        # mid-recording and we must write to the new filename
-                        # (otherwise every chunk recreates the old one).
-                        async with aiosqlite.connect(DB_PATH) as db:
-                            cursor = await db.execute(
-                                "SELECT title FROM meetings WHERE id = ?", (meeting_id,)
+                    # Realtime intelligence runs on a debounced timer — this
+                    # call only schedules; it doesn't block the record loop.
+                    await self.intel.note_utterances(meeting_id, utterances)
+
+                    # Throttled vault write: skip unless we've hit either
+                    # gate. The intel loop's writes also reset these counters
+                    # via the writer module's shared state, so a recent
+                    # intel-driven write keeps the chunk loop quiet.
+                    pending_chunks = note_chunk_arrived(meeting_id)
+                    elapsed_since_write = time_since_write(meeting_id)
+                    should_write = (
+                        pending_chunks >= _VAULT_WRITE_CHUNKS
+                        or elapsed_since_write >= _VAULT_WRITE_INTERVAL_SEC
+                    )
+                    if should_write:
+                        try:
+                            # Re-fetch the title on every write — user can
+                            # rename mid-recording and we must write to the
+                            # new filename (otherwise every chunk recreates
+                            # the old one).
+                            async with aiosqlite.connect(DB_PATH) as db:
+                                cursor = await db.execute(
+                                    "SELECT title FROM meetings WHERE id = ?", (meeting_id,)
+                                )
+                                title_row = await cursor.fetchone()
+                            current_title = title_row[0] if title_row else _initial_title
+                            if prev_title and prev_title != current_title:
+                                self._cleanup_vault_file(started_at, prev_title)
+                            await write_meeting(
+                                meeting_id=meeting_id,
+                                title=current_title,
+                                started_at=started_at,
+                                utterances=all_utterances,
+                                summary="",
+                                action_items=[],
                             )
-                            title_row = await cursor.fetchone()
-                        current_title = title_row[0] if title_row else _initial_title
-                        if prev_title and prev_title != current_title:
-                            self._cleanup_vault_file(started_at, prev_title)
-                        await write_meeting(
-                            meeting_id=meeting_id,
-                            title=current_title,
-                            started_at=started_at,
-                            utterances=all_utterances,
-                            summary="",
-                            action_items=[],
-                        )
-                        prev_title = current_title
-                    except Exception as e:
-                        log.warning(f"Live Obsidian write failed: {e}")
+                            prev_title = current_title
+                        except Exception as e:
+                            log.warning(f"Live Obsidian write failed: {e}")
             except Exception as e:
                 log.error(f"Transcription error: {e}", exc_info=True)
                 await self._emit_status("error", {"message": str(e), "meeting_id": meeting_id})

@@ -22,6 +22,52 @@ export interface Meeting {
   action_items: string | null;
   vault_path: string | null;
   utterances?: Utterance[];
+  // Live intelligence — JSON strings for the array fields, plain text for
+  // support_intelligence. Populated incrementally during recording by the
+  // realtime-intelligence loop. Null until the LLM has run at least once.
+  live_highlights: string | null;
+  live_action_items_self: string | null;
+  live_action_items_others: string | null;
+  live_support_intelligence: string | null;
+}
+
+export interface ActionItemOther {
+  speaker: string;
+  item: string;
+}
+
+export interface LiveIntel {
+  highlights: string[];
+  actionItemsSelf: string[];
+  actionItemsOthers: ActionItemOther[];
+  supportIntelligence: string;
+}
+
+export const EMPTY_LIVE_INTEL: LiveIntel = {
+  highlights: [],
+  actionItemsSelf: [],
+  actionItemsOthers: [],
+  supportIntelligence: "",
+};
+
+export function liveIntelFromMeeting(m: Meeting | null): LiveIntel {
+  if (!m) return EMPTY_LIVE_INTEL;
+  return {
+    highlights: safeJsonArray<string>(m.live_highlights),
+    actionItemsSelf: safeJsonArray<string>(m.live_action_items_self),
+    actionItemsOthers: safeJsonArray<ActionItemOther>(m.live_action_items_others),
+    supportIntelligence: m.live_support_intelligence ?? "",
+  };
+}
+
+function safeJsonArray<T>(raw: string | null): T[] {
+  if (!raw) return [];
+  try {
+    const v = JSON.parse(raw);
+    return Array.isArray(v) ? (v as T[]) : [];
+  } catch {
+    return [];
+  }
 }
 
 export interface Person {
@@ -112,6 +158,20 @@ export const api = {
   },
   llm: {
     models: () => request<{ models: string[] }>("/models"),
+  },
+  intel: {
+    refresh: (meetingId: string) =>
+      request<{ ok: boolean }>(`/meetings/${meetingId}/intel/refresh`, { method: "POST" }),
+    promptPath: () => request<{ path: string }>("/intel/prompt-path"),
+    prompts: () =>
+      request<{ dir: string; prompts: { name: string; filename: string; path: string }[] }>(
+        "/intel/prompts",
+      ),
+    openPrompt: (filename: string) =>
+      request<{ ok: boolean; path: string }>("/intel/open-prompt", {
+        method: "POST",
+        body: JSON.stringify({ filename }),
+      }),
   },
   enroll: {
     start: (name: string, duration?: number) =>
