@@ -1,0 +1,58 @@
+"""Transcription engine protocol + stub implementation.
+
+Phase 3 adds `whisper.WhisperEngine` (faster-whisper). Phase 4 adds real
+pyannote 3.1 diarization, which layers on top of the engine output.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Callable, Protocol
+
+import numpy as np
+
+
+@dataclass
+class Utterance:
+    speaker: str
+    text: str
+    start: float
+    end: float
+    # Pickled pyannote embedding for this chunk. None when pyannote isn't
+    # loaded; otherwise stored on the utterance row so the user can later
+    # re-assign the speaker and fold the embedding into that person's pool.
+    embedding: bytes | None = None
+    # DB primary key (uuid4). Populated by `_save_utterances()`.
+    id: str | None = None
+
+
+PartialCallback = Callable[[str, str], None]  # (speaker, partial_text)
+
+
+class TranscriptionEngine(Protocol):
+    async def load(self) -> None: ...
+    async def reload_enrolled(self) -> None: ...
+    async def transcribe(
+        self,
+        audio: np.ndarray,
+        on_partial: PartialCallback | None = None,
+    ) -> list[Utterance]: ...
+
+
+class StubEngine:
+    """No-op engine. `transcribe()` returns []. Used until Phase 3 lands."""
+
+    def __init__(self) -> None:
+        self._ready = False
+
+    async def load(self) -> None:
+        self._ready = True
+
+    async def reload_enrolled(self) -> None:
+        pass
+
+    async def transcribe(
+        self,
+        audio: np.ndarray,
+        on_partial: PartialCallback | None = None,
+    ) -> list[Utterance]:
+        return []

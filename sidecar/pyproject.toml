@@ -1,0 +1,48 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "aurascribe-sidecar"
+version = "0.1.0"
+description = "AuraScribe Python sidecar — FastAPI backend for ASR, diarization, LLM, and Obsidian integration"
+requires-python = ">=3.13"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.32",
+    "python-dotenv>=1.0",
+    "pydantic>=2.9",
+    "python-multipart>=0.0.17",
+    "aiofiles>=24.1",
+    "aiosqlite>=0.20",
+    "websockets>=13",
+    "numpy>=1.26",
+]
+
+[project.optional-dependencies]
+asr = [
+    "faster-whisper>=1.0.3",
+    "sounddevice>=0.5",
+    "scipy>=1.14",
+    "librosa>=0.10",
+]
+diarization = [
+    "torch>=2.5",
+    "torchaudio>=2.5",
+    "pyannote.audio>=3.3",
+    "omegaconf>=2.3",
+]
+llm = [
+    "openai>=1.60",
+]
+all = [
+    "aurascribe-sidecar[asr,diarization,llm]",
+]
+dev = [
+    "pytest>=8",
+    "ruff>=0.7",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["aurascribe*"]

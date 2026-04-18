@@ -1,16 +1,37 @@
-.env
+# Python
 __pycache__/
-*.pyc
-*.pyo
+*.py[cod]
 .venv/
 venv/
-node_modules/
-frontend/dist/
-frontend/node_modules/
 *.egg-info/
+.pytest_cache/
+
+# Node
+node_modules/
 dist/
-build/
+.eslintcache
+
+# Tauri / Rust
+src-tauri/target/
+src-tauri/gen/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# Env
+.env
+.env.local
+
+# Claude Code per-developer local config (not shared)
+.claude/settings.local.json
+
+# OS
+Thumbs.db
 .DS_Store
-recordings/
-*.wav
-*.mp3
+
+# App data
+*.db
+*.db-journal
+sidecar/models/
