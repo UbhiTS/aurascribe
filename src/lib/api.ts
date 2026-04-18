@@ -10,6 +10,10 @@ export interface Utterance {
   // confident. null/undefined when no embedding-based match was made
   // (Unknown, or pre-migration rows).
   match_distance?: number | null;
+  // Wall-clock offset (seconds) into the meeting's .opus recording. Used
+  // by click-to-play. Null for meetings that predate the audio feature or
+  // when recording failed.
+  audio_start?: number | null;
 }
 
 export interface Meeting {
@@ -21,6 +25,7 @@ export interface Meeting {
   summary: string | null;
   action_items: string | null;
   vault_path: string | null;
+  audio_path: string | null;
   utterances?: Utterance[];
   // Live intelligence — JSON strings for the array fields, plain text for
   // support_intelligence. Populated incrementally during recording by the
@@ -200,6 +205,7 @@ export const api = {
         method: "POST",
         body: JSON.stringify({ at, new_title: newTitle }),
       }),
+    audioUrl: (id: string) => `${BASE}/meetings/${id}/audio`,
   },
   people: {
     list: () => request<Person[]>("/people"),

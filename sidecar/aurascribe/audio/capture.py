@@ -6,7 +6,10 @@ lazily in `start()` so the sidecar boots without the `[asr]` extra installed.
 from __future__ import annotations
 
 import asyncio
+import logging
+import threading
 from collections import deque
+from pathlib import Path
 from typing import AsyncGenerator
 
 import numpy as np
@@ -18,6 +21,8 @@ from aurascribe.config import (
     SILENCE_DURATION,
     VAD_THRESHOLD,
 )
+
+log = logging.getLogger("aurascribe")
 
 _STOP_SENTINEL: object = object()
 _RING_MAXLEN = int(30 * SAMPLE_RATE / 512)  # 30s of 512-sample blocks
@@ -35,6 +40,12 @@ class AudioCapture:
         # Resampling state — only used when the device's native rate isn't 16kHz.
         self._resampler = None
         self._accum: np.ndarray = np.zeros(0, dtype=np.float32)
+        # Wall-clock Opus recorder. Tees every resampled 16kHz block to a
+        # per-meeting .opus file so the UI can play back any transcript line.
+        # Lock protects against close() racing with the audio-thread write.
+        self._record_writer = None  # soundfile.SoundFile when recording
+        self._record_samples: int = 0
+        self._record_lock = threading.Lock()
 
     def _audio_callback(self, indata: np.ndarray, frames: int, time, status) -> None:
         chunk = indata[:, 0].astype(np.float32, copy=True)
@@ -53,6 +64,17 @@ class AudioCapture:
             for i in range(0, n_full, 512):
                 block = chunk[i:i + 512].copy()
                 self._ring.append(block)
+                # Tee to Opus recorder BEFORE handing the block to the speech
+                # queue, so wall_clock_seconds() read by the consumer (after
+                # the await returns) already accounts for this block.
+                if self._record_writer is not None:
+                    with self._record_lock:
+                        if self._record_writer is not None:
+                            try:
+                                self._record_writer.write(block)
+                                self._record_samples += block.size
+                            except Exception as e:
+                                log.warning("opus record write failed: %s", e)
                 if self._loop and not self._loop.is_closed():
                     self._loop.call_soon_threadsafe(self._queue.put_nowait, block)
         self._accum = chunk[n_full:].copy() if n_full < chunk.size else np.zeros(0, dtype=np.float32)
@@ -191,6 +213,50 @@ class AudioCapture:
             self._stream = None
         if self._loop and not self._loop.is_closed():
             await self._queue.put(_STOP_SENTINEL)
+
+    # ── Opus wall-clock recorder ──────────────────────────────────────────────
+
+    def start_recording(self, path: Path) -> None:
+        """Begin teeing the 16kHz stream to `path` as OGG Opus.
+
+        The audio thread writes every block; `wall_clock_seconds()` reflects
+        the total samples committed to the file. Idempotent-safe: if a prior
+        recording is still open, it's closed first.
+        """
+        import soundfile as sf
+
+        if self._record_writer is not None:
+            self.stop_recording()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        # libsndfile's Opus encoder picks a sensible default bitrate for
+        # 16kHz mono (~24-32 kbps for speech). No public knob via soundfile
+        # today — this is within the range we want anyway.
+        writer = sf.SoundFile(
+            str(path),
+            mode="w",
+            samplerate=SAMPLE_RATE,
+            channels=1,
+            format="OGG",
+            subtype="OPUS",
+        )
+        with self._record_lock:
+            self._record_writer = writer
+            self._record_samples = 0
+
+    def stop_recording(self) -> None:
+        with self._record_lock:
+            writer = self._record_writer
+            self._record_writer = None
+        if writer is not None:
+            try:
+                writer.close()
+            except Exception as e:
+                log.warning("opus record close failed: %s", e)
+
+    def wall_clock_seconds(self) -> float:
+        """Seconds of audio written to the active Opus file so far. 0.0 when
+        not recording."""
+        return self._record_samples / SAMPLE_RATE
 
     def _is_speech(self, audio: np.ndarray) -> bool:
         import torch

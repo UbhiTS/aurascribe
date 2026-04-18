@@ -28,6 +28,11 @@ class Utterance:
     # Consumers use this to visually group consecutive high-confidence
     # same-speaker utterances.
     match_distance: float | None = None
+    # Wall-clock offset (seconds) of this utterance's start in the meeting's
+    # Opus recording file. Distinct from `start` (which is speech-time, i.e.
+    # silence-skipped). Used by the UI to seek audio on click. None when the
+    # meeting predates the audio-recording feature.
+    audio_start: float | None = None
 
 
 PartialCallback = Callable[[str, str], None]  # (speaker, partial_text)

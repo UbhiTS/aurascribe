@@ -21,7 +21,7 @@ import aiosqlite
 import numpy as np
 
 from aurascribe.audio.capture import AudioCapture
-from aurascribe.config import DB_PATH, SAMPLE_RATE
+from aurascribe.config import AUDIO_DIR, DB_PATH, SAMPLE_RATE
 from aurascribe.llm.client import chat
 from aurascribe.llm.prompts import (
     MEETING_SUMMARY_SYSTEM,
@@ -124,6 +124,21 @@ class MeetingManager:
                 await db.execute("DELETE FROM meetings WHERE id = ?", (meeting_id,))
                 await db.commit()
             raise
+
+        audio_path = AUDIO_DIR / f"{meeting_id}.opus"
+        try:
+            self.capture.start_recording(audio_path)
+            async with aiosqlite.connect(DB_PATH) as db:
+                await db.execute(
+                    "UPDATE meetings SET audio_path = ? WHERE id = ?",
+                    (str(audio_path), meeting_id),
+                )
+                await db.commit()
+        except Exception as e:
+            # Audio recording is a nice-to-have — a failure here shouldn't
+            # kill the meeting itself. Log and carry on with transcript-only.
+            log.warning("Opus recording unavailable for %s: %s", meeting_id, e)
+
         await self.intel.prepare_meeting(meeting_id)
         self._task = asyncio.create_task(self._record_loop(meeting_id))
         self._spec_task = asyncio.create_task(self._speculative_loop(meeting_id))
@@ -136,6 +151,7 @@ class MeetingManager:
 
         self._running = False
         await self.capture.stop()
+        self.capture.stop_recording()
         if self._spec_task:
             self._spec_task.cancel()
             try:
@@ -187,11 +203,23 @@ class MeetingManager:
             if len(audio_chunk) < int(SAMPLE_RATE * 0.3):
                 continue
             chunk_duration = len(audio_chunk) / SAMPLE_RATE
+            # Snapshot the wall-clock position of the chunk's start in the
+            # Opus file — read *before* the transcribe await so a few more
+            # audio blocks landing meanwhile don't drift our anchor. The
+            # recorder advances on the audio thread; `- chunk_duration`
+            # walks back to the first sample of this chunk.
+            chunk_wall_end = self.capture.wall_clock_seconds()
+            chunk_wall_start = max(0.0, chunk_wall_end - chunk_duration)
             log.info(f"Transcribing chunk: {chunk_duration:.1f}s of audio")
             try:
                 async with self._transcribe_sem:
                     utterances = await self.engine.transcribe(audio_chunk)
                 for u in utterances:
+                    # Preserve the pre-elapsed within-chunk offset so we can
+                    # map into the wall-clock file. Speech-time (`u.start`)
+                    # drives display; `u.audio_start` drives playback.
+                    if chunk_wall_start > 0.0 or chunk_wall_end > 0.0:
+                        u.audio_start = chunk_wall_start + u.start
                     u.start += elapsed
                     u.end += elapsed
                 elapsed += chunk_duration
@@ -398,9 +426,9 @@ class MeetingManager:
             for u in utterances:
                 u.id = str(uuid.uuid4())
                 await db.execute(
-                    "INSERT INTO utterances (id, meeting_id, speaker, text, start_time, end_time, embedding, match_distance, created_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    (u.id, meeting_id, u.speaker, u.text, u.start, u.end, u.embedding, u.match_distance, datetime.now().isoformat()),
+                    "INSERT INTO utterances (id, meeting_id, speaker, text, start_time, end_time, audio_start, embedding, match_distance, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (u.id, meeting_id, u.speaker, u.text, u.start, u.end, u.audio_start, u.embedding, u.match_distance, datetime.now().isoformat()),
                 )
             await db.commit()
 

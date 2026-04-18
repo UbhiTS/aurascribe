@@ -20,10 +20,11 @@ from pathlib import Path
 import aiosqlite
 from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
 from aurascribe import __version__
-from aurascribe.config import DB_PATH
+from aurascribe.config import AUDIO_DIR, DB_PATH
 from aurascribe.db.database import init_db
 from aurascribe.llm import daily_brief as daily_brief_mod
 from aurascribe.llm.client import LLMUnavailableError, chat, get_available_models
@@ -54,6 +55,7 @@ async def lifespan(app: FastAPI):
                         "start_time": u.start,
                         "end_time": u.end,
                         "match_distance": u.match_distance,
+                        "audio_start": u.audio_start,
                     }
                     for u in utterances
                 ],
@@ -90,6 +92,21 @@ app.add_middleware(
     allow_headers=["*"],
     allow_credentials=False,
 )
+
+
+def _delete_audio_files(meeting_ids: list[str]) -> None:
+    """Remove the .opus recording for each id. Best-effort — the meeting rows
+    are already gone, so a lingering file would just waste disk."""
+    for mid in meeting_ids:
+        p = AUDIO_DIR / f"{mid}.opus"
+        if p.exists():
+            try:
+                p.unlink()
+            except Exception as e:
+                import logging as _log
+                _log.getLogger("aurascribe").warning(
+                    "could not delete audio file %s: %s", p, e
+                )
 
 
 async def _broadcast(payload: dict) -> None:
@@ -173,6 +190,7 @@ async def bulk_delete_meetings(req: BulkDeleteRequest) -> dict:
         await db.execute(f"DELETE FROM utterances WHERE meeting_id IN ({placeholders})", req.ids)
         await db.execute(f"DELETE FROM meetings WHERE id IN ({placeholders})", req.ids)
         await db.commit()
+    _delete_audio_files(req.ids)
     return {"ok": True, "deleted": len(req.ids)}
 
 
@@ -187,6 +205,7 @@ async def clear_all_meetings(days: int = 2) -> dict:
             await db.execute(f"DELETE FROM utterances WHERE meeting_id IN ({placeholders})", ids)
             await db.execute(f"DELETE FROM meetings WHERE id IN ({placeholders})", ids)
             await db.commit()
+    _delete_audio_files(ids)
     return {"ok": True, "deleted": len(ids)}
 
 
@@ -201,7 +220,7 @@ async def get_meeting(meeting_id: str) -> dict:
         meeting = dict(row)
 
         cursor = await db.execute(
-            "SELECT id, speaker, text, start_time, end_time, match_distance FROM utterances "
+            "SELECT id, speaker, text, start_time, end_time, match_distance, audio_start FROM utterances "
             "WHERE meeting_id = ? ORDER BY start_time",
             (meeting_id,),
         )
@@ -224,6 +243,7 @@ async def delete_meeting(meeting_id: str) -> dict:
         await db.execute("DELETE FROM utterances WHERE meeting_id = ?", (meeting_id,))
         await db.execute("DELETE FROM meetings WHERE id = ?", (meeting_id,))
         await db.commit()
+    _delete_audio_files([meeting_id])
     return {"ok": True}
 
 
@@ -478,12 +498,40 @@ async def get_transcript(meeting_id: str) -> dict:
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
-            "SELECT id, speaker, text, start_time, end_time, match_distance FROM utterances "
+            "SELECT id, speaker, text, start_time, end_time, match_distance, audio_start FROM utterances "
             "WHERE meeting_id = ? ORDER BY start_time",
             (meeting_id,),
         )
         utterances = [dict(u) async for u in cursor]
     return {"meeting_id": meeting_id, "utterances": utterances}
+
+
+@app.get("/api/meetings/{meeting_id}/audio")
+async def get_meeting_audio(meeting_id: str) -> FileResponse:
+    """Stream the meeting's Opus recording. Starlette's FileResponse
+    handles HTTP Range natively, which the browser's <audio> element uses
+    to seek — so `audio.currentTime = X` Just Works without any server
+    awareness of the requested offset."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT audio_path FROM meetings WHERE id = ?", (meeting_id,)
+        )
+        row = await cursor.fetchone()
+    if not row:
+        raise HTTPException(404, "Meeting not found")
+    audio_path_s = row[0]
+    # Fall back to the canonical location even if the DB row is missing
+    # an audio_path (e.g. the UPDATE raced a crash). The file is the truth.
+    candidates = [Path(audio_path_s)] if audio_path_s else []
+    candidates.append(AUDIO_DIR / f"{meeting_id}.opus")
+    for p in candidates:
+        if p.exists():
+            return FileResponse(
+                str(p),
+                media_type="audio/ogg",
+                filename=f"{meeting_id}.opus",
+            )
+    raise HTTPException(404, "No audio recorded for this meeting")
 
 
 # ── Status ───────────────────────────────────────────────────────────────────

@@ -20,6 +20,7 @@ CREATE TABLE IF NOT EXISTS meetings (
     summary     TEXT,
     action_items TEXT,
     vault_path  TEXT,
+    audio_path  TEXT,
     live_highlights                      TEXT,
     live_action_items_self               TEXT,
     live_action_items_others             TEXT,
@@ -34,6 +35,7 @@ CREATE TABLE IF NOT EXISTS utterances (
     text           TEXT NOT NULL,
     start_time     REAL NOT NULL,
     end_time       REAL NOT NULL,
+    audio_start    REAL,
     embedding      BLOB,
     match_distance REAL,
     created_at     TEXT NOT NULL DEFAULT (datetime('now'))
@@ -112,6 +114,8 @@ async def init_db() -> None:
         utterance_cols = {row[1] async for row in cursor}
         if "match_distance" not in utterance_cols:
             await db.execute("ALTER TABLE utterances ADD COLUMN match_distance REAL")
+        if "audio_start" not in utterance_cols:
+            await db.execute("ALTER TABLE utterances ADD COLUMN audio_start REAL")
 
         cursor = await db.execute("PRAGMA table_info(meetings)")
         meeting_cols = {row[1] async for row in cursor}
@@ -121,6 +125,7 @@ async def init_db() -> None:
             "live_action_items_others",
             "live_support_intelligence",
             "live_support_intelligence_history",
+            "audio_path",
         ):
             if col not in meeting_cols:
                 await db.execute(f"ALTER TABLE meetings ADD COLUMN {col} TEXT")

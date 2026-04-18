@@ -1,5 +1,8 @@
-import { useEffect, useMemo, useRef, useState } from "react";
-import { Check, Pencil, Plus, Scissors, GitBranch, ArrowUpToLine, ArrowDownToLine } from "lucide-react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  Check, Pencil, Plus, Scissors, GitBranch,
+  ArrowUpToLine, ArrowDownToLine, Play, Pause,
+} from "lucide-react";
 import { api } from "../lib/api";
 import type { Person, Utterance } from "../lib/api";
 import { Avatar } from "./Avatar";
@@ -18,6 +21,9 @@ interface BubbleGroup {
   text: string;            // joined text of all members
   start_time: number;      // anchor — used for trim/split actions
   end_time: number;
+  // Wall-clock seek target for this group's first utterance, + the speech-
+  // time span that drives playback stop. Null when the meeting has no .opus.
+  audio_start: number | null;
 }
 
 function groupUtterances(utterances: Utterance[]): BubbleGroup[] {
@@ -46,6 +52,7 @@ function groupUtterances(utterances: Utterance[]): BubbleGroup[] {
         text: u.text,
         start_time: u.start_time,
         end_time: u.end_time,
+        audio_start: u.audio_start ?? null,
       });
     }
   }
@@ -98,6 +105,88 @@ export function TranscriptView({
   const [toolsOpen, setToolsOpen] = useState<string | null>(null);
   const [newSpeakerDraft, setNewSpeakerDraft] = useState("");
   const bottomRef = useRef<HTMLDivElement>(null);
+
+  // Shared <audio> element + which bubble is currently playing. We drive the
+  // stop condition off a ref (not state) so the timeupdate handler stays
+  // free of re-renders.
+  const audioRef = useRef<HTMLAudioElement | null>(null);
+  const stopAtRef = useRef<number | null>(null);
+  const [playingAnchorId, setPlayingAnchorId] = useState<string | null>(null);
+
+  const stopPlayback = useCallback(() => {
+    const el = audioRef.current;
+    if (el && !el.paused) el.pause();
+    stopAtRef.current = null;
+    setPlayingAnchorId(null);
+  }, []);
+
+  const playSegment = useCallback(
+    async (anchorId: string, audioStart: number, durationSec: number) => {
+      if (!meetingId) return;
+      const el = audioRef.current;
+      if (!el) return;
+
+      // Toggle: clicking the same bubble pauses.
+      if (playingAnchorId === anchorId && !el.paused) {
+        stopPlayback();
+        return;
+      }
+
+      // Point the element at this meeting's audio — reassigning `.src`
+      // between meetings triggers a fresh load, but same-meeting re-plays
+      // are essentially free because the browser's HTTP cache (backed by
+      // Range requests on our FileResponse) keeps the bytes warm.
+      const desired = api.meetings.audioUrl(meetingId);
+      if (!el.src.endsWith(desired)) el.src = desired;
+
+      stopAtRef.current = audioStart + Math.max(0.2, durationSec);
+      setPlayingAnchorId(anchorId);
+      try {
+        el.currentTime = audioStart;
+        await el.play();
+      } catch (e) {
+        // No audio file (404), codec trouble, autoplay block — surface to
+        // the console; silently fail in the UI so the pill just doesn't
+        // animate.
+        console.warn("audio playback failed", e);
+        stopPlayback();
+      }
+    },
+    [meetingId, playingAnchorId, stopPlayback],
+  );
+
+  // Stop at segment end; clear playing state on pause/end.
+  useEffect(() => {
+    const el = audioRef.current;
+    if (!el) return;
+    const onTime = () => {
+      const stopAt = stopAtRef.current;
+      if (stopAt != null && el.currentTime >= stopAt) {
+        el.pause();
+      }
+    };
+    const onEnded = () => {
+      stopAtRef.current = null;
+      setPlayingAnchorId(null);
+    };
+    const onPause = () => {
+      stopAtRef.current = null;
+      setPlayingAnchorId(null);
+    };
+    el.addEventListener("timeupdate", onTime);
+    el.addEventListener("ended", onEnded);
+    el.addEventListener("pause", onPause);
+    return () => {
+      el.removeEventListener("timeupdate", onTime);
+      el.removeEventListener("ended", onEnded);
+      el.removeEventListener("pause", onPause);
+    };
+  }, []);
+
+  // Switching meetings stops any in-flight playback.
+  useEffect(() => {
+    stopPlayback();
+  }, [meetingId, stopPlayback]);
 
   useEffect(() => {
     if (!meetingId) { setUtterances([]); return; }
@@ -225,6 +314,9 @@ export function TranscriptView({
 
   return (
     <div className="h-full flex flex-col min-h-0">
+      {/* Shared audio element — one per TranscriptView instance. Never
+          rendered visibly; control happens via playSegment / stopPlayback. */}
+      <audio ref={audioRef} preload="none" style={{ display: "none" }} />
       <div className="flex-1 overflow-y-auto scrollbar-thin px-6 py-6 space-y-5">
         {groups.map((g, i) => {
           // Synthesize an Utterance-shaped object so the existing Bubble
@@ -236,8 +328,11 @@ export function TranscriptView({
             text: g.text,
             start_time: g.start_time,
             end_time: g.end_time,
+            audio_start: g.audio_start,
           };
           const anchorId = g.ids[0];
+          const canPlay = anchorId !== undefined && g.audio_start != null;
+          const isPlaying = canPlay && playingAnchorId === anchorId;
           return (
             <Bubble
               key={anchorId ?? i}
@@ -262,6 +357,12 @@ export function TranscriptView({
               onSplitHere={() => handleSplitHere(anchor)}
               isFirst={i === 0}
               isLast={i === groups.length - 1}
+              canPlay={canPlay}
+              isPlaying={isPlaying}
+              onTogglePlay={() => {
+                if (!canPlay || anchorId === undefined || g.audio_start == null) return;
+                playSegment(anchorId, g.audio_start, g.end_time - g.start_time);
+              }}
             />
           );
         })}
@@ -308,13 +409,16 @@ interface BubbleProps {
   onSplitHere: () => void;
   isFirst: boolean;
   isLast: boolean;
+  canPlay: boolean;
+  isPlaying: boolean;
+  onTogglePlay: () => void;
 }
 
 function Bubble({
   u, mine, enrolled, selfSpeaker, assignOpen,
   onOpenAssign, onAssign, newSpeakerDraft, onNewSpeakerDraft,
   editable, toolsOpen, onOpenTools, onTrimBefore, onTrimAfter, onSplitHere,
-  isFirst, isLast,
+  isFirst, isLast, canPlay, isPlaying, onTogglePlay,
 }: BubbleProps) {
   return (
     <div className={`flex gap-3 items-start group/bubble ${mine ? "flex-row-reverse" : ""}`}>
@@ -329,7 +433,21 @@ function Bubble({
             {u.speaker}
             {u.id !== undefined && <Pencil size={9} className="opacity-40 group-hover:opacity-100 transition-opacity" />}
           </button>
-          <span className="text-[10px] font-mono text-gray-600">{fmtTime(u.start_time)}</span>
+          {canPlay ? (
+            <button
+              onClick={onTogglePlay}
+              title={isPlaying ? "Stop playback" : "Play this segment"}
+              className={`inline-flex items-center gap-1 text-[10px] font-mono rounded-full px-1.5 py-0.5 border transition-colors
+                ${isPlaying
+                  ? "border-brand-400/70 text-brand-300 bg-brand-500/10"
+                  : "border-transparent text-gray-600 hover:text-gray-200 hover:border-gray-700"}`}
+            >
+              {isPlaying ? <Pause size={9} /> : <Play size={9} />}
+              {fmtTime(u.start_time)}
+            </button>
+          ) : (
+            <span className="text-[10px] font-mono text-gray-600">{fmtTime(u.start_time)}</span>
+          )}
           {editable && u.id !== undefined && (
             <div className="relative">
               <button
@@ -382,7 +500,8 @@ function Bubble({
         <div className={`relative inline-block max-w-[80%] px-3.5 py-2 rounded-2xl text-sm leading-relaxed border
           ${mine
             ? "bg-gradient-to-br from-brand-600 to-purple-700 text-white border-transparent shadow-lg shadow-brand-500/20 rounded-tr-sm"
-            : `${bubbleClassFor(u.speaker)} rounded-tl-sm`}`}
+            : `${bubbleClassFor(u.speaker)} rounded-tl-sm`}
+          ${isPlaying ? "ring-2 ring-brand-400/60" : ""}`}
         >
           {u.text}
 

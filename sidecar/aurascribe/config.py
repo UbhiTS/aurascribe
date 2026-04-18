@@ -44,6 +44,10 @@ APP_DATA.mkdir(parents=True, exist_ok=True)
 DB_PATH: Path = APP_DATA / "aurascribe.db"
 MODELS_DIR: Path = APP_DATA / "models"
 MODELS_DIR.mkdir(parents=True, exist_ok=True)
+# Per-meeting raw-audio recordings (OGG Opus, 24 kbps mono). One file per
+# meeting, named <meeting_id>.opus. Deleted alongside the meeting row.
+AUDIO_DIR: Path = APP_DATA / "audio"
+AUDIO_DIR.mkdir(parents=True, exist_ok=True)
 
 if OBSIDIAN_VAULT:
     VAULT_MEETINGS: Path | None = OBSIDIAN_VAULT / "AuraScribe" / "Meetings"
