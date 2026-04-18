@@ -17,22 +17,34 @@ type StatusEvent =
 export default function App() {
   const [page, setPage] = useState<Page>("live");
   const [appStatus, setAppStatus] = useState<AppStatus | null>(null);
-  const [selectedMeetingId, setSelectedMeetingId] = useState<string | null>(null);
-  const [selectedMeeting, setSelectedMeeting] = useState<Meeting | null>(null);
+  // Two completely separate meeting slices:
+  //  - live*  — driven by recording start/stop + WebSocket utterance stream; owned by LiveFeed.
+  //  - review*— driven by clicks in Meeting Library; owned by Review page.
+  // Loading a library meeting must NEVER touch live* (or vice versa).
+  const [liveMeetingId, setLiveMeetingId] = useState<string | null>(null);
+  const [liveMeeting, setLiveMeeting] = useState<Meeting | null>(null);
+  const [reviewMeetingId, setReviewMeetingId] = useState<string | null>(null);
+  const [reviewMeeting, setReviewMeeting] = useState<Meeting | null>(null);
   const [liveUtterances, setLiveUtterances] = useState<Utterance[]>([]);
   const [livePartial, setLivePartial] = useState<{ speaker: string; text: string } | null>(null);
   const [statusMessage, setStatusMessage] = useState("Loading models...");
   const [systemStatus, setSystemStatus] = useState<StatusEvent>("loading");
   const [refreshKey, setRefreshKey] = useState(0);
   const [enrolled, setEnrolled] = useState<Person[]>([]);
-  const selectedMeetingIdRef = useRef<string | null>(null);
+  // WS utterance filter keys off the LIVE meeting only — library loads can't redirect the stream.
+  const liveMeetingIdRef = useRef<string | null>(null);
 
-  useEffect(() => { selectedMeetingIdRef.current = selectedMeetingId; }, [selectedMeetingId]);
+  useEffect(() => { liveMeetingIdRef.current = liveMeetingId; }, [liveMeetingId]);
 
   useEffect(() => {
-    if (!selectedMeetingId) { setSelectedMeeting(null); return; }
-    api.meetings.get(selectedMeetingId).then(setSelectedMeeting).catch(console.error);
-  }, [selectedMeetingId]);
+    if (!liveMeetingId) { setLiveMeeting(null); return; }
+    api.meetings.get(liveMeetingId).then(setLiveMeeting).catch(console.error);
+  }, [liveMeetingId]);
+
+  useEffect(() => {
+    if (!reviewMeetingId) { setReviewMeeting(null); return; }
+    api.meetings.get(reviewMeetingId).then(setReviewMeeting).catch(console.error);
+  }, [reviewMeetingId]);
 
   // Poll /api/status until engine_ready — WS "ready" broadcast can fire before
   // the client's socket connects on cached-model fast boot.
@@ -63,30 +75,34 @@ export default function App() {
   useEffect(() => { refreshEnrolled(); }, [refreshEnrolled]);
 
   const handleWsMessage = useCallback((msg: any) => {
-    if (msg.type === "partial_utterance" && msg.meeting_id === selectedMeetingIdRef.current) {
+    if (msg.type === "partial_utterance" && msg.meeting_id === liveMeetingIdRef.current) {
       if (!msg.text) setLivePartial(null);
       else setLivePartial((prev) =>
         !prev || msg.text.length >= prev.text.length
           ? { speaker: msg.speaker, text: msg.text }
           : prev);
     }
-    if (msg.type === "utterances" && msg.meeting_id === selectedMeetingIdRef.current) {
+    if (msg.type === "utterances" && msg.meeting_id === liveMeetingIdRef.current) {
       setLivePartial(null);
       setLiveUtterances((prev) => [...prev, ...msg.data]);
     }
     if (msg.type === "status") {
       setSystemStatus(msg.event as StatusEvent);
       setStatusMessage(msg.message ?? "");
-      if (msg.event === "done") {
+      if (msg.event === "done" && msg.meeting_id) {
         setRefreshKey((k) => k + 1);
-        if (msg.meeting_id) api.meetings.get(msg.meeting_id).then(setSelectedMeeting).catch(() => {});
+        // Refresh the live meeting card with its finalized data (summary, action items, vault_path).
+        // Only the live pane gets updated — review's meeting is untouched.
+        if (msg.meeting_id === liveMeetingIdRef.current) {
+          api.meetings.get(msg.meeting_id).then(setLiveMeeting).catch(() => {});
+        }
       }
     }
   }, []);
   useWebSocket(handleWsMessage);
 
   const handleMeetingStarted = (id: string) => {
-    setSelectedMeetingId(id);
+    setLiveMeetingId(id);
     setLiveUtterances([]);
     setLivePartial(null);
     setAppStatus((s) => s ? { ...s, is_recording: true, current_meeting_id: id } : s);
@@ -97,9 +113,9 @@ export default function App() {
     setAppStatus((s) => s ? { ...s, is_recording: false, current_meeting_id: null } : s);
   };
 
-  // Heuristic: if any meeting has a vault_path, Obsidian is writing.
+  // Heuristic: if the current live or review meeting has a vault_path, Obsidian is writing.
   // (Full check would need a /api/settings/obsidian endpoint.)
-  const obsidianConfigured = !!selectedMeeting?.vault_path;
+  const obsidianConfigured = !!(liveMeeting?.vault_path || reviewMeeting?.vault_path);
 
   // Device name lookup for the header.
   const activeDeviceName = appStatus?.audio_devices[0]?.name ?? null;
@@ -116,10 +132,9 @@ export default function App() {
       {page === "live" && (
         <LiveFeed
           appStatus={appStatus}
-          selectedMeeting={selectedMeeting}
-          setSelectedMeeting={setSelectedMeeting}
-          selectedMeetingId={selectedMeetingId}
-          setSelectedMeetingId={setSelectedMeetingId}
+          meeting={liveMeeting}
+          setMeeting={setLiveMeeting}
+          meetingId={liveMeetingId}
           liveUtterances={liveUtterances}
           livePartial={livePartial}
           enrolled={enrolled}
@@ -133,20 +148,21 @@ export default function App() {
         <MeetingLibrary
           activeMeetingId={appStatus?.current_meeting_id ?? null}
           refreshKey={refreshKey}
-          onOpen={(id) => { setSelectedMeetingId(id); setLiveUtterances([]); setPage("review"); }}
-          selectedId={selectedMeetingId}
+          // Load a library meeting into Review only. Live pane is untouched.
+          onOpen={(id) => { setReviewMeetingId(id); setPage("review"); }}
+          selectedId={reviewMeetingId}
         />
       )}
       {page === "review" && (
         <Review
-          meeting={selectedMeeting}
-          meetingId={selectedMeetingId}
-          setMeeting={setSelectedMeeting}
+          meeting={reviewMeeting}
+          meetingId={reviewMeetingId}
+          setMeeting={setReviewMeeting}
           enrolled={enrolled}
           onEnrolledChanged={refreshEnrolled}
           onBack={() => setPage("library")}
           onMeetingChanged={() => setRefreshKey((k) => k + 1)}
-          onOpenMeeting={(id) => { setSelectedMeetingId(id); }}
+          onOpenMeeting={(id) => { setReviewMeetingId(id); }}
         />
       )}
       {page === "enrollment" && (

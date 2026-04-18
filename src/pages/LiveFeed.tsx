@@ -7,10 +7,10 @@ import { TranscriptView } from "../components/TranscriptView";
 
 interface Props {
   appStatus: AppStatus | null;
-  selectedMeeting: Meeting | null;
-  setSelectedMeeting: (m: Meeting | null) => void;
-  selectedMeetingId: string | null;
-  setSelectedMeetingId: (id: string | null) => void;
+  // The live meeting — fully isolated from Meeting Library / Review state.
+  meeting: Meeting | null;
+  setMeeting: (m: Meeting | null) => void;
+  meetingId: string | null;
   liveUtterances: Utterance[];
   livePartial: { speaker: string; text: string } | null;
   enrolled: Person[];
@@ -21,8 +21,7 @@ interface Props {
 }
 
 export function LiveFeed({
-  appStatus, selectedMeeting, setSelectedMeeting,
-  selectedMeetingId, setSelectedMeetingId,
+  appStatus, meeting, setMeeting, meetingId,
   liveUtterances, livePartial, enrolled, onEnrolledChanged,
   onMeetingStarted, onMeetingStopped, bumpRefreshKey,
 }: Props) {
@@ -35,25 +34,25 @@ export function LiveFeed({
   const selfSpeaker = enrolled.find((p) => p.name === "Me")?.name ?? "Me";
 
   const handleRenameTitle = async () => {
-    if (!selectedMeetingId || !titleDraft.trim()) { setEditingTitle(false); return; }
-    await api.meetings.rename(selectedMeetingId, titleDraft.trim());
-    setSelectedMeeting(selectedMeeting ? { ...selectedMeeting, title: titleDraft.trim() } : null);
+    if (!meetingId || !titleDraft.trim()) { setEditingTitle(false); return; }
+    await api.meetings.rename(meetingId, titleDraft.trim());
+    setMeeting(meeting ? { ...meeting, title: titleDraft.trim() } : null);
     bumpRefreshKey();
     setEditingTitle(false);
   };
 
   const handleSummarize = async () => {
-    if (!selectedMeetingId || summarizing) return;
+    if (!meetingId || summarizing) return;
     setSummarizing(true);
     try {
-      const updated = await api.meetings.summarize(selectedMeetingId);
-      setSelectedMeeting(updated);
+      const updated = await api.meetings.summarize(meetingId);
+      setMeeting(updated);
     } finally {
       setSummarizing(false);
     }
   };
 
-  const actionItems = parseActionItems(selectedMeeting?.action_items ?? null);
+  const actionItems = parseActionItems(meeting?.action_items ?? null);
 
   return (
     <div className="h-full flex flex-col min-h-0">
@@ -62,7 +61,7 @@ export function LiveFeed({
         <RecordingBar
           isRecording={isRecording}
           devices={appStatus?.audio_devices ?? []}
-          onStarted={(id) => { onMeetingStarted(id); setSelectedMeetingId(id); }}
+          onStarted={onMeetingStarted}
           onStopped={onMeetingStopped}
         />
       </div>
@@ -87,12 +86,12 @@ export function LiveFeed({
                 ) : (
                   <div className="flex items-center gap-1.5 group/title min-w-0 mt-0.5">
                     <p className="text-xs text-gray-500 truncate">
-                      {selectedMeeting?.title ?? (isRecording ? "Recording..." : "No transcription selected")}
-                      {selectedMeeting?.started_at && ` · ${new Date(selectedMeeting.started_at).toLocaleString()}`}
+                      {meeting?.title ?? (isRecording ? "Recording..." : "No transcription selected")}
+                      {meeting?.started_at && ` · ${new Date(meeting.started_at).toLocaleString()}`}
                     </p>
-                    {selectedMeeting && (
+                    {meeting && (
                       <button
-                        onClick={() => { setTitleDraft(selectedMeeting.title); setEditingTitle(true); }}
+                        onClick={() => { setTitleDraft(meeting.title); setEditingTitle(true); }}
                         title="Rename transcription"
                         className="flex-shrink-0 opacity-0 group-hover/title:opacity-100 text-gray-600 hover:text-gray-300 transition-all"
                       >
@@ -103,7 +102,7 @@ export function LiveFeed({
                 )}
               </div>
 
-              {selectedMeeting && selectedMeeting.status === "done" && (
+              {meeting && meeting.status === "done" && (
                 <button
                   onClick={handleSummarize}
                   disabled={summarizing}
@@ -117,7 +116,7 @@ export function LiveFeed({
 
             <div className="flex-1 min-h-0 bg-circuit">
               <TranscriptView
-                meetingId={selectedMeetingId}
+                meetingId={meetingId}
                 liveUtterances={liveUtterances}
                 livePartial={livePartial}
                 isRecording={isRecording}
@@ -133,9 +132,9 @@ export function LiveFeed({
         <aside className="min-h-0 overflow-y-auto space-y-3">
           <h2 className="text-xl font-bold text-gray-100 tracking-tight px-1 pt-1">Live Intelligence</h2>
           <Card title="Real-Time Highlights" gradient>
-            {selectedMeeting?.summary ? (
+            {meeting?.summary ? (
               <pre className="text-xs text-gray-300 whitespace-pre-wrap font-sans leading-relaxed">
-                {extractHighlights(selectedMeeting.summary)}
+                {extractHighlights(meeting.summary)}
               </pre>
             ) : (
               <p className="text-xs text-gray-500 italic">
@@ -156,9 +155,9 @@ export function LiveFeed({
             )}
           </Card>
 
-          {selectedMeeting?.vault_path && (
+          {meeting?.vault_path && (
             <Card title="Obsidian">
-              <p className="text-xs text-gray-400 break-all">{selectedMeeting.vault_path}</p>
+              <p className="text-xs text-gray-400 break-all">{meeting.vault_path}</p>
             </Card>
           )}
         </aside>
