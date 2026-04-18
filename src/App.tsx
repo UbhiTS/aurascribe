@@ -42,10 +42,6 @@ export default function App() {
   const [systemStatus, setSystemStatus] = useState<StatusEvent>("loading");
   const [refreshKey, setRefreshKey] = useState(0);
   const [voices, setVoices] = useState<Voice[]>([]);
-  // Bumped whenever the sidecar finishes an auto-recompute for the currently
-  // selected review meeting. Review passes this into TranscriptView so the
-  // transcript re-fetches even though the meeting id didn't change.
-  const [reviewRecomputeTick, setReviewRecomputeTick] = useState(0);
   // Pushed by WS whenever the daily brief for a given date changes state.
   // DailyBrief watches this and refetches when the date matches its view.
   const [dailyBriefSignal, setDailyBriefSignal] = useState<
@@ -132,23 +128,6 @@ export default function App() {
       });
       setIntelTick((t) => t + 1);
     }
-    if (msg.type === "recompute_done" && typeof msg.meeting_id === "string") {
-      // The debounced auto-recompute just landed. Refetch the affected
-      // meeting so whatever pane is showing it picks up the new speakers.
-      const mid = msg.meeting_id;
-      if (mid === liveMeetingIdRef.current) {
-        api.meetings.get(mid).then(setLiveMeeting).catch(() => {});
-      }
-      // Review has its own id state — if it matches, refetch + bump the
-      // transcript tick so TranscriptView re-fetches utterances too.
-      setReviewMeetingId((currentId) => {
-        if (currentId === mid) {
-          api.meetings.get(mid).then(setReviewMeeting).catch(() => {});
-          setReviewRecomputeTick((t) => t + 1);
-        }
-        return currentId;
-      });
-    }
     if (msg.type === "daily_brief_updated" && typeof msg.date === "string") {
       setDailyBriefSignal((prev) => ({
         date: msg.date,
@@ -191,9 +170,11 @@ export default function App() {
     setAppStatus((s) => s ? { ...s, is_recording: false, current_meeting_id: null, active_audio_device: null } : s);
   };
 
-  // Heuristic: if the current live or review meeting has a vault_path, Obsidian is writing.
-  // (Full check would need a /api/settings/obsidian endpoint.)
-  const obsidianConfigured = !!(liveMeeting?.vault_path || reviewMeeting?.vault_path);
+  // Authoritative — sourced from /api/status (config.OBSIDIAN_VAULT). This
+  // doesn't wait for a vault_path to be stamped on a meeting after the first
+  // markdown write, which used to make the header lie for the first ~15s of
+  // a recording.
+  const obsidianConfigured = appStatus?.obsidian_configured ?? false;
 
   const isRecording = appStatus?.is_recording ?? false;
 
@@ -245,7 +226,6 @@ export default function App() {
           onBack={() => setPage("library")}
           onMeetingChanged={() => setRefreshKey((k) => k + 1)}
           onOpenMeeting={(id) => { setReviewMeetingId(id); }}
-          externalRefreshTick={reviewRecomputeTick}
         />
       )}
       {page === "voices" && (

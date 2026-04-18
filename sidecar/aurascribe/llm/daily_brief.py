@@ -164,9 +164,26 @@ async def build_brief(brief_date: str) -> dict:
             brief_date, raw[:200],
         )
         # Persist a stub so the UI doesn't think generation never ran. The
-        # user can hit Refresh to try again.
+        # message shown distinguishes "model returned nothing" (the common
+        # reasoning-model failure mode — see chat() for the diagnostic log)
+        # from "model returned text but it wasn't JSON". Both are actionable
+        # but in different ways, so the UI shouldn't lump them together.
         brief = dict(EMPTY_BRIEF)
-        brief["tldr"] = "(Brief generation failed to parse LLM output. Hit refresh to retry.)"
+        if not raw.strip():
+            brief["tldr"] = (
+                "Brief generation failed — the LLM returned no content. "
+                "Most likely the model burned its whole output budget on internal "
+                "reasoning before producing JSON. Fix: in Settings, raise "
+                "`llm_context_tokens` to your model's actual context window "
+                "(e.g. 32768), or switch `llm_model` to a non-reasoning model. "
+                "Then hit Refresh."
+            )
+        else:
+            brief["tldr"] = (
+                "Brief generation failed — the LLM returned text but it wasn't "
+                "valid JSON. Check the sidecar log for the raw response, then "
+                "hit Refresh to retry."
+            )
     else:
         brief = _normalize_brief(parsed)
 

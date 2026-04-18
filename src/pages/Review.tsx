@@ -1,6 +1,6 @@
-import { useEffect, useMemo, useState } from "react";
+import { useMemo, useState } from "react";
 import { ArrowLeft, Clock, Loader, Pencil, Sparkles, CheckSquare, Square, FileText, Wand2 } from "lucide-react";
-import { api } from "../lib/api";
+import { api, tagsPending } from "../lib/api";
 import type { Meeting, Voice } from "../lib/api";
 import { TranscriptView } from "../components/TranscriptView";
 
@@ -13,14 +13,11 @@ interface Props {
   onBack: () => void;
   onMeetingChanged: () => void;  // bump refreshKey so library re-loads
   onOpenMeeting: (id: string) => void;  // navigate to another meeting (e.g. part 2 after split)
-  // Incremented by App when a debounced auto-recompute lands on THIS meeting.
-  // Used to re-fetch transcript utterances without a navigation.
-  externalRefreshTick?: number;
 }
 
 export function Review({
   meeting, meetingId, setMeeting, voices, onVoicesChanged,
-  onBack, onMeetingChanged, onOpenMeeting, externalRefreshTick = 0,
+  onBack, onMeetingChanged, onOpenMeeting,
 }: Props) {
   const [editingTitle, setEditingTitle] = useState(false);
   const [titleDraft, setTitleDraft] = useState("");
@@ -28,12 +25,6 @@ export function Review({
   const [busy, setBusy] = useState(false);
   const [recomputing, setRecomputing] = useState(false);
   const [transcriptKey, setTranscriptKey] = useState(0);
-
-  // When the backend's debounced recompute finishes, App bumps this tick.
-  // Bump our own transcript key so TranscriptView re-fetches utterances.
-  useEffect(() => {
-    if (externalRefreshTick > 0) setTranscriptKey((k) => k + 1);
-  }, [externalRefreshTick]);
 
   const selfSpeaker = voices.find((v) => v.name === "Me")?.name ?? "Me";
   const actionItems = useMemo(() => parseActionItems(meeting?.action_items ?? null), [meeting]);
@@ -143,15 +134,31 @@ export function Review({
           <div className="ml-auto flex items-center gap-2">
             {meeting.status === "done" && (
               <>
-                <button
-                  onClick={handleRecompute}
-                  disabled={recomputing || busy || summarizing}
-                  title="Re-run diarization against the current Voices DB — fixes mislabeled or merged speaker pills"
-                  className="flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-medium rounded-lg border transition-colors disabled:opacity-50 border-gray-700 text-gray-300 bg-gray-800/60 hover:border-gray-500 hover:bg-gray-800"
-                >
-                  {recomputing ? <Loader size={12} className="animate-spin" /> : <Wand2 size={12} />}
-                  Recompute voices
-                </button>
+                {(() => {
+                  const pending = tagsPending(meeting);
+                  return (
+                    <button
+                      onClick={handleRecompute}
+                      disabled={recomputing || busy || summarizing}
+                      title={
+                        pending
+                          ? "Tags pending — Recompute to apply the latest Voices to this meeting's pills"
+                          : "Re-run diarization against the current Voices DB — fixes mislabeled or merged speaker pills"
+                      }
+                      className={`flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-medium rounded-lg border transition-colors disabled:opacity-50 ${
+                        pending
+                          ? "border-amber-700 text-amber-300 bg-amber-950/30 hover:bg-amber-950/50"
+                          : "border-gray-700 text-gray-300 bg-gray-800/60 hover:border-gray-500 hover:bg-gray-800"
+                      }`}
+                    >
+                      {recomputing ? <Loader size={12} className="animate-spin" /> : <Wand2 size={12} />}
+                      Recompute voices
+                      {pending && !recomputing && (
+                        <span className="w-1.5 h-1.5 rounded-full bg-amber-400 animate-pulse" />
+                      )}
+                    </button>
+                  );
+                })()}
                 <button
                   onClick={handleSummarize}
                   disabled={summarizing || busy}

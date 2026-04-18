@@ -218,7 +218,6 @@ function VoiceDetailPane({ detail, allVoices, onChanged, onDeleted }: DetailProp
   };
 
   const handleDeleteSnippet = async (snippetId: string) => {
-    if (!confirm("Remove this sample from the Voice? (The utterance stays tagged — only the training embedding goes.)")) return;
     try {
       await api.voices.deleteSnippet(detail.id, snippetId);
       await onChanged();
@@ -228,7 +227,6 @@ function VoiceDetailPane({ detail, allVoices, onChanged, onDeleted }: DetailProp
   };
 
   const handleDeleteVoice = async () => {
-    if (!confirm(`Delete "${detail.name}"? Every utterance tagged with this voice will revert to Unknown.`)) return;
     try {
       await api.voices.delete(detail.id);
       onDeleted();
@@ -240,7 +238,6 @@ function VoiceDetailPane({ detail, allVoices, onChanged, onDeleted }: DetailProp
   const handleMerge = async (intoId: string) => {
     const into = allVoices.find((v) => v.id === intoId);
     if (!into) return;
-    if (!confirm(`Merge "${detail.name}" into "${into.name}"? All samples and pills move over, then "${detail.name}" is deleted.`)) return;
     try {
       await api.voices.merge(detail.id, intoId);
       setMergeOpen(false);

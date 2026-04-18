@@ -11,7 +11,11 @@ endpoint, and most commercial gateways. Swap providers by pointing
 """
 from __future__ import annotations
 
+import logging
+
 from aurascribe.config import LLM_API_KEY, LLM_BASE_URL, LLM_MODEL
+
+log = logging.getLogger("aurascribe.llm")
 
 _client = None
 
@@ -59,7 +63,27 @@ async def chat(
             temperature=temperature,
             max_tokens=max_tokens,
         )
-        return response.choices[0].message.content.strip()
+        choice = response.choices[0]
+        content = (choice.message.content or "").strip()
+        # Empty output usually means the model hit max_tokens before producing
+        # any content (reasoning models burn the whole budget on internal
+        # thinking) or the input exceeded the actual context window. Surface
+        # finish_reason + usage so the operator can tell which one it is.
+        if not content:
+            usage = getattr(response, "usage", None)
+            log.warning(
+                "LLM returned empty content. model=%s finish_reason=%s "
+                "usage=prompt:%s completion:%s total:%s max_tokens=%s. "
+                "Likely fixes: raise llm_context_tokens in Settings, or use "
+                "a model that doesn't burn the whole output budget on reasoning.",
+                model,
+                getattr(choice, "finish_reason", "?"),
+                getattr(usage, "prompt_tokens", "?") if usage else "?",
+                getattr(usage, "completion_tokens", "?") if usage else "?",
+                getattr(usage, "total_tokens", "?") if usage else "?",
+                max_tokens,
+            )
+        return content
     except Exception as e:
         msg = str(e).lower()
         if "connect" in msg or "connection" in msg or "refused" in msg:

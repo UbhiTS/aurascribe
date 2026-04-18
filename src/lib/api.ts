@@ -34,6 +34,21 @@ export interface Meeting {
   live_action_items_self: string | null;
   live_action_items_others: string | null;
   live_support_intelligence: string | null;
+  // Bumped on every pill/voice change that affects this meeting's labels.
+  // Compared against last_recomputed_at by `tagsPending` to flag the
+  // "Recompute to apply" hint.
+  last_tagged_at: string | null;
+  last_recomputed_at: string | null;
+}
+
+/**
+ * True when this meeting has had label-affecting changes since the last
+ * recompute (or has never been recomputed and has at least one tag).
+ */
+export function tagsPending(m: Pick<Meeting, "last_tagged_at" | "last_recomputed_at"> | null | undefined): boolean {
+  if (!m || !m.last_tagged_at) return false;
+  if (!m.last_recomputed_at) return true;
+  return m.last_tagged_at > m.last_recomputed_at;
 }
 
 export interface ActionItemOther {
@@ -121,6 +136,10 @@ export interface AppStatus {
   // now. null when idle. The dropdown in the UI can lie (default-mic, name
   // mismatch) — this is the authoritative source.
   active_audio_device: string | null;
+  // True iff the sidecar's `OBSIDIAN_VAULT` is set. Authoritative — the
+  // header uses this directly instead of inferring from meeting vault_paths
+  // (which only land after the first markdown write).
+  obsidian_configured: boolean;
 }
 
 export interface DailyBriefDecision {

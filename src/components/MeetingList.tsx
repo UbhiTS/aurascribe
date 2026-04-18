@@ -1,6 +1,6 @@
 import { useEffect, useState, useRef, useCallback } from "react";
 import { Clock, FileText, Loader, CheckSquare, Square, Trash2 } from "lucide-react";
-import { api } from "../lib/api";
+import { api, tagsPending } from "../lib/api";
 import type { Meeting } from "../lib/api";
 
 const PAGE_SIZE = 20;
@@ -233,6 +233,12 @@ export function MeetingList({ selectedId, activeMeetingId, onSelect, onDeleted, 
                       {m.status === "processing" && <Loader size={10} className="animate-spin text-amber-400 flex-shrink-0" />}
                       {m.status === "done"       && <FileText size={10} className="text-gray-600 flex-shrink-0" />}
                       <span className="text-sm text-gray-200 truncate font-medium">{m.title}</span>
+                      {tagsPending(m) && (
+                        <span
+                          title="Tags pending — open and click Recompute voices"
+                          className="w-1.5 h-1.5 rounded-full bg-amber-400 flex-shrink-0"
+                        />
+                      )}
                     </div>
                     <div className="flex items-center gap-1 mt-0.5 text-xs text-gray-500">
                       <Clock size={10} />

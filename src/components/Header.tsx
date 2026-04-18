@@ -1,4 +1,4 @@
-import { Brain, FolderCheck, FolderX, Mic, Plug, PlugZap, Radio } from "lucide-react";
+import { Book, Brain, Mic, Plug, PlugZap, Radio } from "lucide-react";
 import type { LLMHealth } from "../lib/useLLMHealth";
 
 type StatusEvent =
@@ -91,6 +91,26 @@ export function Header({
         </span>
       </div>
 
+      <div className="h-4 w-px bg-gray-800" />
+
+      {/* Obsidian — icon color carries the state, no extra label */}
+      <div
+        className="flex items-center gap-1.5 text-xs"
+        title={
+          obsidianConfigured
+            ? "Obsidian vault configured — meetings are mirrored to markdown"
+            : "Obsidian vault not set — meetings won't be written to markdown. Configure in Settings → Obsidian."
+        }
+      >
+        <Book
+          size={13}
+          className={obsidianConfigured ? "text-emerald-400" : "text-red-400"}
+        />
+        <span className={obsidianConfigured ? "text-gray-300" : "text-red-400"}>
+          Obsidian
+        </span>
+      </div>
+
       {/* Active recording mic — only while recording */}
       {isRecording && (
         <>
@@ -109,16 +129,6 @@ export function Header({
       )}
 
       <div className="flex-1" />
-
-      {/* Obsidian — icon only, detail in tooltip */}
-      <div
-        className="flex items-center"
-        title={obsidianConfigured ? "Obsidian vault configured" : "Obsidian vault not set — meetings won't be written to markdown"}
-      >
-        {obsidianConfigured
-          ? <FolderCheck size={14} className="text-emerald-400" />
-          : <FolderX size={14} className="text-gray-600" />}
-      </div>
 
       <StatusPill status={systemStatus} message={statusMessage} />
     </header>

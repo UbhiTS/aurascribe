@@ -171,7 +171,8 @@ async def list_meetings(limit: int = 20, offset: int = 0, days: int = 2) -> list
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
-            "SELECT id, title, started_at, ended_at, status, vault_path "
+            "SELECT id, title, started_at, ended_at, status, vault_path, "
+            "       last_tagged_at, last_recomputed_at "
             "FROM meetings WHERE started_at >= ? ORDER BY started_at DESC LIMIT ? OFFSET ?",
             (cutoff, limit, offset),
         )
@@ -707,6 +708,10 @@ async def get_status() -> dict:
         "current_meeting_id": manager.current_meeting_id,
         "audio_devices": manager.list_audio_devices(),
         "active_audio_device": manager.active_device_name,
+        # True iff config.obsidian_vault is set. Lets the header show the
+        # vault state without waiting for a vault_path to be stamped on a
+        # meeting (which only happens after the first markdown write).
+        "obsidian_configured": config.OBSIDIAN_VAULT is not None,
     }
 
 
@@ -978,6 +983,29 @@ async def _next_voice_color(db: aiosqlite.Connection) -> str:
     return _VOICE_COLORS[n % len(_VOICE_COLORS)]
 
 
+async def _bump_meeting_tag(db: aiosqlite.Connection, meeting_id: str) -> None:
+    """Mark this meeting as having had a label change, so the UI can show
+    a 'Tags pending — Recompute to apply' indicator."""
+    await db.execute(
+        "UPDATE meetings SET last_tagged_at = ? WHERE id = ?",
+        (datetime.now().isoformat(), meeting_id),
+    )
+
+
+async def _bump_meetings_for_voice(
+    db: aiosqlite.Connection, voice_id: str
+) -> None:
+    """Same idea, but for voice-level changes (rename / delete / merge)
+    that can affect every meeting where this voice was tagged. Bumps each
+    affected meeting in one statement."""
+    await db.execute(
+        "UPDATE meetings SET last_tagged_at = ? "
+        "WHERE id IN (SELECT DISTINCT meeting_id FROM voice_embeddings "
+        "             WHERE voice_id = ? AND meeting_id IS NOT NULL)",
+        (datetime.now().isoformat(), voice_id),
+    )
+
+
 async def _get_or_create_voice(
     db: aiosqlite.Connection, name: str
 ) -> str:
@@ -1090,6 +1118,10 @@ async def update_voice(voice_id: str, req: VoicePatch) -> dict:
                 "UPDATE utterances SET speaker = ? WHERE speaker = ?",
                 (new_name, old_name),
             )
+            # Renaming a voice changes pill text everywhere it appears.
+            # Recompute won't change the labels (text is direct) but we still
+            # bump so library cards can flag "labels changed since recompute".
+            await _bump_meetings_for_voice(db, voice_id)
 
         if req.color is not None:
             await db.execute(
@@ -1114,6 +1146,10 @@ async def delete_voice(voice_id: str) -> dict:
             raise HTTPException(404, "Voice not found")
         name = row["name"]
 
+        # Capture which meetings will be affected BEFORE the delete cascade
+        # nukes voice_embeddings — we need the meeting list for the bump.
+        await _bump_meetings_for_voice(db, voice_id)
+
         # voice_embeddings has ON DELETE CASCADE, but cascade only fires with
         # PRAGMA foreign_keys enabled for this connection — set it explicitly.
         await db.execute("PRAGMA foreign_keys = ON")
@@ -1134,13 +1170,25 @@ async def delete_voice_snippet(voice_id: str, snippet_id: str) -> dict:
     keeps its speaker label — only the pool entry goes, so future matches
     rely on the remaining embeddings."""
     async with aiosqlite.connect(DB_PATH) as db:
+        # Capture the meeting before the row is gone so we can flag it for
+        # recompute. Removing a sample changes the matcher's output for any
+        # future recompute of meetings where this voice was tagged.
+        cursor = await db.execute(
+            "SELECT meeting_id FROM voice_embeddings WHERE id = ? AND voice_id = ?",
+            (snippet_id, voice_id),
+        )
+        row = await cursor.fetchone()
+        affected_meeting = row[0] if row else None
+
         cursor = await db.execute(
             "DELETE FROM voice_embeddings WHERE id = ? AND voice_id = ?",
             (snippet_id, voice_id),
         )
-        await db.commit()
         if cursor.rowcount == 0:
             raise HTTPException(404, "Snippet not found")
+        if affected_meeting:
+            await _bump_meeting_tag(db, affected_meeting)
+        await db.commit()
 
     await manager.engine.reload_voices()
     return {"ok": True}
@@ -1170,6 +1218,11 @@ async def merge_voices(req: VoiceMergeRequest) -> dict:
             raise HTTPException(404, "One or both voices not found")
         from_name = rows[req.from_id]
         into_name = rows[req.into_id]
+
+        # Bump every meeting that referenced either side BEFORE the merge —
+        # afterwards the from-side is gone and we can't enumerate it.
+        await _bump_meetings_for_voice(db, req.from_id)
+        await _bump_meetings_for_voice(db, req.into_id)
 
         await db.execute(
             "UPDATE voice_embeddings SET voice_id = ? WHERE voice_id = ?",
@@ -1248,13 +1301,13 @@ async def rename_speaker(meeting_id: str, req: RenameSpeakerRequest) -> dict:
             "UPDATE voices SET updated_at = ? WHERE id = ?",
             (datetime.now().isoformat(), voice_id),
         )
+        await _bump_meeting_tag(db, meeting_id)
         await db.commit()
 
     if is_provisional:
         manager.release_provisional_label(meeting_id, req.old_name)
     await manager.engine.reload_voices()
     await _rewrite_vault(meeting_id)
-    _schedule_recompute_debounced(meeting_id)
     return {"ok": True, "voice_id": voice_id}
 
 
@@ -1336,11 +1389,11 @@ async def assign_utterance_speaker(
                 "UPDATE voices SET updated_at = ? WHERE id = ?",
                 (datetime.now().isoformat(), voice_id),
             )
+        await _bump_meeting_tag(db, meeting_id)
         await db.commit()
 
     await manager.engine.reload_voices()
     await _rewrite_vault(meeting_id)
-    _schedule_recompute_debounced(meeting_id)
     return {"ok": True, "speaker": "Unknown" if is_clear else new_speaker}
 
 
@@ -1447,6 +1500,12 @@ async def _do_recompute(meeting_id: str) -> dict:
                 (best_speaker, best_distance, u["id"]),
             )
             updated += 1
+        # Stamp the recompute completion so the UI can clear the
+        # "Tags pending" badge.
+        await db.execute(
+            "UPDATE meetings SET last_recomputed_at = ? WHERE id = ?",
+            (datetime.now().isoformat(), meeting_id),
+        )
         await db.commit()
 
     await _rewrite_vault(meeting_id)
@@ -1470,62 +1529,3 @@ async def recompute_meeting_speakers(meeting_id: str) -> dict:
     return {"ok": True, **result}
 
 
-# ── Debounced auto-recompute after tagging ───────────────────────────────────
-#
-# When the user tags a pill, we don't recompute immediately — a flurry of
-# tags during a review session would thrash the diarization pipeline. Instead
-# we schedule a single debounced run per meeting: every new tag cancels the
-# pending timer and starts a fresh one, so the actual recompute only fires
-# 10s after the user stops tagging.
-
-_RECOMPUTE_DEBOUNCE_SEC = 10.0
-_recompute_timers: dict[str, asyncio.Task] = {}
-
-
-def _schedule_recompute_debounced(meeting_id: str) -> None:
-    """Kick the debounce timer for `meeting_id`. Replaces any pending task."""
-    existing = _recompute_timers.get(meeting_id)
-    if existing is not None and not existing.done():
-        existing.cancel()
-    _recompute_timers[meeting_id] = asyncio.create_task(
-        _debounced_recompute_job(meeting_id)
-    )
-
-
-async def _debounced_recompute_job(meeting_id: str) -> None:
-    try:
-        await asyncio.sleep(_RECOMPUTE_DEBOUNCE_SEC)
-    except asyncio.CancelledError:
-        # Replaced by a newer schedule call — quietly exit.
-        return
-
-    await _broadcast({"type": "recompute_started", "meeting_id": meeting_id})
-    import logging as _log
-    log = _log.getLogger("aurascribe")
-    try:
-        result = await _do_recompute(meeting_id)
-    except RecomputeSkipped as e:
-        # Precondition failure (still recording, no audio, pipeline missing).
-        # Not worth surfacing — the user is tagging, not asking for recompute.
-        log.info("debounced recompute skipped for %s: %s", meeting_id, e.detail)
-        await _broadcast({
-            "type": "recompute_done",
-            "meeting_id": meeting_id,
-            "skipped": e.detail,
-        })
-        return
-    except Exception as e:
-        log.warning("debounced recompute failed for %s: %s", meeting_id, e, exc_info=True)
-        await _broadcast({
-            "type": "recompute_done",
-            "meeting_id": meeting_id,
-            "error": str(e),
-        })
-        return
-
-    await _broadcast({
-        "type": "recompute_done",
-        "meeting_id": meeting_id,
-        "turns": result["turns"],
-        "updated": result["updated"],
-    })

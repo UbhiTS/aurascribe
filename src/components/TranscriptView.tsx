@@ -240,21 +240,18 @@ export function TranscriptView({
 
   const handleTrimBefore = async (u: Utterance) => {
     if (!onTrim) return;
-    if (!confirm(`Delete all lines before "${u.text.slice(0, 40)}${u.text.length > 40 ? "…" : ""}"?\n\nThis rebases remaining timestamps to 0.`)) return;
     await onTrim({ before: u.start_time });
     setToolsOpen(null);
   };
 
   const handleTrimAfter = async (u: Utterance) => {
     if (!onTrim) return;
-    if (!confirm(`Delete all lines after "${u.text.slice(0, 40)}${u.text.length > 40 ? "…" : ""}"?`)) return;
     await onTrim({ after: u.start_time });
     setToolsOpen(null);
   };
 
   const handleSplitHere = async (u: Utterance) => {
     if (!onSplit) return;
-    if (!confirm(`Split this meeting here?\n\nThis line and everything after becomes a new meeting (Part 2). Both meetings will need a fresh AI Summary.`)) return;
     await onSplit(u.start_time);
     setToolsOpen(null);
   };

@@ -25,7 +25,12 @@ CREATE TABLE IF NOT EXISTS meetings (
     live_action_items_self               TEXT,
     live_action_items_others             TEXT,
     live_support_intelligence            TEXT,
-    live_support_intelligence_history    TEXT
+    live_support_intelligence_history    TEXT,
+    -- Bumped whenever a pill/voice change touches this meeting's labels.
+    -- Compared against last_recomputed_at to surface a "Tags pending" badge
+    -- so the user knows when an explicit Recompute would yield new info.
+    last_tagged_at      TEXT,
+    last_recomputed_at  TEXT
 );
 
 CREATE TABLE IF NOT EXISTS utterances (
@@ -142,6 +147,15 @@ async def init_db() -> None:
             "INSERT OR REPLACE INTO schema_meta (key, value) VALUES ('embedding_dim', ?)",
             (_CURRENT_EMBEDDING_DIM,),
         )
+
+        # Idempotent column adds for forward-only schema changes on existing
+        # DBs. CREATE TABLE IF NOT EXISTS doesn't touch existing tables, so
+        # any column added after voices-1 schipped needs to be ALTERed in.
+        cursor = await db.execute("PRAGMA table_info(meetings)")
+        meeting_cols = {row[1] async for row in cursor}
+        for col in ("last_tagged_at", "last_recomputed_at"):
+            if col not in meeting_cols:
+                await db.execute(f"ALTER TABLE meetings ADD COLUMN {col} TEXT")
 
         # Crash-recovery reconciliation. If the sidecar was killed mid-meeting
         # (taskkill, crash, power loss), the row is still status='recording'.
