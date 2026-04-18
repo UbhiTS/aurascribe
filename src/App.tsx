@@ -105,6 +105,20 @@ export default function App() {
   }, []);
   useEffect(() => { refreshVoices(); }, [refreshVoices]);
 
+  // Dismiss the static HTML splash (rendered by index.html) once the engine
+  // is ready. Done via DOM mutation rather than React state because the
+  // splash element lives outside the React tree — keeping it in raw HTML
+  // means it paints on the very first webview frame, long before Vite
+  // optimises deps or React mounts.
+  useEffect(() => {
+    if (systemStatus === "loading") return;
+    const el = document.getElementById("splash");
+    if (!el) return;
+    el.classList.add("hidden");
+    const t = window.setTimeout(() => el.remove(), 500);
+    return () => window.clearTimeout(t);
+  }, [systemStatus]);
+
   const handleWsMessage = useCallback((msg: any) => {
     if (msg.type === "partial_utterance" && msg.meeting_id === liveMeetingIdRef.current) {
       if (!msg.text) setLivePartial(null);

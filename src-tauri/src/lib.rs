@@ -10,6 +10,10 @@ struct SidecarState(Mutex<Option<Child>>);
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
+        // Persists window size / position / maximized state across restarts
+        // so the user doesn't have to reposition the window every launch.
+        // State lives in the app's data dir (window-state.json).
+        .plugin(tauri_plugin_window_state::Builder::default().build())
         .manage(SidecarState(Mutex::new(None)))
         .setup(|app| {
             match spawn_sidecar() {
