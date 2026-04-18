@@ -25,7 +25,7 @@ src-tauri/gen/
 .env.local
 
 # Claude Code per-developer local config (not shared)
-.claude/settings.local.json
+.claude/
 
 # OS
 Thumbs.db
