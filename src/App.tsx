@@ -41,6 +41,18 @@ export default function App() {
     api.meetings.get(liveMeetingId).then(setLiveMeeting).catch(console.error);
   }, [liveMeetingId]);
 
+  // Re-adopt an in-flight recording if the sidecar outlived the frontend
+  // (HMR reload, window refresh, dev restart). Without this, WS utterances
+  // would be dropped because the meeting-id filter is still null.
+  useEffect(() => {
+    if (liveMeetingId) return;
+    if (appStatus?.is_recording && appStatus.current_meeting_id) {
+      setLiveMeetingId(appStatus.current_meeting_id);
+      setLiveUtterances([]);
+      setLivePartial(null);
+    }
+  }, [appStatus, liveMeetingId]);
+
   useEffect(() => {
     if (!reviewMeetingId) { setReviewMeeting(null); return; }
     api.meetings.get(reviewMeetingId).then(setReviewMeeting).catch(console.error);

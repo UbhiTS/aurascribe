@@ -73,7 +73,6 @@ export function LiveFeed({
           <div className="relative z-10 h-full flex flex-col">
             <div className="flex items-center gap-3 px-5 pt-4 pb-3">
               <div className="flex-1 min-w-0">
-                <h1 className="text-xl font-bold text-gray-100 tracking-tight">Transcription</h1>
                 {editingTitle ? (
                   <input
                     autoFocus
@@ -81,24 +80,28 @@ export function LiveFeed({
                     onChange={(e) => setTitleDraft(e.target.value)}
                     onKeyDown={(e) => { if (e.key === "Enter") handleRenameTitle(); if (e.key === "Escape") setEditingTitle(false); }}
                     onBlur={handleRenameTitle}
-                    className="mt-0.5 w-full text-xs bg-gray-800 border border-gray-600 rounded px-2 py-0.5 text-gray-200 outline-none"
+                    className="w-full text-xl font-bold bg-gray-800 border border-gray-600 rounded px-2 py-0.5 text-gray-100 tracking-tight outline-none focus:border-brand-500"
                   />
                 ) : (
-                  <div className="flex items-center gap-1.5 group/title min-w-0 mt-0.5">
-                    <p className="text-xs text-gray-500 truncate">
+                  <div className="flex items-center gap-2 min-w-0">
+                    <h1 className="text-xl font-bold text-gray-100 tracking-tight truncate">
                       {meeting?.title ?? (isRecording ? "Recording..." : "No transcription selected")}
-                      {meeting?.started_at && ` · ${new Date(meeting.started_at).toLocaleString()}`}
-                    </p>
+                    </h1>
                     {meeting && (
                       <button
                         onClick={() => { setTitleDraft(meeting.title); setEditingTitle(true); }}
                         title="Rename transcription"
-                        className="flex-shrink-0 opacity-0 group-hover/title:opacity-100 text-gray-600 hover:text-gray-300 transition-all"
+                        className="flex-shrink-0 text-gray-500 hover:text-gray-200 transition-colors"
                       >
-                        <Pencil size={11} />
+                        <Pencil size={14} />
                       </button>
                     )}
                   </div>
+                )}
+                {meeting?.started_at && (
+                  <p className="text-xs text-gray-500 truncate mt-0.5">
+                    {new Date(meeting.started_at).toLocaleString()}
+                  </p>
                 )}
               </div>
 
