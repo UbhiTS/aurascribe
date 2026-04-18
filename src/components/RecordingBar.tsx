@@ -1,7 +1,9 @@
 import { useState } from "react";
 import { Mic, Square, Clock } from "lucide-react";
 import { api } from "../lib/api";
+import { MicAudioProvider } from "../lib/MicAudioContext";
 import { VuMeter } from "./VuMeter";
+import { Waveform } from "./Waveform";
 
 interface Props {
   isRecording: boolean;
@@ -56,6 +58,7 @@ export function RecordingBar({ isRecording, devices, onStarted, onStopped }: Pro
   };
 
   return (
+    <MicAudioProvider>
     <div className={`flex items-center gap-3 px-4 py-3 rounded-xl border transition-all ${
       isRecording ? "bg-red-950/40 border-red-800/50" : "bg-gray-900 border-gray-800"
     }`}>
@@ -63,6 +66,7 @@ export function RecordingBar({ isRecording, devices, onStarted, onStopped }: Pro
         isRecording ? "bg-red-500 animate-pulse" : "bg-gray-600"
       }`} />
       <VuMeter />
+      <Waveform />
 
       {isRecording ? (
         <>
@@ -83,7 +87,7 @@ export function RecordingBar({ isRecording, devices, onStarted, onStopped }: Pro
           </div>
         </>
       ) : (
-        <>
+        <div className="ml-auto flex items-center gap-3">
           {devices.length > 1 && (
             <select
               value={deviceIndex ?? ""}
@@ -104,9 +108,10 @@ export function RecordingBar({ isRecording, devices, onStarted, onStopped }: Pro
             <Mic size={14} />
             Start Recording
           </button>
-        </>
+        </div>
       )}
     </div>
+    </MicAudioProvider>
   );
 }
 

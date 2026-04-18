@@ -107,6 +107,13 @@ class AudioCapture:
             name = d["name"]
             if name in MME_META:
                 continue
+            # Disconnected Bluetooth Hands-Free / A2DP endpoints leak through
+            # as raw MUI strings like "Headset (@System32\drivers\bthhfenum.sys,#2;…)".
+            # Windows only resolves the friendly name when the device is paired
+            # and active, so an unresolved "@...\\...sys" signature means the
+            # endpoint isn't currently connected — hide it.
+            if "@" in name and ".sys" in name:
+                continue
             hostapi_idx = d.get("hostapi", -1)
             hostapi_name = (
                 hostapis[hostapi_idx]["name"]

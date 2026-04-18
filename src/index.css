@@ -1,15 +1,52 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
+
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
 
 @layer base {
+  html, body, #root {
+    @apply h-full;
+  }
   body {
     @apply bg-gray-950 text-gray-100 antialiased;
     font-family: 'Inter', system-ui, sans-serif;
+    font-feature-settings: "cv02", "cv03", "cv11";
   }
 }
 
 @layer utilities {
+  /* Subtle circuit-board pattern used behind the transcript pane. */
+  .bg-circuit {
+    background-image: url("/circuit.svg");
+    background-repeat: repeat;
+    background-size: 140px 140px;
+    background-position: center;
+  }
+
+  /* Gradient glow border for the primary content card. */
+  .glow-border {
+    position: relative;
+  }
+  .glow-border::before {
+    content: "";
+    position: absolute;
+    inset: -1px;
+    border-radius: inherit;
+    padding: 1px;
+    background: linear-gradient(135deg, rgba(124, 150, 248, 0.6), rgba(168, 85, 247, 0.55), rgba(34, 211, 238, 0.4));
+    -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+    -webkit-mask-composite: xor;
+    mask-composite: exclude;
+    pointer-events: none;
+  }
+  .glow-shadow {
+    box-shadow:
+      0 0 0 1px rgba(124, 150, 248, 0.18),
+      0 10px 40px -10px rgba(124, 150, 248, 0.35),
+      0 6px 30px -12px rgba(168, 85, 247, 0.35);
+  }
+
   .scrollbar-thin {
     scrollbar-width: thin;
     scrollbar-color: #374151 transparent;

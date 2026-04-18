@@ -64,7 +64,7 @@ class MeetingManager:
             raise RuntimeError("Models still loading — try again in a moment")
 
         if not title:
-            title = f"Meeting {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+            title = f"Transcription {datetime.now().strftime('%Y-%m-%d %H:%M')}"
 
         meeting_id = str(uuid.uuid4())
         async with aiosqlite.connect(DB_PATH) as db:

@@ -37,6 +37,7 @@ export interface AppStatus {
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(BASE + path, {
     headers: { "Content-Type": "application/json" },
+    cache: "no-store",
     ...init,
   });
   if (!res.ok) {
@@ -91,6 +92,16 @@ export const api = {
       }),
     summarize: (id: string) =>
       request<Meeting>(`/meetings/${id}/summarize`, { method: "POST" }),
+    trim: (id: string, opts: { before?: number; after?: number }) =>
+      request<{ ok: boolean; shifted_by: number }>(`/meetings/${id}/trim`, {
+        method: "POST",
+        body: JSON.stringify(opts),
+      }),
+    split: (id: string, at: number, newTitle?: string) =>
+      request<{ ok: boolean; new_meeting_id: string }>(`/meetings/${id}/split`, {
+        method: "POST",
+        body: JSON.stringify({ at, new_title: newTitle }),
+      }),
   },
   people: {
     list: () => request<Person[]>("/people"),

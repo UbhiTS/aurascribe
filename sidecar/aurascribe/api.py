@@ -319,6 +319,173 @@ async def summarize_meeting(meeting_id: str) -> dict:
     return dict(row) if row else {}
 
 
+class TrimMeetingRequest(BaseModel):
+    before: float | None = None  # delete utterances with start_time < before (then rebase to 0)
+    after: float | None = None   # delete utterances with start_time > after
+
+
+@app.post("/api/meetings/{meeting_id}/trim")
+async def trim_meeting(meeting_id: str, req: TrimMeetingRequest) -> dict:
+    """Crop the transcript. Deletes utterances outside [before, after].
+
+    Semantics are list-positional: `before` and `after` are the clicked line's
+    start_time, and that clicked line is always kept. Strict inequality on
+    start_time on both sides means the clicked line itself stays.
+
+    When `before` is given, remaining utterances are rebased so the first one
+    starts at 0 — keeps displayed timestamps sensible. `started_at` on the
+    meeting row is shifted forward by the same amount.
+
+    Clears summary/action_items (stale post-trim) and re-writes the vault file.
+    """
+    if req.before is None and req.after is None:
+        raise HTTPException(400, "Provide at least one of 'before' or 'after'")
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            "SELECT status, started_at FROM meetings WHERE id = ?", (meeting_id,)
+        )
+        row = await cursor.fetchone()
+        if not row:
+            raise HTTPException(404, "Meeting not found")
+        if row["status"] == "recording":
+            raise HTTPException(400, "Cannot trim a meeting that is still recording")
+        started_at = datetime.fromisoformat(row["started_at"])
+
+        if req.before is not None:
+            await db.execute(
+                "DELETE FROM utterances WHERE meeting_id = ? AND start_time < ?",
+                (meeting_id, req.before),
+            )
+        if req.after is not None:
+            await db.execute(
+                "DELETE FROM utterances WHERE meeting_id = ? AND start_time > ?",
+                (meeting_id, req.after),
+            )
+
+        cursor = await db.execute(
+            "SELECT MIN(start_time) AS min_s, MAX(end_time) AS max_e "
+            "FROM utterances WHERE meeting_id = ?",
+            (meeting_id,),
+        )
+        bounds = await cursor.fetchone()
+        min_start = bounds["min_s"] if bounds else None
+        max_end = bounds["max_e"] if bounds else None
+
+        shift = 0.0
+        if req.before is not None and min_start is not None and min_start > 0:
+            shift = float(min_start)
+            await db.execute(
+                "UPDATE utterances SET start_time = start_time - ?, end_time = end_time - ? "
+                "WHERE meeting_id = ?",
+                (shift, shift, meeting_id),
+            )
+
+        new_started_at = started_at + timedelta(seconds=shift) if shift else started_at
+        new_ended_at = new_started_at + timedelta(seconds=float(max_end) - shift) if max_end is not None else None
+
+        await db.execute(
+            "UPDATE meetings SET started_at = ?, ended_at = ?, summary = NULL, action_items = NULL WHERE id = ?",
+            (new_started_at.isoformat(), new_ended_at.isoformat() if new_ended_at else None, meeting_id),
+        )
+        await db.commit()
+
+    await _rewrite_vault(meeting_id)
+    return {"ok": True, "shifted_by": shift}
+
+
+class SplitMeetingRequest(BaseModel):
+    at: float  # seconds — utterances with start_time >= at move to the new meeting
+    new_title: str | None = None
+
+
+@app.post("/api/meetings/{meeting_id}/split")
+async def split_meeting(meeting_id: str, req: SplitMeetingRequest) -> dict:
+    """Split a meeting in two at timestamp `at`.
+
+    Creates a new meeting; moves utterances (and their speaker_enrollment rows)
+    with start_time >= at to it, rebasing their timestamps to 0. The original
+    meeting keeps utterances before the cut. Both meetings get fresh vault files
+    and their summaries cleared (stale post-split).
+    """
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            "SELECT title, started_at, status, vault_path FROM meetings WHERE id = ?",
+            (meeting_id,),
+        )
+        row = await cursor.fetchone()
+        if not row:
+            raise HTTPException(404, "Meeting not found")
+        if row["status"] == "recording":
+            raise HTTPException(400, "Cannot split a meeting that is still recording")
+
+        original_title = row["title"]
+        original_started_at = datetime.fromisoformat(row["started_at"])
+
+        cursor = await db.execute(
+            "SELECT MIN(start_time) AS min_s, MAX(end_time) AS max_e "
+            "FROM utterances WHERE meeting_id = ? AND start_time >= ?",
+            (meeting_id, req.at),
+        )
+        after_bounds = await cursor.fetchone()
+        if after_bounds is None or after_bounds["min_s"] is None:
+            raise HTTPException(400, "No utterances at or after the split point")
+
+        cursor = await db.execute(
+            "SELECT COUNT(*) AS n FROM utterances WHERE meeting_id = ? AND start_time < ?",
+            (meeting_id, req.at),
+        )
+        before_count_row = await cursor.fetchone()
+        if before_count_row is None or before_count_row["n"] == 0:
+            raise HTTPException(400, "No utterances before the split point — nothing to split")
+
+        shift = float(after_bounds["min_s"])
+        new_started_at = original_started_at + timedelta(seconds=shift)
+        new_ended_at = original_started_at + timedelta(seconds=float(after_bounds["max_e"]))
+        new_title = (req.new_title or f"{original_title} (Part 2)").strip()
+
+        new_meeting_id = str(uuid.uuid4())
+        await db.execute(
+            "INSERT INTO meetings (id, title, started_at, ended_at, status) "
+            "VALUES (?, ?, ?, ?, 'done')",
+            (new_meeting_id, new_title, new_started_at.isoformat(), new_ended_at.isoformat()),
+        )
+
+        await db.execute(
+            "UPDATE utterances SET meeting_id = ?, start_time = start_time - ?, end_time = end_time - ? "
+            "WHERE meeting_id = ? AND start_time >= ?",
+            (new_meeting_id, shift, shift, meeting_id, req.at),
+        )
+        await db.execute(
+            "UPDATE speaker_enrollment SET meeting_id = ? "
+            "WHERE meeting_id = ? AND utterance_id IN "
+            "(SELECT id FROM utterances WHERE meeting_id = ?)",
+            (new_meeting_id, meeting_id, new_meeting_id),
+        )
+
+        cursor = await db.execute(
+            "SELECT MAX(end_time) AS max_e FROM utterances WHERE meeting_id = ?",
+            (meeting_id,),
+        )
+        orig_bounds = await cursor.fetchone()
+        orig_ended_at = (
+            original_started_at + timedelta(seconds=float(orig_bounds["max_e"]))
+            if orig_bounds and orig_bounds["max_e"] is not None
+            else None
+        )
+        await db.execute(
+            "UPDATE meetings SET ended_at = ?, summary = NULL, action_items = NULL WHERE id = ?",
+            (orig_ended_at.isoformat() if orig_ended_at else None, meeting_id),
+        )
+        await db.commit()
+
+    await _rewrite_vault(meeting_id)
+    await _rewrite_vault(new_meeting_id)
+    return {"ok": True, "new_meeting_id": new_meeting_id}
+
+
 @app.get("/api/meetings/{meeting_id}/transcript")
 async def get_transcript(meeting_id: str) -> dict:
     async with aiosqlite.connect(DB_PATH) as db:
