@@ -22,14 +22,21 @@ from pathlib import Path
 
 import aiosqlite
 
-from aurascribe.config import DB_PATH, LM_STUDIO_CONTEXT_TOKENS, MY_SPEAKER_LABEL
+from aurascribe.config import (
+    DB_PATH,
+    LM_STUDIO_CONTEXT_TOKENS,
+    MY_SPEAKER_LABEL,
+    PROMPTS_DIR,
+)
 from aurascribe.llm.client import LLMUnavailableError, chat
 
 log = logging.getLogger("aurascribe.daily_brief")
 
 PROMPT_FILENAME = "daily_brief.md"
-PROMPTS_DIR_REPO = Path(__file__).resolve().parent
-_BUNDLED_DEFAULT = PROMPTS_DIR_REPO / PROMPT_FILENAME
+# User-editable copy lives in APP_DATA/prompts (seeded by config.py).
+# Bundled package copy is the read-only fallback.
+_USER_PROMPT = PROMPTS_DIR / PROMPT_FILENAME
+_BUNDLED_DEFAULT = Path(__file__).resolve().parent / PROMPT_FILENAME
 
 # Rough chars-per-token for English text. Slight overestimate is safer than
 # underestimate since we size transcript budgets off this.
@@ -244,11 +251,17 @@ async def _load_meetings_for_date(brief_date: str) -> list[dict]:
 
 
 def _render_prompt(brief_date: str, meetings: list[dict]) -> str:
+    # Prefer the user-editable copy; fall back to the bundled default so a
+    # deleted or momentarily-unreadable user file doesn't crash the brief.
     try:
-        template = _BUNDLED_DEFAULT.read_text(encoding="utf-8")
+        template = _USER_PROMPT.read_text(encoding="utf-8")
     except Exception as e:
-        log.error("Could not read daily_brief.md: %s", e)
-        raise
+        log.warning("Could not read user daily_brief.md (%s): falling back to bundled default", e)
+        try:
+            template = _BUNDLED_DEFAULT.read_text(encoding="utf-8")
+        except Exception as e2:
+            log.error("Could not read bundled daily_brief.md: %s", e2)
+            raise
 
     # Divide the total transcript budget evenly across meetings, with a floor.
     # If the per-meeting slice would fall below the drop threshold, skip raw

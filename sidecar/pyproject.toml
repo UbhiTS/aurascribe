@@ -10,7 +10,6 @@ requires-python = ">=3.13"
 dependencies = [
     "fastapi>=0.115",
     "uvicorn[standard]>=0.32",
-    "python-dotenv>=1.0",
     "pydantic>=2.9",
     "python-multipart>=0.0.17",
     "aiofiles>=24.1",
@@ -46,3 +45,8 @@ dev = [
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["aurascribe*"]
+
+[tool.setuptools.package-data]
+# Ship the bundled LLM prompt templates alongside the Python modules so a
+# packaged install can seed APP_DATA/prompts/ on first run.
+"aurascribe.llm" = ["*.md"]

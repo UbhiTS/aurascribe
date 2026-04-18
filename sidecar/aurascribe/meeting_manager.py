@@ -10,7 +10,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import os
 import pickle
 import re
 import uuid
@@ -45,9 +44,9 @@ log = logging.getLogger("aurascribe")
 # provisional speaker. Matching is centroid-based: we compare each new chunk
 # against the running mean of each existing cluster, not the min-over-pool used
 # for enrolled speakers — centroids stay stable as the meeting grows instead of
-# drifting more permissive with every added embedding. Tune via env if speakers
+# drifting more permissive with every added embedding. Edit here if speakers
 # merge too eagerly (lower) or split across many labels (raise).
-_PROVISIONAL_THRESH = float(os.environ.get("SPEAKER_PROVISIONAL_THRESH", "0.50"))
+_PROVISIONAL_THRESH = 0.50
 _PROVISIONAL_LABEL_RE = re.compile(r"^Speaker \d+$")
 
 # Vault-write throttle for the live recording loop. We want the file to look
@@ -55,8 +54,8 @@ _PROVISIONAL_LABEL_RE = re.compile(r"^Speaker \d+$")
 # Write only when EITHER the time gate OR the chunk gate trips — whichever
 # fires first. The intel loop's writes naturally reset both via the writer
 # module's shared throttle state.
-_VAULT_WRITE_INTERVAL_SEC = float(os.environ.get("VAULT_WRITE_INTERVAL_SEC", "15"))
-_VAULT_WRITE_CHUNKS = int(os.environ.get("VAULT_WRITE_CHUNKS", "5"))
+_VAULT_WRITE_INTERVAL_SEC = 15.0
+_VAULT_WRITE_CHUNKS = 5
 
 UtteranceCallback = Callable[[str, list[Utterance]], Awaitable[None]]
 PartialCallback = Callable[[str, str, str], Awaitable[None]]

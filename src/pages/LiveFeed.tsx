@@ -266,7 +266,7 @@ function SupportIntelligenceCard({ text, tick }: { text: string; tick: number })
       <div className="flex items-center gap-1.5 mb-2">
         <Lightbulb size={11} className="text-amber-400" />
         <div className="text-[10px] uppercase tracking-wider text-amber-300 font-semibold">
-          Support Intelligence
+          Ask Now
         </div>
       </div>
       {bullets.length > 0 ? (

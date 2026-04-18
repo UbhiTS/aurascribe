@@ -24,7 +24,7 @@ Built as a Tauri 2 desktop app with a Python sidecar. ASR via [faster-whisper](h
 - **Live highlights panel** — debounced LLM call (~20s after the last utterance, hard-capped at 60s) extracts new highlights, action items for you, and action items for other speakers.
 - **Support intelligence** — a 2–5 bullet side-panel card suggesting what to say next: specific tools/numbers to mention, counterarguments to pre-empt, clarifying questions to ask. Refreshed on every tick.
 - **Persistence** — highlights and action items accumulate across the meeting and are written into the Obsidian note as they land.
-- **Editable prompts** — `realtime_highlights.md` and `daily_brief.md` live next to the code and are picked up on the next run. One-click "open in editor" from Settings.
+- **Editable prompts** — `live_intelligence.md` and `daily_brief.md` live next to the code and are picked up on the next run. One-click "open in editor" from Settings.
 
 ### Daily Brief
 - **End-of-day rollup** — aggregates every meeting on a given date into a single briefing: tl;dr, highlights, decisions, open threads, action items (yours + others'), per-person takeaways, themes, tomorrow's focus, coaching notes.
@@ -71,13 +71,11 @@ py -3.13 -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -e ".\sidecar[all]"
 
-# 4. Config
-copy .env.example .env
-# edit .env — set HF_TOKEN, OBSIDIAN_VAULT, LM_STUDIO_MODEL
-
-# 5. Run
+# 4. Run
 npm run tauri:dev
 ```
+
+On first launch the app starts with built-in defaults. Open **Settings** in the UI to enter your HuggingFace token, LM Studio endpoint, Obsidian vault path, etc. — everything persists in `config.json` inside the data directory.
 
 The Tauri shell spawns the Python sidecar automatically (see [src-tauri/src/lib.rs](src-tauri/src/lib.rs)). On first run the sidecar downloads the Whisper model (`~/.cache/huggingface` or `%APPDATA%\AuraScribe\models`) and, once you accept the licenses, the pyannote pipeline.
 
@@ -106,29 +104,28 @@ pip install -e ".\sidecar[dev]"           # pytest, ruff
 
 ## Configuration
 
-All config goes through `.env` at the repo root. See [.env.example](.env.example) for the authoritative list. Highlights:
+Everything lives under a single **data directory** — pick it in Settings (default `%APPDATA%\AuraScribe`). The folder holds the SQLite database, per-meeting Opus recordings, Whisper model cache, and `config.json` with your user settings. Copy that one folder to a new machine or pass it to a fresh install to pick up where you left off.
+
+User-editable knobs (all in Settings UI, persisted to `config.json`):
 
 | Key | Default | Purpose |
 |---|---|---|
-| `HF_TOKEN` | — | HuggingFace token for pyannote downloads |
-| `LM_STUDIO_URL` | `http://127.0.0.1:1234/v1` | OpenAI-compatible endpoint |
-| `LM_STUDIO_MODEL` | `local-model` | Model ID LM Studio should load |
-| `LM_STUDIO_CONTEXT_TOKENS` | `220000` | Context budget for Daily Brief |
-| `OBSIDIAN_VAULT` | — | Vault root; omit to disable Obsidian writes |
-| `WHISPER_MODEL` | `large-v3-turbo` | faster-whisper model id |
-| `WHISPER_DEVICE` | `cuda` | `cuda` / `cpu` |
-| `WHISPER_COMPUTE_TYPE` | `float16` | `float16` / `int8_float16` / `int8` |
-| `WHISPER_LANGUAGE` | `en` | ISO code or empty for auto-detect |
-| `DIARIZATION_MODEL` | `pyannote/speaker-diarization-3.1` | Pipeline id |
-| `MY_SPEAKER_LABEL` | `Me` | How your enrolled voice is labeled |
-| `SIDECAR_HOST` / `SIDECAR_PORT` | `127.0.0.1` / `8765` | Sidecar bind address |
-| `SPEAKER_PROVISIONAL_THRESH` | `0.50` | Cosine-distance threshold for clustering unknowns |
-| `RT_HIGHLIGHTS_DEBOUNCE_SEC` | `20` | Seconds after last utterance before an intel call fires |
-| `RT_HIGHLIGHTS_MAX_INTERVAL_SEC` | `60` | Hard cap between intel calls during continuous speech |
-| `RT_HIGHLIGHTS_WINDOW_SEC` | `180` | Transcript window the intel LLM sees |
-| `VAULT_WRITE_INTERVAL_SEC` | `15` | Throttle for live Obsidian writes |
-| `VAULT_WRITE_CHUNKS` | `5` | Chunks between forced live Obsidian writes |
-| `AURASCRIBE_DATA` | `%APPDATA%\AuraScribe` | Durable state (DB, models) |
+| `hf_token` | — | HuggingFace token for pyannote downloads |
+| `lm_studio_url` | `http://127.0.0.1:1234/v1` | OpenAI-compatible endpoint |
+| `lm_studio_api_key` | `lm-studio` | LM Studio API key |
+| `lm_studio_model` | `local-model` | Model ID LM Studio should load |
+| `lm_studio_context_tokens` | `220000` | Context budget for Daily Brief |
+| `whisper_model` | `large-v3-turbo` | faster-whisper model id |
+| `whisper_language` | `en` | ISO code or empty for auto-detect |
+| `my_speaker_label` | `Me` | How your enrolled voice is labeled |
+| `obsidian_vault` | — | Vault root; empty disables Obsidian writes |
+| `rt_highlights_debounce_sec` | `20` | Seconds after last utterance before an intel call fires |
+| `rt_highlights_max_interval_sec` | `60` | Hard cap between intel calls during continuous speech |
+| `rt_highlights_window_sec` | `180` | Transcript window the intel LLM sees |
+
+Fixed in-source (safety rails): `whisper_device = cuda`, `whisper_compute_type = float16`, `diarization_model = pyannote/speaker-diarization-3.1`. Edit [`sidecar/aurascribe/config.py`](sidecar/aurascribe/config.py) if you need to retune.
+
+Sidecar bind address is `SIDECAR_HOST` / `SIDECAR_PORT` env vars read by `main.py` (deployment concern, not a user setting) — defaults to `127.0.0.1:8765`.
 
 ---
 
@@ -170,7 +167,7 @@ aurascribe/
 │   ├── main.py                     uvicorn entry point
 │   └── aurascribe/
 │       ├── api.py                  FastAPI routes + WS
-│       ├── config.py               .env loader, paths, thresholds
+│       ├── config.py               config.json loader, paths, thresholds
 │       ├── meeting_manager.py      Lifecycle, recording loop, provisional clustering
 │       ├── audio/                  capture.py, enrollment.py
 │       ├── transcription/          engine.py, whisper.py (faster-whisper + pyannote wiring)
@@ -178,8 +175,7 @@ aurascribe/
 │       ├── obsidian/writer.py      Meeting / people / daily-brief markdown writers
 │       └── db/database.py          SQLite schema + migrations
 ├── package.json                    Node (frontend + Tauri CLI)
-├── vite.config.ts                  Dev proxy to sidecar
-└── .env.example                    Copy to .env
+└── vite.config.ts                  Dev proxy to sidecar
 ```
 
 ---

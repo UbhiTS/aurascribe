@@ -34,6 +34,7 @@ import aiosqlite
 from aurascribe.config import (
     DB_PATH,
     MY_SPEAKER_LABEL,
+    PROMPTS_DIR,
     RT_HIGHLIGHTS_DEBOUNCE_SEC,
     RT_HIGHLIGHTS_MAX_INTERVAL_SEC,
     RT_HIGHLIGHTS_WINDOW_SEC,
@@ -43,12 +44,13 @@ from aurascribe.transcription import Utterance
 
 log = logging.getLogger("aurascribe.realtime")
 
-PROMPT_FILENAME = "realtime_highlights.md"
-# Live edit target. Lives in the repo so the dev workflow is "edit in your
-# IDE, save, next LLM call sees it". For end-user packaging we'd want to
-# fall back to a writable copy in PROMPTS_DIR, but that's deferred.
-PROMPTS_DIR_REPO = Path(__file__).resolve().parent
-_BUNDLED_DEFAULT = PROMPTS_DIR_REPO / PROMPT_FILENAME
+PROMPT_FILENAME = "live_intelligence.md"
+# Live edit target — the user-editable copy in APP_DATA/prompts. Seeded
+# from the bundled package default at startup; edits stick.
+_USER_PROMPT = PROMPTS_DIR / PROMPT_FILENAME
+# Package-bundled factory default — read-only fallback if the user-facing
+# file gets deleted or unreadable between seeding and use.
+_BUNDLED_DEFAULT = Path(__file__).resolve().parent / PROMPT_FILENAME
 
 # JSON code-fence stripper — local LLMs frequently wrap output in ```json...```
 # even when the prompt forbids it. We tolerate both fenced and naked output.
@@ -59,10 +61,18 @@ BroadcastFn = Callable[[dict], Awaitable[None]]
 
 
 def _ensure_prompt_file() -> Path:
-    """Return the live prompt file path. Edits go straight into the repo
-    file — no APPDATA shadow copy. Kept as a function (rather than inlining
-    the constant) so swapping in a writable-fallback later is one place."""
-    return _BUNDLED_DEFAULT
+    """Return the live prompt file path in APP_DATA/prompts. The file is
+    seeded at startup by config.py, but we also heal it here if the user
+    deleted it mid-run — copy the bundled default back in. Missing-bundle
+    case is handled downstream by the caller's read-with-fallback."""
+    if not _USER_PROMPT.exists() and _BUNDLED_DEFAULT.is_file():
+        try:
+            _USER_PROMPT.write_text(
+                _BUNDLED_DEFAULT.read_text(encoding="utf-8"), encoding="utf-8",
+            )
+        except Exception as e:
+            log.warning("Could not reseed %s: %s", _USER_PROMPT, e)
+    return _USER_PROMPT
 
 
 def _norm(s: str) -> str:

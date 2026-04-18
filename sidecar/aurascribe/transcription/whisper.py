@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 import pickle
 
 import aiosqlite
@@ -37,12 +36,12 @@ from aurascribe.transcription.engine import PartialCallback, Utterance
 
 log = logging.getLogger("aurascribe.whisper")
 
-# Cosine-distance thresholds. Override via env for tuning.
-_THRESH_MULTI = float(os.environ.get("SPEAKER_THRESH_MULTI", "0.55"))
-_THRESH_SOLO = float(os.environ.get("SPEAKER_THRESH_SOLO", "0.70"))
+# Cosine-distance thresholds. Edit here to retune speaker identification.
+_THRESH_MULTI = 0.55
+_THRESH_SOLO = 0.70
 # Ratio test: best speaker must beat second-best by this margin. Rejects
 # ambiguous chunks where two enrolled speakers are near-tied.
-_RATIO_MARGIN = float(os.environ.get("SPEAKER_RATIO_MARGIN", "0.80"))
+_RATIO_MARGIN = 0.80
 
 
 def _valid_embedding(emb) -> bool:

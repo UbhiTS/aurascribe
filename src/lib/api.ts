@@ -126,6 +126,59 @@ export interface DailyBriefData {
   coaching: string[];
 }
 
+// Keys exposed by /api/settings/config. Keep in sync with _CONFIG_FIELDS
+// in the sidecar — adding a key here without updating the backend is a
+// silent no-op.
+export type ConfigKey =
+  | "hf_token"
+  | "my_speaker_label"
+  | "lm_studio_url"
+  | "lm_studio_api_key"
+  | "lm_studio_model"
+  | "lm_studio_context_tokens"
+  | "whisper_model"
+  | "whisper_language"
+  | "obsidian_vault"
+  | "rt_highlights_debounce_sec"
+  | "rt_highlights_max_interval_sec"
+  | "rt_highlights_window_sec";
+
+export interface ConfigFieldState {
+  // What the running process is actually using. Frozen at sidecar import
+  // time — differs from `override` after a save, until restart.
+  effective: string | number | null;
+  // What's persisted in config.json. null = using the default.
+  override: string | number | null;
+  // Built-in fallback when nothing is set.
+  default: string | number | null;
+}
+
+export interface AppConfig {
+  settings: Record<ConfigKey, ConfigFieldState>;
+  config_file: string;
+  // PUT responses only — true when at least one saved value differs from
+  // what the live process is using (i.e. restart will change behavior).
+  requires_restart?: boolean;
+}
+
+export type AppConfigPatch = Partial<Record<ConfigKey, string | number | null>>;
+
+export interface DataDirSettings {
+  // Path currently in use by the running sidecar (resolved at import time).
+  effective: string;
+  // What the Settings UI has persisted for next startup. Null = using
+  // the default.
+  override: string | null;
+  // Where the app would land with nothing configured.
+  default: string;
+  // Where the bootstrap pointer file lives (fixed OS location — NOT moved
+  // by changing data_dir). Shown as a diagnostic.
+  bootstrap_file: string;
+  // Only on PUT responses; true when the saved override differs from
+  // what's currently loaded in memory.
+  requires_restart?: boolean;
+}
+
 export interface DailyBriefResponse {
   date: string;
   brief: DailyBriefData | null;
@@ -232,6 +285,20 @@ export const api = {
       request<{ person_id: string; name: string }>("/enroll/start", {
         method: "POST",
         body: JSON.stringify({ name, duration: duration ?? 10 }),
+      }),
+  },
+  settings: {
+    getDataDir: () => request<DataDirSettings>("/settings/data-dir"),
+    setDataDir: (data_dir: string | null) =>
+      request<DataDirSettings>("/settings/data-dir", {
+        method: "PUT",
+        body: JSON.stringify({ data_dir }),
+      }),
+    getConfig: () => request<AppConfig>("/settings/config"),
+    updateConfig: (patch: AppConfigPatch) =>
+      request<AppConfig>("/settings/config", {
+        method: "PUT",
+        body: JSON.stringify(patch),
       }),
   },
   dailyBrief: {

@@ -24,6 +24,7 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
 from aurascribe import __version__
+from aurascribe import config
 from aurascribe.config import AUDIO_DIR, DB_PATH
 from aurascribe.db.database import init_db
 from aurascribe.llm import daily_brief as daily_brief_mod
@@ -534,6 +535,164 @@ async def get_meeting_audio(meeting_id: str) -> FileResponse:
     raise HTTPException(404, "No audio recorded for this meeting")
 
 
+# ── Settings ─────────────────────────────────────────────────────────────────
+
+
+class DataDirSettings(BaseModel):
+    # Where AuraScribe stores ALL durable state (DB, audio, model cache,
+    # config.json). Absolute path; `~` and env vars are expanded. An
+    # explicit `""` or null clears the override → next startup falls back
+    # to the default (%APPDATA%\AuraScribe).
+    data_dir: str | None = None
+
+
+def _data_dir_response() -> dict:
+    """Snapshot of the current state-directory resolution. `effective` is
+    what this running process picked up at import time; `override` is the
+    bootstrap value the UI has persisted for next startup."""
+    return {
+        "effective": str(config.APP_DATA),
+        "override": config.load_bootstrap_data_dir(),
+        "default": str(config.DEFAULT_APP_DATA),
+        "bootstrap_file": str(config.BOOTSTRAP_FILE),
+    }
+
+
+@app.get("/api/settings/data-dir")
+async def get_settings_data_dir() -> dict:
+    return _data_dir_response()
+
+
+@app.put("/api/settings/data-dir")
+async def put_settings_data_dir(req: DataDirSettings) -> dict:
+    provided = req.model_fields_set if hasattr(req, "model_fields_set") else req.__fields_set__
+    if "data_dir" not in provided:
+        raise HTTPException(400, "data_dir is required")
+    raw = req.data_dir
+    if raw in (None, ""):
+        config.save_bootstrap_data_dir(None)
+    else:
+        expanded = Path(os.path.expandvars(raw)).expanduser()
+        if not expanded.is_absolute():
+            raise HTTPException(400, "data_dir must be an absolute path")
+        try:
+            expanded.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            raise HTTPException(400, f"Cannot use data_dir {expanded}: {e}")
+        config.save_bootstrap_data_dir(str(expanded))
+    resp = _data_dir_response()
+    # Saving doesn't hot-swap — all module-level paths were frozen at import.
+    # A restart is needed iff what we just wrote differs from what's in use.
+    resp["requires_restart"] = (
+        resp["override"] is not None and resp["override"] != resp["effective"]
+    )
+    return resp
+
+
+# Declarative spec for every editable config field. Ordering here is purely
+# for developer convenience — the UI picks its own groupings via the key
+# names. Each tuple is (key, default_for_display).
+_CONFIG_FIELDS: list[tuple[str, object]] = [
+    ("hf_token",                       None),
+    ("my_speaker_label",               "Me"),
+    ("lm_studio_url",                  "http://127.0.0.1:1234/v1"),
+    ("lm_studio_api_key",              "lm-studio"),
+    ("lm_studio_model",                "local-model"),
+    ("lm_studio_context_tokens",       220000),
+    ("whisper_model",                  "large-v3-turbo"),
+    ("whisper_language",               "en"),
+    ("obsidian_vault",                 None),
+    ("rt_highlights_debounce_sec",     20.0),
+    ("rt_highlights_max_interval_sec", 60.0),
+    ("rt_highlights_window_sec",       180.0),
+]
+
+
+def _effective_for(key: str) -> object:
+    """Resolve the actual in-process value of a config key by reading from
+    the `config` module. Kept in a dict for O(1) lookup; centralized here
+    so the field list and the effective readers stay in sync."""
+    readers: dict = {
+        "hf_token":                       config.HF_TOKEN,
+        "my_speaker_label":               config.MY_SPEAKER_LABEL,
+        "lm_studio_url":                  config.LM_STUDIO_URL,
+        "lm_studio_api_key":              config.LM_STUDIO_API_KEY,
+        "lm_studio_model":                config.LM_STUDIO_MODEL,
+        "lm_studio_context_tokens":       config.LM_STUDIO_CONTEXT_TOKENS,
+        "whisper_model":                  config.WHISPER_MODEL,
+        "whisper_language":               config.WHISPER_LANGUAGE,
+        "obsidian_vault":                 str(config.OBSIDIAN_VAULT) if config.OBSIDIAN_VAULT else None,
+        "rt_highlights_debounce_sec":     config.RT_HIGHLIGHTS_DEBOUNCE_SEC,
+        "rt_highlights_max_interval_sec": config.RT_HIGHLIGHTS_MAX_INTERVAL_SEC,
+        "rt_highlights_window_sec":       config.RT_HIGHLIGHTS_WINDOW_SEC,
+    }
+    return readers[key]
+
+
+class UserConfigUpdate(BaseModel):
+    # Every field is optional so clients can PATCH-style send only what
+    # they're changing. None or "" clears the override → default on restart.
+    hf_token: str | None = None
+    my_speaker_label: str | None = None
+    lm_studio_url: str | None = None
+    lm_studio_api_key: str | None = None
+    lm_studio_model: str | None = None
+    lm_studio_context_tokens: int | None = None
+    whisper_model: str | None = None
+    whisper_language: str | None = None
+    obsidian_vault: str | None = None
+    rt_highlights_debounce_sec: float | None = None
+    rt_highlights_max_interval_sec: float | None = None
+    rt_highlights_window_sec: float | None = None
+
+
+def _config_response() -> dict:
+    """Per-field snapshot: what's in use (effective, frozen at import), what
+    the UI has saved (override), and the built-in default."""
+    stored = config.load_user_config()
+    settings: dict = {}
+    for key, default in _CONFIG_FIELDS:
+        settings[key] = {
+            "effective": _effective_for(key),
+            "override": stored.get(key),
+            "default": default,
+        }
+    return {"settings": settings, "config_file": str(config.CONFIG_FILE)}
+
+
+@app.get("/api/settings/config")
+async def get_settings_config() -> dict:
+    return _config_response()
+
+
+@app.put("/api/settings/config")
+async def put_settings_config(req: UserConfigUpdate) -> dict:
+    provided = req.model_fields_set if hasattr(req, "model_fields_set") else req.__fields_set__
+    updates: dict = {}
+    for key in provided:
+        val = getattr(req, key)
+        # Path-shaped fields get absolute-path validation so we don't
+        # silently accept relative paths that'd resolve unpredictably.
+        if key == "obsidian_vault" and isinstance(val, str) and val:
+            expanded = Path(os.path.expandvars(val)).expanduser()
+            if not expanded.is_absolute():
+                raise HTTPException(400, "obsidian_vault must be an absolute path")
+            updates[key] = str(expanded)
+        else:
+            updates[key] = val
+    config.save_user_config(updates)
+    resp = _config_response()
+    # Any field whose persisted value differs from what's live requires a
+    # restart. Clearing an override (override=None) also counts if the
+    # live value differs from the built-in default.
+    resp["requires_restart"] = any(
+        (f.get("override") if f.get("override") is not None else f.get("default"))
+        != f.get("effective")
+        for f in resp["settings"].values()
+    )
+    return resp
+
+
 # ── Status ───────────────────────────────────────────────────────────────────
 
 
@@ -721,25 +880,24 @@ async def refresh_daily_brief(date_param: str | None = Query(None, alias="date")
 # Friendly display names for the prompt files we know about. Anything else in
 # PROMPTS_DIR is shown with its raw filename so the user can still find it.
 _PROMPT_LABELS = {
-    "realtime_highlights.md": "Real-Time Highlights",
+    "live_intelligence.md": "Live Intelligence",
     "daily_brief.md": "Daily Brief",
 }
 
 
 @app.get("/api/intel/prompts")
 async def list_prompts() -> dict:
-    """Enumerate every .md file alongside the realtime intel module — i.e.
-    in the repo. Edits to these files are picked up live; no APPDATA copy."""
-    from aurascribe.llm.realtime import PROMPTS_DIR_REPO
-
+    """Enumerate every .md file under the user's prompts dir (APP_DATA/prompts).
+    Known prompts are seeded on first run; the user can also drop extra files
+    here. Edits are picked up on the next LLM call — no restart needed."""
     items: list[dict] = []
-    for path in sorted(PROMPTS_DIR_REPO.glob("*.md")):
+    for path in sorted(config.PROMPTS_DIR.glob("*.md")):
         items.append({
             "name": _PROMPT_LABELS.get(path.name, path.name),
             "filename": path.name,
             "path": str(path),
         })
-    return {"dir": str(PROMPTS_DIR_REPO), "prompts": items}
+    return {"dir": str(config.PROMPTS_DIR), "prompts": items}
 
 
 class OpenPromptRequest(BaseModel):
@@ -753,13 +911,11 @@ async def open_prompt(req: OpenPromptRequest) -> dict:
     Sidesteps tauri-plugin-shell's URL-only `open` scope. The filename is
     validated against the prompts dir (basename only — no path traversal) so
     this endpoint can't be coaxed into opening arbitrary files."""
-    from aurascribe.llm.realtime import PROMPTS_DIR_REPO
-
     # Reject anything that isn't a bare basename — guards against ../ etc.
     safe_name = Path(req.filename).name
     if safe_name != req.filename or not safe_name:
         raise HTTPException(400, "Invalid filename")
-    target = PROMPTS_DIR_REPO / safe_name
+    target = config.PROMPTS_DIR / safe_name
     if not target.exists() or not target.is_file():
         raise HTTPException(404, f"Prompt file not found: {safe_name}")
 
@@ -829,8 +985,9 @@ async def enroll_start(req: EnrollRequest) -> dict:
         if "401" in msg or "Unauthorized" in msg or "gated" in msg.lower() or "GatedRepo" in msg:
             raise HTTPException(
                 503,
-                "Diarization model could not be downloaded. Set HF_TOKEN in .env and accept the "
-                "license at https://hf.co/pyannote/speaker-diarization-3.1. Then restart the app.",
+                "Diarization model could not be downloaded. Set your HuggingFace token in "
+                "Settings → Speaker Diarization and accept the license at "
+                "https://hf.co/pyannote/speaker-diarization-3.1. Then restart the app.",
             )
         raise HTTPException(500, f"Enrollment failed: {msg}")
     await manager.engine.reload_enrolled()

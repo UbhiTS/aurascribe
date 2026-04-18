@@ -1,14 +1,14 @@
-"""Runtime configuration — Windows-native paths, loaded from .env at repo root."""
+"""Runtime configuration — Windows-native paths.
+
+All user settings live in `APP_DATA/config.json`. `.env` is not consulted:
+if a value isn't in config.json, it falls back to the built-in default.
+The Settings UI is the only supported way to change these.
+"""
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
-
-from dotenv import load_dotenv
-
-# aurascribe/config.py -> aurascribe/ -> sidecar/ -> <repo root>/.env
-_ROOT = Path(__file__).resolve().parents[2]
-load_dotenv(_ROOT / ".env")
 
 
 def _expand(p: str | None) -> Path | None:
@@ -17,28 +17,65 @@ def _expand(p: str | None) -> Path | None:
     return Path(os.path.expandvars(p)).expanduser()
 
 
-# ── External services ────────────────────────────────────────────────────────
-
-HF_TOKEN: str | None = os.environ.get("HF_TOKEN")
-LM_STUDIO_URL: str = os.environ.get("LM_STUDIO_URL", "http://127.0.0.1:1234/v1")
-LM_STUDIO_API_KEY: str = os.environ.get("LM_STUDIO_API_KEY", "lm-studio")
-# Which model to ask LM Studio to run for summaries/people-notes. Must be
-# loaded (or auto-loadable) in LM Studio. Overridable per-call.
-LM_STUDIO_MODEL: str = os.environ.get("LM_STUDIO_MODEL", "local-model")
-# Total context window (in tokens) of the loaded LM Studio model. Drives the
-# input-size budgeting for long-context calls like the Daily Brief. Bump
-# this when you load a long-context model (e.g. a 220k-token variant);
-# shrink it for smaller models. Overridable via env for per-machine tuning.
-LM_STUDIO_CONTEXT_TOKENS: int = int(os.environ.get("LM_STUDIO_CONTEXT_TOKENS", "220000"))
-
-# Obsidian vault root. None = integration disabled (transcripts still saved to DB).
-OBSIDIAN_VAULT: Path | None = _expand(os.environ.get("OBSIDIAN_VAULT"))
-
 # ── App data (durable state) ─────────────────────────────────────────────────
+#
+# Everything AuraScribe owns — SQLite DB, per-meeting Opus recordings,
+# cached Whisper model files, user settings — lives under a single root:
+# APP_DATA. Keeping the entire state tree under one directory means the
+# user can move to a new machine or reinstall the app just by copying that
+# folder (e.g. E:\AuraScribe) and pointing the fresh install at it.
+#
+# APP_DATA is `data_dir` in bootstrap.json (what the Settings UI writes),
+# or the default `%APPDATA%\AuraScribe` on a fresh install.
+#
+# The bootstrap file itself lives at a FIXED OS location — it can't move
+# with APP_DATA because we need to read it *before* we know where APP_DATA
+# is. After that, no other state touches this location; everything else
+# follows APP_DATA.
+#
+# Note: `%APPDATA%` below reads the Windows system env var that points at
+# the per-user roaming folder — not a user-settable override. It's how
+# Windows tells us where to put user data.
 
-APP_DATA: Path = _expand(os.environ.get("AURASCRIBE_DATA")) or Path(
+DEFAULT_APP_DATA: Path = Path(
     os.environ.get("APPDATA", str(Path.home() / "AppData" / "Roaming"))
 ) / "AuraScribe"
+
+# Bootstrap pointer — anchors the state tree. Never moves.
+BOOTSTRAP_FILE: Path = DEFAULT_APP_DATA / "bootstrap.json"
+
+
+def _read_bootstrap() -> dict:
+    if not BOOTSTRAP_FILE.exists():
+        return {}
+    try:
+        data = json.loads(BOOTSTRAP_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def load_bootstrap_data_dir() -> str | None:
+    """The `data_dir` the Settings UI has persisted, or None."""
+    v = _read_bootstrap().get("data_dir")
+    return v if isinstance(v, str) and v else None
+
+
+def save_bootstrap_data_dir(value: str | None) -> None:
+    """Write (or clear, when value is None/empty) the data_dir override.
+    The file stays at BOOTSTRAP_FILE; only its contents change. Callers
+    must restart the app for the new location to take effect — the
+    module-level APP_DATA/DB_PATH/etc. are frozen at import time."""
+    current = _read_bootstrap()
+    if value in (None, ""):
+        current.pop("data_dir", None)
+    else:
+        current["data_dir"] = value
+    BOOTSTRAP_FILE.parent.mkdir(parents=True, exist_ok=True)
+    BOOTSTRAP_FILE.write_text(json.dumps(current, indent=2), encoding="utf-8")
+
+
+APP_DATA: Path = _expand(load_bootstrap_data_dir()) or DEFAULT_APP_DATA
 APP_DATA.mkdir(parents=True, exist_ok=True)
 
 DB_PATH: Path = APP_DATA / "aurascribe.db"
@@ -49,6 +86,155 @@ MODELS_DIR.mkdir(parents=True, exist_ok=True)
 AUDIO_DIR: Path = APP_DATA / "audio"
 AUDIO_DIR.mkdir(parents=True, exist_ok=True)
 
+# User-editable LLM prompt templates. Seeded from the package-bundled copies
+# on first run (or whenever the user deletes a file — the default returns).
+# Existing files are NEVER overwritten, so edits are sticky.
+PROMPTS_DIR: Path = APP_DATA / "prompts"
+PROMPTS_DIR.mkdir(parents=True, exist_ok=True)
+
+_BUNDLED_PROMPTS_DIR: Path = Path(__file__).resolve().parent / "llm"
+# Known prompts we own. New prompts can be dropped in PROMPTS_DIR at any
+# time — nothing seeds or gates them, they just need to live there.
+_SEEDED_PROMPTS: tuple[str, ...] = ("live_intelligence.md", "daily_brief.md")
+
+for _name in _SEEDED_PROMPTS:
+    _target = PROMPTS_DIR / _name
+    if _target.exists():
+        continue
+    _src = _BUNDLED_PROMPTS_DIR / _name
+    if not _src.is_file():
+        continue
+    try:
+        _target.write_text(_src.read_text(encoding="utf-8"), encoding="utf-8")
+    except Exception:
+        # Seeding is best-effort — if it fails (permissions, odd FS), the
+        # runtime read paths fall back to the bundled copy anyway.
+        pass
+
+# ── User config (editable via Settings UI) ───────────────────────────────────
+#
+# All user-tunable knobs — LM Studio endpoint, Whisper model, Obsidian vault,
+# realtime-intel cadence — persist in config.json inside APP_DATA. Moving the
+# data dir to a new machine carries these over automatically.
+#
+# Resolution: config.json → built-in default. Nothing else. No env-var
+# fallback; if it's not in config.json, it's the default.
+#
+# Keys that aren't in _CONFIG_KEYS are ignored (defensive — older/newer
+# config.json files from a different install won't crash us).
+
+CONFIG_FILE: Path = APP_DATA / "config.json"
+
+_CONFIG_KEYS = {
+    "hf_token",
+    "my_speaker_label",
+    "lm_studio_url",
+    "lm_studio_api_key",
+    "lm_studio_model",
+    "lm_studio_context_tokens",
+    "whisper_model",
+    "whisper_language",
+    "obsidian_vault",
+    "rt_highlights_debounce_sec",
+    "rt_highlights_max_interval_sec",
+    "rt_highlights_window_sec",
+}
+
+
+def load_user_config() -> dict:
+    """Read config.json from APP_DATA. Missing/corrupt file = empty dict —
+    startup must never fail on a bad config file."""
+    if not CONFIG_FILE.exists():
+        return {}
+    try:
+        data = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return {k: v for k, v in data.items() if k in _CONFIG_KEYS}
+
+
+def save_user_config(updates: dict) -> dict:
+    """Merge `updates` into config.json. Keys with None/"" values are
+    removed (fall back to default on next restart). Unknown keys are
+    silently dropped. Returns the full persisted dict."""
+    current: dict = {}
+    if CONFIG_FILE.exists():
+        try:
+            loaded = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                current = loaded
+        except Exception:
+            current = {}
+    for k, v in updates.items():
+        if k not in _CONFIG_KEYS:
+            continue
+        if v is None or (isinstance(v, str) and v == ""):
+            current.pop(k, None)
+        else:
+            current[k] = v
+    CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    CONFIG_FILE.write_text(json.dumps(current, indent=2), encoding="utf-8")
+    return current
+
+
+_user_config: dict = load_user_config()
+
+
+def _cfg_str(cfg_key: str, default: str) -> str:
+    """config.json value, or `default`."""
+    v = _user_config.get(cfg_key)
+    return v if isinstance(v, str) and v else default
+
+
+def _cfg_optional_str(cfg_key: str) -> str | None:
+    """config.json value, or None — for fields where absent is meaningful
+    (HF_TOKEN, OBSIDIAN_VAULT)."""
+    v = _user_config.get(cfg_key)
+    return v if isinstance(v, str) and v else None
+
+
+def _cfg_int(cfg_key: str, default: int) -> int:
+    v = _user_config.get(cfg_key)
+    if isinstance(v, (int, float)):
+        return int(v)
+    if isinstance(v, str):
+        try:
+            return int(v)
+        except ValueError:
+            pass
+    return default
+
+
+def _cfg_float(cfg_key: str, default: float) -> float:
+    v = _user_config.get(cfg_key)
+    if isinstance(v, (int, float)):
+        return float(v)
+    if isinstance(v, str):
+        try:
+            return float(v)
+        except ValueError:
+            pass
+    return default
+
+
+# External services --
+HF_TOKEN: str | None = _cfg_optional_str("hf_token")
+LM_STUDIO_URL: str = _cfg_str("lm_studio_url", "http://127.0.0.1:1234/v1")
+LM_STUDIO_API_KEY: str = _cfg_str("lm_studio_api_key", "lm-studio")
+# Which model to ask LM Studio to run for summaries/people-notes. Must be
+# loaded (or auto-loadable) in LM Studio. Overridable per-call.
+LM_STUDIO_MODEL: str = _cfg_str("lm_studio_model", "local-model")
+# Total context window (in tokens) of the loaded LM Studio model. Drives the
+# input-size budgeting for long-context calls like the Daily Brief. Bump
+# this when you load a long-context model (e.g. a 220k-token variant);
+# shrink it for smaller models.
+LM_STUDIO_CONTEXT_TOKENS: int = _cfg_int("lm_studio_context_tokens", 220000)
+
+# Obsidian vault root. None = integration disabled (transcripts still saved to DB).
+OBSIDIAN_VAULT: Path | None = _expand(_cfg_optional_str("obsidian_vault"))
+
 if OBSIDIAN_VAULT:
     VAULT_MEETINGS: Path | None = OBSIDIAN_VAULT / "AuraScribe" / "Meetings"
     VAULT_PEOPLE: Path | None = OBSIDIAN_VAULT / "AuraScribe" / "People"
@@ -58,17 +244,20 @@ else:
 
 # ── ASR (faster-whisper) — Phase 3 consumes these ────────────────────────────
 
-WHISPER_MODEL: str = os.environ.get("WHISPER_MODEL", "large-v3-turbo")
-WHISPER_DEVICE: str = os.environ.get("WHISPER_DEVICE", "cuda")
-WHISPER_COMPUTE_TYPE: str = os.environ.get("WHISPER_COMPUTE_TYPE", "float16")
-WHISPER_LANGUAGE: str = os.environ.get("WHISPER_LANGUAGE", "en")
+WHISPER_MODEL: str = _cfg_str("whisper_model", "large-v3-turbo")
+# Device / compute-type are deliberately fixed — swapping them at runtime
+# can brick the pipeline (wrong CUDA/CPU path, unsupported compute type).
+# Edit these constants in-source if you need to retune.
+WHISPER_DEVICE: str = "cuda"
+WHISPER_COMPUTE_TYPE: str = "float16"
+WHISPER_LANGUAGE: str = _cfg_str("whisper_language", "en")
 
 # ── Diarization (pyannote) — Phase 4 consumes these ──────────────────────────
 
-DIARIZATION_MODEL: str = os.environ.get(
-    "DIARIZATION_MODEL", "pyannote/speaker-diarization-3.1"
-)
-MY_SPEAKER_LABEL: str = os.environ.get("MY_SPEAKER_LABEL", "Me")
+# Pipeline choice is fixed — swapping diarization pipelines is an expert-mode
+# change that requires matching pyannote version + auth. Edit in-source.
+DIARIZATION_MODEL: str = "pyannote/speaker-diarization-3.1"
+MY_SPEAKER_LABEL: str = _cfg_str("my_speaker_label", "Me")
 
 # ── Audio pipeline ───────────────────────────────────────────────────────────
 
@@ -83,10 +272,10 @@ VAD_THRESHOLD: float = 0.5
 # Debounce: fire this many seconds after the last new utterance lands. Shorter
 # = snappier panel updates, more LLM load. Local LMStudio handles ~1 call/15s
 # comfortably with a 7-8B model.
-RT_HIGHLIGHTS_DEBOUNCE_SEC: float = float(os.environ.get("RT_HIGHLIGHTS_DEBOUNCE_SEC", "20"))
+RT_HIGHLIGHTS_DEBOUNCE_SEC: float = _cfg_float("rt_highlights_debounce_sec", 20.0)
 # Hard cap: even during nonstop speech, never wait longer than this between
 # refreshes. Keeps the support-intelligence card feeling alive.
-RT_HIGHLIGHTS_MAX_INTERVAL_SEC: float = float(os.environ.get("RT_HIGHLIGHTS_MAX_INTERVAL_SEC", "60"))
+RT_HIGHLIGHTS_MAX_INTERVAL_SEC: float = _cfg_float("rt_highlights_max_interval_sec", 60.0)
 # Recent transcript window the LLM sees. Older context lives in the
 # already-extracted highlights/action items, which we also send back.
-RT_HIGHLIGHTS_WINDOW_SEC: float = float(os.environ.get("RT_HIGHLIGHTS_WINDOW_SEC", "180"))
+RT_HIGHLIGHTS_WINDOW_SEC: float = _cfg_float("rt_highlights_window_sec", 180.0)
