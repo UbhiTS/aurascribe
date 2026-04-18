@@ -6,6 +6,10 @@ export interface Utterance {
   text: string;
   start_time: number;
   end_time: number;
+  // Cosine distance to the matched speaker's centroid. Smaller = more
+  // confident. null/undefined when no embedding-based match was made
+  // (Unknown, or pre-migration rows).
+  match_distance?: number | null;
 }
 
 export interface Meeting {

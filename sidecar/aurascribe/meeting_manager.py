@@ -10,11 +10,15 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
+import pickle
+import re
 import uuid
 from datetime import datetime
 from typing import Awaitable, Callable
 
 import aiosqlite
+import numpy as np
 
 from aurascribe.audio.capture import AudioCapture
 from aurascribe.config import DB_PATH, SAMPLE_RATE
@@ -29,6 +33,15 @@ from aurascribe.obsidian.writer import update_person_note, write_meeting
 from aurascribe.transcription import TranscriptionEngine, Utterance, default_engine
 
 log = logging.getLogger("aurascribe")
+
+# Cosine-distance threshold for clustering "Unknown" embeddings into the same
+# provisional speaker. Matching is centroid-based: we compare each new chunk
+# against the running mean of each existing cluster, not the min-over-pool used
+# for enrolled speakers — centroids stay stable as the meeting grows instead of
+# drifting more permissive with every added embedding. Tune via env if speakers
+# merge too eagerly (lower) or split across many labels (raise).
+_PROVISIONAL_THRESH = float(os.environ.get("SPEAKER_PROVISIONAL_THRESH", "0.50"))
+_PROVISIONAL_LABEL_RE = re.compile(r"^Speaker \d+$")
 
 UtteranceCallback = Callable[[str, list[Utterance]], Awaitable[None]]
 PartialCallback = Callable[[str, str, str], Awaitable[None]]
@@ -48,6 +61,11 @@ class MeetingManager:
         self._task: asyncio.Task | None = None
         self._spec_task: asyncio.Task | None = None
         self._transcribe_sem = asyncio.Semaphore(1)
+        # Per-meeting provisional speaker state. Unknown utterances are
+        # clustered in-memory: embeddings that look like an existing provisional
+        # speaker reuse that label; novel ones get the next "Speaker N".
+        self._provisional_pools: dict[str, dict[str, list[np.ndarray]]] = {}
+        self._provisional_next_n: dict[str, int] = {}
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -75,6 +93,8 @@ class MeetingManager:
             await db.commit()
 
         self._current_meeting_id = meeting_id
+        self._provisional_pools[meeting_id] = {}
+        self._provisional_next_n[meeting_id] = 1
         self._running = True
         try:
             await self.capture.start(device=device)
@@ -111,6 +131,8 @@ class MeetingManager:
 
         meeting_id = self._current_meeting_id
         self._current_meeting_id = None
+        self._provisional_pools.pop(meeting_id, None)
+        self._provisional_next_n.pop(meeting_id, None)
 
         status_msg = "Generating summary..." if summarize else "Saving transcript..."
         await self._emit_status("processing", {"meeting_id": meeting_id, "message": status_msg})
@@ -129,8 +151,13 @@ class MeetingManager:
             )
             row = await cursor.fetchone()
         assert row is not None
-        title, started_at_str = row
+        _initial_title, started_at_str = row
         started_at = datetime.fromisoformat(started_at_str)
+        # Track the filename we last wrote to so we can clean it up on rename.
+        # The rename endpoint deletes the old file, but a chunk write racing
+        # with the rename can recreate it; sweeping on next write keeps the
+        # vault tidy.
+        prev_title: str | None = None
 
         all_utterances: list[Utterance] = []
 
@@ -146,6 +173,7 @@ class MeetingManager:
                     u.start += elapsed
                     u.end += elapsed
                 elapsed += chunk_duration
+                self._relabel_unknowns(meeting_id, utterances)
                 log.info(f"Got {len(utterances)} utterances")
                 if utterances:
                     all_utterances.extend(utterances)
@@ -153,19 +181,50 @@ class MeetingManager:
                     for cb in self._utterance_callbacks:
                         await cb(meeting_id, utterances)
                     try:
+                        # Re-fetch the title on every write — user can rename
+                        # mid-recording and we must write to the new filename
+                        # (otherwise every chunk recreates the old one).
+                        async with aiosqlite.connect(DB_PATH) as db:
+                            cursor = await db.execute(
+                                "SELECT title FROM meetings WHERE id = ?", (meeting_id,)
+                            )
+                            title_row = await cursor.fetchone()
+                        current_title = title_row[0] if title_row else _initial_title
+                        if prev_title and prev_title != current_title:
+                            self._cleanup_vault_file(started_at, prev_title)
                         await write_meeting(
                             meeting_id=meeting_id,
-                            title=title,
+                            title=current_title,
                             started_at=started_at,
                             utterances=all_utterances,
                             summary="",
                             action_items=[],
                         )
+                        prev_title = current_title
                     except Exception as e:
                         log.warning(f"Live Obsidian write failed: {e}")
             except Exception as e:
                 log.error(f"Transcription error: {e}", exc_info=True)
                 await self._emit_status("error", {"message": str(e), "meeting_id": meeting_id})
+
+    @staticmethod
+    def _cleanup_vault_file(started_at: datetime, title: str) -> None:
+        """Delete the vault file named after `(started_at, title)`, if any.
+
+        Called when a mid-recording rename leaves a stale file behind. Safe
+        even if the file doesn't exist.
+        """
+        from aurascribe.config import VAULT_MEETINGS
+
+        if VAULT_MEETINGS is None:
+            return
+        filename = f"{started_at.strftime('%Y-%m-%d')} {title}.md"
+        path = VAULT_MEETINGS / filename
+        if path.exists():
+            try:
+                path.unlink()
+            except Exception as e:
+                log.warning("Could not delete stale vault file %s: %s", path, e)
 
     async def _speculative_loop(self, meeting_id: str) -> None:
         """Every 1.5s, transcribe the last 4s of audio for live partial display."""
@@ -181,13 +240,119 @@ class MeetingManager:
                 if audio is None or len(audio) < int(SAMPLE_RATE * 1.0):
                     continue
                 async with self._transcribe_sem:
-                    utterances = await self.engine.transcribe(audio)
+                    # Skip diarization for the live partial — it's expensive
+                    # and the real chunk that follows will re-do it properly.
+                    utterances = await self.engine.transcribe(audio, diarize=False)
                 if utterances and self._running:
-                    await self._emit_partial(meeting_id, utterances[0].speaker, utterances[0].text)
+                    first = utterances[0]
+                    speaker = first.speaker
+                    # Map "Unknown" to a matching provisional label read-only —
+                    # never allocates, so the partial display doesn't burn a
+                    # "Speaker N" that the real chunk would later re-allocate.
+                    if speaker == "Unknown" and first.embedding is not None:
+                        try:
+                            emb = pickle.loads(first.embedding)
+                            speaker = self._match_provisional(meeting_id, emb)
+                        except Exception:
+                            pass
+                    await self._emit_partial(meeting_id, speaker, first.text)
             except asyncio.CancelledError:
                 raise
             except Exception as e:
                 log.warning(f"Speculative transcription error: {e}", exc_info=True)
+
+    # ── Provisional speaker clustering ────────────────────────────────────────
+    #
+    # Every chunk whose embedding doesn't match an enrolled speaker comes back
+    # as "Unknown". We cluster those unknowns in-memory per meeting so the user
+    # sees "Speaker 1", "Speaker 2"... instead of every line collapsing to one
+    # "Unknown" bucket. Renaming a provisional label (via the rename-speaker
+    # endpoint) both relabels the transcript and folds the pooled embeddings
+    # into a real enrolled person — effectively "tag-as-you-go" enrollment.
+
+    def _relabel_unknowns(self, meeting_id: str, utterances: list[Utterance]) -> None:
+        """Mutate utterances: swap speaker='Unknown' for a provisional 'Speaker N'."""
+        pool = self._provisional_pools.setdefault(meeting_id, {})
+        for u in utterances:
+            if u.speaker != "Unknown" or u.embedding is None:
+                continue
+            try:
+                emb = pickle.loads(u.embedding)
+            except Exception as e:
+                log.warning("Could not unpickle embedding for provisional match: %s", e)
+                continue
+            speaker, distance = self._match_or_allocate_provisional(meeting_id, emb, add=True)
+            u.speaker = speaker
+            u.match_distance = distance
+
+    def _match_provisional(self, meeting_id: str, emb: np.ndarray) -> str:
+        """Best-matching provisional label for `emb`, or 'Unknown' if none fit.
+
+        Read-only — does not grow any pool. Used for live-partial display so a
+        mid-chunk partial doesn't burn a "Speaker N" the real chunk will re-use.
+        """
+        speaker, _distance = self._match_or_allocate_provisional(meeting_id, emb, add=False)
+        return speaker
+
+    def _match_or_allocate_provisional(
+        self, meeting_id: str, emb: np.ndarray, *, add: bool
+    ) -> tuple[str, float | None]:
+        from scipy.spatial.distance import cosine
+
+        pool = self._provisional_pools.setdefault(meeting_id, {})
+        distances: list[tuple[str, float]] = []
+        for label, embs in pool.items():
+            if not embs:
+                continue
+            centroid = np.mean(np.stack(embs), axis=0)
+            d = float(cosine(emb, centroid))
+            distances.append((label, d))
+
+        # Filter NaN/inf before picking best — Python's sort with NaN keys is
+        # undefined and can return a NaN entry as "best", which then fails the
+        # threshold check and spawns a spurious new cluster. NaNs come from
+        # degenerate centroids on very short turns; once the pool no longer
+        # sees new bad embeddings (whisper.py guards them out), these are
+        # leftover zombie clusters that should just be ignored for matching.
+        valid = [(l, d) for l, d in distances if np.isfinite(d)]
+        valid.sort(key=lambda ld: ld[1])
+        best_label, best_dist = (valid[0] if valid else (None, float("inf")))
+
+        if best_label is not None and best_dist < _PROVISIONAL_THRESH:
+            if add:
+                pool[best_label].append(emb)
+                log.info(
+                    "provisional: matched %s dist=%.3f (all=%s) thresh=%.2f",
+                    best_label, best_dist,
+                    [(l, round(d, 3)) for l, d in distances], _PROVISIONAL_THRESH,
+                )
+            return best_label, best_dist
+
+        if not add:
+            # Read-only miss — caller gets "Unknown" to render until the real
+            # chunk lands and allocates the number.
+            return "Unknown", None
+
+        n = self._provisional_next_n.get(meeting_id, 1)
+        label = f"Speaker {n}"
+        self._provisional_next_n[meeting_id] = n + 1
+        pool[label] = [emb]
+        log.info(
+            "provisional: allocated %s (all=%s) thresh=%.2f",
+            label,
+            [(l, round(d, 3)) for l, d in distances], _PROVISIONAL_THRESH,
+        )
+        # Fresh cluster — this utterance is definitionally the centroid, so
+        # treat it as high-confidence (distance=0.0) for downstream grouping.
+        return label, 0.0
+
+    def release_provisional_label(self, meeting_id: str, label: str) -> None:
+        """Drop a provisional label from the in-memory pool — called after it
+        has been renamed to a real enrolled speaker. Future chunks will match
+        via the engine's enrolled pool instead."""
+        pool = self._provisional_pools.get(meeting_id)
+        if pool:
+            pool.pop(label, None)
 
     async def _save_utterances(self, meeting_id: str, utterances: list[Utterance]) -> None:
         # Generate a uuid per utterance so the WS broadcast + the frontend's
@@ -196,9 +361,9 @@ class MeetingManager:
             for u in utterances:
                 u.id = str(uuid.uuid4())
                 await db.execute(
-                    "INSERT INTO utterances (id, meeting_id, speaker, text, start_time, end_time, embedding, created_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                    (u.id, meeting_id, u.speaker, u.text, u.start, u.end, u.embedding, datetime.now().isoformat()),
+                    "INSERT INTO utterances (id, meeting_id, speaker, text, start_time, end_time, embedding, match_distance, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (u.id, meeting_id, u.speaker, u.text, u.start, u.end, u.embedding, u.match_distance, datetime.now().isoformat()),
                 )
             await db.commit()
 
@@ -254,7 +419,12 @@ class MeetingManager:
                     action_items=action_items,
                 )
 
-                speakers = list({u.speaker for u in utterances if u.speaker != "Me"})
+                speakers = list({
+                    u.speaker for u in utterances
+                    if u.speaker != "Me"
+                    and u.speaker != "Unknown"
+                    and not _PROVISIONAL_LABEL_RE.match(u.speaker)
+                })
                 for speaker in speakers:
                     speaker_lines = "\n".join(u.text for u in utterances if u.speaker == speaker)
                     existing = await self._get_existing_person_note(speaker)

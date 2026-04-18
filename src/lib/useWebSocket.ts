@@ -1,7 +1,7 @@
 import { useEffect, useRef } from "react";
 
 export type WSMessage =
-  | { type: "utterances"; meeting_id: string; data: { id?: string; speaker: string; text: string; start_time: number; end_time: number }[] }
+  | { type: "utterances"; meeting_id: string; data: { id?: string; speaker: string; text: string; start_time: number; end_time: number; match_distance?: number | null }[] }
   | { type: "partial_utterance"; meeting_id: string; speaker: string; text: string }
   | { type: "status"; event: string; message?: string; meeting_id?: string; vault_path?: string };
 

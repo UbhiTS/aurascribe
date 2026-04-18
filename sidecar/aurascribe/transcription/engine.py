@@ -23,6 +23,11 @@ class Utterance:
     embedding: bytes | None = None
     # DB primary key (uuid4). Populated by `_save_utterances()`.
     id: str | None = None
+    # Cosine distance from the matched speaker's centroid. Lower = more
+    # confident. None for "Unknown" (no match), or for pre-migration rows.
+    # Consumers use this to visually group consecutive high-confidence
+    # same-speaker utterances.
+    match_distance: float | None = None
 
 
 PartialCallback = Callable[[str, str], None]  # (speaker, partial_text)
@@ -35,6 +40,8 @@ class TranscriptionEngine(Protocol):
         self,
         audio: np.ndarray,
         on_partial: PartialCallback | None = None,
+        *,
+        diarize: bool = True,
     ) -> list[Utterance]: ...
 
 
@@ -54,5 +61,7 @@ class StubEngine:
         self,
         audio: np.ndarray,
         on_partial: PartialCallback | None = None,
+        *,
+        diarize: bool = True,
     ) -> list[Utterance]:
         return []

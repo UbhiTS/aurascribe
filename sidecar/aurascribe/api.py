@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
@@ -23,7 +24,7 @@ from aurascribe.db.database import init_db
 from aurascribe.llm.client import LLMUnavailableError, chat, get_available_models
 from aurascribe.llm.prompts import MEETING_SUMMARY_SYSTEM, format_transcript, meeting_summary_prompt
 from aurascribe.meeting_manager import MeetingManager
-from aurascribe.obsidian.writer import write_meeting
+from aurascribe.obsidian.writer import cleanup_vault_stragglers, write_meeting
 from aurascribe.transcription import Utterance
 
 manager = MeetingManager()
@@ -33,6 +34,7 @@ ws_clients: list[WebSocket] = []
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await init_db()
+    cleanup_vault_stragglers()
 
     async def on_utterance(meeting_id: str, utterances: list[Utterance]) -> None:
         await _broadcast(
@@ -46,6 +48,7 @@ async def lifespan(app: FastAPI):
                         "text": u.text,
                         "start_time": u.start,
                         "end_time": u.end,
+                        "match_distance": u.match_distance,
                     }
                     for u in utterances
                 ],
@@ -187,7 +190,7 @@ async def get_meeting(meeting_id: str) -> dict:
         meeting = dict(row)
 
         cursor = await db.execute(
-            "SELECT id, speaker, text, start_time, end_time FROM utterances "
+            "SELECT id, speaker, text, start_time, end_time, match_distance FROM utterances "
             "WHERE meeting_id = ? ORDER BY start_time",
             (meeting_id,),
         )
@@ -491,7 +494,7 @@ async def get_transcript(meeting_id: str) -> dict:
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
-            "SELECT id, speaker, text, start_time, end_time FROM utterances "
+            "SELECT id, speaker, text, start_time, end_time, match_distance FROM utterances "
             "WHERE meeting_id = ? ORDER BY start_time",
             (meeting_id,),
         )
@@ -551,7 +554,7 @@ async def enroll_start(req: EnrollRequest) -> dict:
     )
     try:
         audio = await record_enrollment_sample(req.duration)
-        person_id = await save_enrollment(req.name, audio)
+        person_id = await save_enrollment(manager.engine, req.name, audio)
     except Exception as e:
         # Clear the "enrolling" header status on the way out.
         await _broadcast({"type": "status", "event": "ready", "message": ""})
@@ -559,8 +562,8 @@ async def enroll_start(req: EnrollRequest) -> dict:
         if "401" in msg or "Unauthorized" in msg or "gated" in msg.lower() or "GatedRepo" in msg:
             raise HTTPException(
                 503,
-                "pyannote/embedding could not be downloaded. Set HF_TOKEN in .env to a real "
-                "token and accept the license at https://hf.co/pyannote/embedding. Then restart the app.",
+                "Diarization model could not be downloaded. Set HF_TOKEN in .env and accept the "
+                "license at https://hf.co/pyannote/speaker-diarization-3.1. Then restart the app.",
             )
         raise HTTPException(500, f"Enrollment failed: {msg}")
     await manager.engine.reload_enrolled()
@@ -575,18 +578,73 @@ class RenameSpeakerRequest(BaseModel):
     new_name: str
 
 
+_PROVISIONAL_LABEL_RE = re.compile(r"^Speaker \d+$")
+
+
 @app.post("/api/meetings/{meeting_id}/rename-speaker")
 async def rename_speaker(meeting_id: str, req: RenameSpeakerRequest) -> dict:
+    """Bulk-rename a speaker across one meeting.
+
+    Two modes:
+    - Rename provisional ("Speaker N") → real name: creates/finds the person,
+      folds every embedding from matching utterances into their enrollment pool,
+      and drops the provisional label from the in-memory pool so new chunks
+      match via the enrolled matcher.
+    - Rename one real name → another: also updates the `people` row so the
+      enrollment follows.
+    """
+    new_name = req.new_name.strip()
+    if not new_name:
+        raise HTTPException(400, "new_name cannot be empty")
+
+    is_provisional = bool(_PROVISIONAL_LABEL_RE.match(req.old_name))
+
     async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+
+        if is_provisional:
+            cursor = await db.execute(
+                "SELECT id, embedding FROM utterances "
+                "WHERE meeting_id = ? AND speaker = ?",
+                (meeting_id, req.old_name),
+            )
+            matching = await cursor.fetchall()
+
+            cursor = await db.execute("SELECT id FROM people WHERE name = ?", (new_name,))
+            person_row = await cursor.fetchone()
+            if person_row is None:
+                person_id = str(uuid.uuid4())
+                await db.execute(
+                    "INSERT INTO people (id, name, created_at) VALUES (?, ?, ?)",
+                    (person_id, new_name, datetime.now().isoformat()),
+                )
+            else:
+                person_id = str(person_row["id"])
+
+            now = datetime.now().isoformat()
+            for row in matching:
+                if row["embedding"] is None:
+                    continue
+                await db.execute(
+                    "INSERT INTO speaker_enrollment "
+                    "(id, person_id, embedding, utterance_id, meeting_id, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (str(uuid.uuid4()), person_id, row["embedding"], row["id"], meeting_id, now),
+                )
+
         await db.execute(
             "UPDATE utterances SET speaker = ? WHERE meeting_id = ? AND speaker = ?",
-            (req.new_name, meeting_id, req.old_name),
+            (new_name, meeting_id, req.old_name),
         )
-        await db.execute(
-            "UPDATE people SET name = ? WHERE name = ?",
-            (req.new_name, req.old_name),
-        )
+        if not is_provisional:
+            await db.execute(
+                "UPDATE people SET name = ? WHERE name = ?",
+                (new_name, req.old_name),
+            )
         await db.commit()
+
+    if is_provisional:
+        manager.release_provisional_label(meeting_id, req.old_name)
     await manager.engine.reload_enrolled()
     await _rewrite_vault(meeting_id)
     return {"ok": True}

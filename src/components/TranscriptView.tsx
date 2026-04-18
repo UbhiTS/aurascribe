@@ -1,8 +1,56 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Check, Pencil, Plus, Scissors, GitBranch, ArrowUpToLine, ArrowDownToLine } from "lucide-react";
 import { api } from "../lib/api";
 import type { Person, Utterance } from "../lib/api";
 import { Avatar } from "./Avatar";
+
+// Distance threshold below which we consider a speaker match confident enough
+// to visually merge into the previous bubble. Empirically, same-speaker
+// matches sit in the 0.05–0.20 range; different speakers are 0.60+.
+const MERGE_DIST_THRESHOLD = 0.20;
+// Max gap (seconds) between adjacent utterances for a merge — beyond this
+// it's probably a topic shift even if the voice is the same.
+const MERGE_MAX_GAP_SEC = 3.0;
+
+interface BubbleGroup {
+  ids: string[];           // underlying utterance ids (retag targets)
+  speaker: string;
+  text: string;            // joined text of all members
+  start_time: number;      // anchor — used for trim/split actions
+  end_time: number;
+}
+
+function groupUtterances(utterances: Utterance[]): BubbleGroup[] {
+  const groups: BubbleGroup[] = [];
+  for (const u of utterances) {
+    const prev = groups[groups.length - 1];
+    const prevLast = prev ? utterances.find((x) => x.id === prev.ids[prev.ids.length - 1]) : null;
+    const canMerge =
+      prev != null &&
+      prevLast != null &&
+      prev.speaker === u.speaker &&
+      prev.speaker !== "Unknown" &&
+      u.start_time - prevLast.end_time <= MERGE_MAX_GAP_SEC &&
+      prevLast.match_distance != null &&
+      u.match_distance != null &&
+      prevLast.match_distance <= MERGE_DIST_THRESHOLD &&
+      u.match_distance <= MERGE_DIST_THRESHOLD;
+    if (canMerge) {
+      if (u.id !== undefined) prev!.ids.push(u.id);
+      prev!.text = `${prev!.text} ${u.text}`.trim();
+      prev!.end_time = u.end_time;
+    } else {
+      groups.push({
+        ids: u.id !== undefined ? [u.id] : [],
+        speaker: u.speaker,
+        text: u.text,
+        start_time: u.start_time,
+        end_time: u.end_time,
+      });
+    }
+  }
+  return groups;
+}
 
 function fmtTime(s: number): string {
   const m = Math.floor(s / 60).toString().padStart(2, "0");
@@ -122,13 +170,40 @@ export function TranscriptView({
     setToolsOpen(null);
   };
 
-  const handleAssign = async (utteranceId: string, speaker: string) => {
-    if (!meetingId) return;
+  const handleAssign = async (utteranceIds: string[], oldSpeaker: string, speaker: string) => {
+    if (!meetingId || utteranceIds.length === 0) return;
+    // Provisional labels ("Speaker 1", "Speaker 2"...) always rename in bulk:
+    // the user is telling us who the mystery speaker is, so every line tagged
+    // with that number should flip — and the embeddings get folded into the
+    // new person's enrollment so future chunks match automatically. Clearing
+    // to "Unknown" stays per-utterance (single-line fix, not "forget them").
+    const isProvisional = /^Speaker \d+$/.test(oldSpeaker);
+    const isClear = !speaker || speaker.toLowerCase() === "unknown";
+    const idSet = new Set(utteranceIds);
     try {
-      const res = await api.meetings.assignSpeaker(meetingId, utteranceId, speaker);
-      setUtterances((prev) =>
-        prev.map((u) => (u.id === utteranceId ? { ...u, speaker: res.speaker } : u))
-      );
+      if (isProvisional && !isClear) {
+        await api.meetings.renameSpeaker(meetingId, oldSpeaker, speaker);
+        setUtterances((prev) =>
+          prev.map((u) => (u.speaker === oldSpeaker ? { ...u, speaker } : u))
+        );
+      } else if (isClear) {
+        // Clearing: only the anchor utterance — keep the "lose the ability to
+        // re-learn from one mistagged line" behavior scoped narrowly.
+        const anchor = utteranceIds[0];
+        const res = await api.meetings.assignSpeaker(meetingId, anchor, speaker);
+        setUtterances((prev) =>
+          prev.map((u) => (u.id === anchor ? { ...u, speaker: res.speaker } : u))
+        );
+      } else {
+        // Enrolled assignment on a merged bubble — apply to every underlying
+        // utterance so the whole pill flips (and every embedding folds in).
+        for (const id of utteranceIds) {
+          await api.meetings.assignSpeaker(meetingId, id, speaker);
+        }
+        setUtterances((prev) =>
+          prev.map((u) => (u.id && idSet.has(u.id) ? { ...u, speaker } : u))
+        );
+      }
     } catch (e) {
       console.error("assign failed", e);
     }
@@ -136,6 +211,9 @@ export function TranscriptView({
     setNewSpeakerDraft("");
     onEnrolledChanged?.();
   };
+
+  // Hooks must run unconditionally; keep this above any early returns.
+  const groups = useMemo(() => groupUtterances(utterances), [utterances]);
 
   if (!meetingId && !isRecording) {
     return (
@@ -148,28 +226,45 @@ export function TranscriptView({
   return (
     <div className="h-full flex flex-col min-h-0">
       <div className="flex-1 overflow-y-auto scrollbar-thin px-6 py-6 space-y-5">
-        {utterances.map((u, i) => (
-          <Bubble
-            key={u.id ?? i}
-            u={u}
-            mine={u.speaker === selfSpeaker}
-            enrolled={enrolled}
-            selfSpeaker={selfSpeaker}
-            assignOpen={u.id !== undefined && assignOpen === u.id}
-            onOpenAssign={() => u.id !== undefined && setAssignOpen(assignOpen === u.id ? null : u.id)}
-            onAssign={(speaker) => u.id !== undefined && handleAssign(u.id, speaker)}
-            newSpeakerDraft={newSpeakerDraft}
-            onNewSpeakerDraft={setNewSpeakerDraft}
-            editable={editable}
-            toolsOpen={u.id !== undefined && toolsOpen === u.id}
-            onOpenTools={() => u.id !== undefined && setToolsOpen(toolsOpen === u.id ? null : u.id)}
-            onTrimBefore={() => handleTrimBefore(u)}
-            onTrimAfter={() => handleTrimAfter(u)}
-            onSplitHere={() => handleSplitHere(u)}
-            isFirst={i === 0}
-            isLast={i === utterances.length - 1}
-          />
-        ))}
+        {groups.map((g, i) => {
+          // Synthesize an Utterance-shaped object so the existing Bubble
+          // renderer stays per-"bubble" — the DB rows below are still
+          // individually addressable via `g.ids` for retag operations.
+          const anchor: Utterance = {
+            id: g.ids[0],
+            speaker: g.speaker,
+            text: g.text,
+            start_time: g.start_time,
+            end_time: g.end_time,
+          };
+          const anchorId = g.ids[0];
+          return (
+            <Bubble
+              key={anchorId ?? i}
+              u={anchor}
+              mine={g.speaker === selfSpeaker}
+              enrolled={enrolled}
+              selfSpeaker={selfSpeaker}
+              assignOpen={anchorId !== undefined && assignOpen === anchorId}
+              onOpenAssign={() =>
+                anchorId !== undefined && setAssignOpen(assignOpen === anchorId ? null : anchorId)
+              }
+              onAssign={(speaker) => handleAssign(g.ids, g.speaker, speaker)}
+              newSpeakerDraft={newSpeakerDraft}
+              onNewSpeakerDraft={setNewSpeakerDraft}
+              editable={editable}
+              toolsOpen={anchorId !== undefined && toolsOpen === anchorId}
+              onOpenTools={() =>
+                anchorId !== undefined && setToolsOpen(toolsOpen === anchorId ? null : anchorId)
+              }
+              onTrimBefore={() => handleTrimBefore(anchor)}
+              onTrimAfter={() => handleTrimAfter(anchor)}
+              onSplitHere={() => handleSplitHere(anchor)}
+              isFirst={i === 0}
+              isLast={i === groups.length - 1}
+            />
+          );
+        })}
 
         {/* Live partial — grows as speech is recognised */}
         {livePartial && isRecording && (
@@ -298,7 +393,7 @@ function Bubble({
                 ${mine ? "right-0" : "left-0"}`}
             >
               <div className="px-2 py-1 text-[10px] uppercase tracking-wider text-gray-500">
-                Assign this line to
+                {/^Speaker \d+$/.test(u.speaker) ? `Tag all ${u.speaker} lines as` : "Assign this line to"}
               </div>
               {enrolled.length === 0 && (
                 <div className="px-2 py-2 text-xs text-gray-500 italic">No enrolled speakers yet</div>

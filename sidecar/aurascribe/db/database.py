@@ -23,14 +23,15 @@ CREATE TABLE IF NOT EXISTS meetings (
 );
 
 CREATE TABLE IF NOT EXISTS utterances (
-    id          TEXT PRIMARY KEY,
-    meeting_id  TEXT NOT NULL REFERENCES meetings(id),
-    speaker     TEXT NOT NULL,
-    text        TEXT NOT NULL,
-    start_time  REAL NOT NULL,
-    end_time    REAL NOT NULL,
-    embedding   BLOB,
-    created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+    id             TEXT PRIMARY KEY,
+    meeting_id     TEXT NOT NULL REFERENCES meetings(id),
+    speaker        TEXT NOT NULL,
+    text           TEXT NOT NULL,
+    start_time     REAL NOT NULL,
+    end_time       REAL NOT NULL,
+    embedding      BLOB,
+    match_distance REAL,
+    created_at     TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
 CREATE TABLE IF NOT EXISTS people (
@@ -50,10 +51,20 @@ CREATE TABLE IF NOT EXISTS speaker_enrollment (
     created_at  TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
+CREATE TABLE IF NOT EXISTS schema_meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_utterances_meeting ON utterances(meeting_id);
 CREATE INDEX IF NOT EXISTS idx_speaker_enrollment_utterance ON speaker_enrollment(utterance_id);
 CREATE INDEX IF NOT EXISTS idx_speaker_enrollment_person ON speaker_enrollment(person_id);
 """
+
+# Current embedding dimension produced by the speaker pipeline. When the DB's
+# stored value doesn't match, we drop all embedding data (enrollments + stored
+# per-utterance embeddings) since cross-dim comparison isn't meaningful.
+_CURRENT_EMBEDDING_DIM = "256"
 
 
 async def init_db() -> None:
@@ -80,4 +91,28 @@ async def init_db() -> None:
              WHERE status = 'recording'
             """
         )
+
+        # Idempotent column adds for forward-only schema changes on existing
+        # DBs (CREATE TABLE IF NOT EXISTS doesn't touch existing tables).
+        cursor = await db.execute("PRAGMA table_info(utterances)")
+        utterance_cols = {row[1] async for row in cursor}
+        if "match_distance" not in utterance_cols:
+            await db.execute("ALTER TABLE utterances ADD COLUMN match_distance REAL")
+
+        # Embedding-dimension migration. If the stored dimension doesn't match
+        # what the current pipeline produces, wipe the old-dim data — mixing
+        # dimensions makes cosine-distance comparisons crash.
+        cursor = await db.execute(
+            "SELECT value FROM schema_meta WHERE key = 'embedding_dim'"
+        )
+        row = await cursor.fetchone()
+        stored_dim = row[0] if row else None
+        if stored_dim != _CURRENT_EMBEDDING_DIM:
+            await db.execute("DELETE FROM speaker_enrollment")
+            await db.execute("UPDATE utterances SET embedding = NULL")
+            await db.execute(
+                "INSERT OR REPLACE INTO schema_meta (key, value) VALUES ('embedding_dim', ?)",
+                (_CURRENT_EMBEDDING_DIM,),
+            )
+
         await db.commit()

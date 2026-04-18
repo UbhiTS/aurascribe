@@ -1,13 +1,16 @@
-"""faster-whisper ASR + optional pyannote embedding speaker match.
+"""faster-whisper ASR + pyannote speaker diarization.
 
-Speaker ID is a soft dep: if pyannote (the [diarization] extra) isn't
-installed or HF_TOKEN is missing, the engine still works — utterances
-come back with speaker="Unknown" and no embedding attached.
+One pipeline does all the speaker work:
+- For each VAD chunk, `pyannote/speaker-diarization-3.1` returns
+  speaker-turn boundaries + a centroid embedding per detected speaker.
+- We slice audio per turn, run whisper on each slice, and use the
+  pipeline's own 256-dim centroid as the embedding — no separate
+  `pyannote/embedding` inference needed. Enrollments use the same
+  pipeline so every embedding lives in one vector space.
 
-Each chunk's pyannote embedding is attached to the produced utterances so
-the caller can persist it. When the user later assigns an "Unknown"
-utterance to a speaker, that stored embedding is folded into the speaker's
-pool — the matcher improves online.
+If the pipeline fails to load (licence not accepted, HF_TOKEN missing,
+or the `[diarization]` extra not installed), ASR still works; speaker
+fields come back as "Unknown" with no embedding attached.
 """
 from __future__ import annotations
 
@@ -21,6 +24,7 @@ import numpy as np
 
 from aurascribe.config import (
     DB_PATH,
+    DIARIZATION_MODEL,
     HF_TOKEN,
     MODELS_DIR,
     SAMPLE_RATE,
@@ -41,15 +45,36 @@ _THRESH_SOLO = float(os.environ.get("SPEAKER_THRESH_SOLO", "0.70"))
 _RATIO_MARGIN = float(os.environ.get("SPEAKER_RATIO_MARGIN", "0.80"))
 
 
+def _valid_embedding(emb) -> bool:
+    """Check an embedding is safe for cosine distance — finite + non-zero norm."""
+    try:
+        arr = np.asarray(emb, dtype=np.float32)
+    except Exception:
+        return False
+    if arr.size == 0 or not np.all(np.isfinite(arr)):
+        return False
+    return bool(np.linalg.norm(arr) > 1e-8)
+
+
 class WhisperEngine:
-    """ASR via faster-whisper; speaker via pyannote embedding (if available)."""
+    """ASR via faster-whisper; speaker ID via pyannote diarization pipeline."""
+
+    # A diarized chunk can produce many turns. Sub-segments shorter than this
+    # produce whisper hallucinations, so we drop the whole turn.
+    _MIN_TURN_SEC = 0.4
+    # Minimum turn duration for the embedding to be trustworthy enough to
+    # cluster. Below this, transcribe the turn but don't use its centroid —
+    # pyannote's 1-2s embeddings drift enough that a same-speaker turn can
+    # sit ~0.9 from the existing centroid, which would spawn a phantom
+    # Speaker N. Turns render as "Unknown" and can be tagged manually.
+    _MIN_EMBED_TURN_SEC = 1.5
 
     def __init__(self, enable_speaker_id: bool = True) -> None:
         self._model = None
-        self._embedding_inference = None
+        self._diarization_pipeline = None
         self._enable_speaker_id = enable_speaker_id
-        # {speaker_name: [embedding, embedding, ...]} — one name has many
-        # embeddings as online learning grows their pool.
+        # {speaker_name: [embedding, ...]} — one name accumulates embeddings
+        # as online learning grows their pool.
         self._enrolled_pools: dict[str, list[np.ndarray]] = {}
         self._ready = False
 
@@ -75,16 +100,21 @@ class WhisperEngine:
 
         if self._enable_speaker_id:
             try:
-                from pyannote.audio import Inference, Model
+                from pyannote.audio import Pipeline
+                import torch
 
-                log.info("Loading pyannote/embedding for speaker ID")
-                embedding_model = Model.from_pretrained("pyannote/embedding", token=HF_TOKEN)
-                self._embedding_inference = Inference(embedding_model, window="whole")
+                log.info("Loading %s", DIARIZATION_MODEL)
+                pipe = Pipeline.from_pretrained(DIARIZATION_MODEL, token=HF_TOKEN)
+                if WHISPER_DEVICE == "cuda" and torch.cuda.is_available():
+                    pipe.to(torch.device("cuda"))
+                self._diarization_pipeline = pipe
             except Exception as e:
                 log.warning(
-                    "Speaker ID disabled (pyannote unavailable or HF_TOKEN missing): %s", e
+                    "Diarization disabled (pipeline unavailable — accept license at "
+                    "https://hf.co/%s and set HF_TOKEN): %s",
+                    DIARIZATION_MODEL, e,
                 )
-                self._embedding_inference = None
+                self._diarization_pipeline = None
 
     async def _load_enrolled(self) -> None:
         pools: dict[str, list[np.ndarray]] = {}
@@ -109,24 +139,82 @@ class WhisperEngine:
     async def reload_enrolled(self) -> None:
         await self._load_enrolled()
 
+    async def embed_for_enrollment(self, audio: np.ndarray) -> np.ndarray:
+        """Compute a single enrollment embedding from a recorded sample.
+
+        Runs the diarization pipeline (same one the live loop uses) and
+        returns the centroid of the dominant speaker. Raises if the pipeline
+        isn't available or if no speech is detected.
+        """
+        if self._diarization_pipeline is None:
+            raise RuntimeError(
+                "Diarization pipeline unavailable — enrollment requires it. "
+                f"Accept the license at https://hf.co/{DIARIZATION_MODEL} and set HF_TOKEN."
+            )
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, self._embed_for_enrollment_sync, audio)
+
+    def _embed_for_enrollment_sync(self, audio: np.ndarray) -> np.ndarray:
+        import torch
+
+        waveform = torch.from_numpy(audio).unsqueeze(0)
+        result = self._diarization_pipeline(
+            {"waveform": waveform, "sample_rate": SAMPLE_RATE}
+        )
+
+        emb_matrix = getattr(result, "speaker_embeddings", None)
+        source = getattr(result, "speaker_diarization", None)
+        if emb_matrix is None or source is None:
+            raise RuntimeError(
+                "Diarization did not return centroids — pipeline version mismatch."
+            )
+
+        labels = list(source.labels())
+        if not labels:
+            raise RuntimeError(
+                "No speech detected in enrollment sample. Try recording again."
+            )
+
+        # Use the dominant (most-speaking) label's centroid; enrollment audio
+        # is usually single-speaker but pyannote can briefly mis-segment.
+        durations = {lbl: 0.0 for lbl in labels}
+        for segment, _track, lbl in source.itertracks(yield_label=True):
+            durations[lbl] += float(segment.end) - float(segment.start)
+        dominant = max(durations, key=durations.get)
+        idx = labels.index(dominant)
+        return np.asarray(emb_matrix[idx])
+
     async def transcribe(
         self,
         audio: np.ndarray,
         on_partial: PartialCallback | None = None,
+        *,
+        diarize: bool = True,
     ) -> list[Utterance]:
         if not self._ready:
             raise RuntimeError("Engine not loaded — call load() first")
         loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(None, self._transcribe_sync, audio, on_partial)
+        return await loop.run_in_executor(
+            None, self._transcribe_sync, audio, on_partial, diarize
+        )
 
     def _transcribe_sync(
-        self, audio: np.ndarray, on_partial: PartialCallback | None = None
+        self,
+        audio: np.ndarray,
+        on_partial: PartialCallback | None = None,
+        diarize: bool = True,
     ) -> list[Utterance]:
-        # Compute the pyannote embedding once; reuse for match + persist.
-        embedding = self._compute_embedding(audio)
-        speaker = self._match_speaker(embedding) if embedding is not None else "Unknown"
-        embedding_bytes = pickle.dumps(embedding) if embedding is not None else None
+        if diarize and self._diarization_pipeline is not None:
+            turns, label_embeddings = self._diarize(audio)
+            if turns:
+                return self._transcribe_per_turn(audio, turns, label_embeddings, on_partial)
+        # diarize=False (speculative partial), diarization unavailable, or no
+        # speech detected → ASR only, no embedding, speaker="Unknown".
+        return self._transcribe_asr_only(audio, on_partial)
 
+    def _transcribe_asr_only(
+        self, audio: np.ndarray, on_partial: PartialCallback | None
+    ) -> list[Utterance]:
         segments, _info = self._model.transcribe(
             audio,
             beam_size=5,
@@ -134,47 +222,201 @@ class WhisperEngine:
             condition_on_previous_text=False,
             vad_filter=False,  # audio is already VAD-gated upstream
         )
-
         utterances: list[Utterance] = []
-        accumulated = ""
         for seg in segments:
             text = seg.text.strip()
             if not text:
                 continue
             utterances.append(
                 Utterance(
-                    speaker=speaker,
+                    speaker="Unknown",
                     text=text,
                     start=seg.start,
                     end=seg.end,
-                    embedding=embedding_bytes,
+                    embedding=None,
                 )
             )
-            accumulated = (accumulated + " " + text).strip()
             if on_partial:
-                on_partial(speaker, accumulated)
-
+                on_partial("Unknown", text)
         return utterances
 
-    # ── Speaker identification helpers ────────────────────────────────────
+    def _diarize(
+        self, audio: np.ndarray
+    ) -> tuple[list[tuple[float, float, str]], dict[str, np.ndarray]]:
+        """Run diarization; return (turns, label_embeddings).
 
-    def _compute_embedding(self, audio: np.ndarray):
-        if self._embedding_inference is None:
-            return None
+        - `turns`: [(start, end, local_label)] with adjacent same-speaker turns
+          merged (<=0.3s gap).
+        - `label_embeddings`: {local_label: 256-dim centroid} from
+          `DiarizeOutput.speaker_embeddings`.
+
+        Returns ([], {}) on failure so the caller falls back to ASR-only.
+        """
         try:
             import torch
 
             waveform = torch.from_numpy(audio).unsqueeze(0)
-            return self._embedding_inference(
+            result = self._diarization_pipeline(
                 {"waveform": waveform, "sample_rate": SAMPLE_RATE}
             )
         except Exception as e:
-            log.warning("Embedding compute failed: %s", e)
-            return None
+            log.warning("Diarization failed, falling back to ASR-only: %s", e)
+            return [], {}
 
-    def _match_speaker(self, embedding) -> str:
+        # The transcription-friendly (non-overlapping) annotation is
+        # `exclusive_speaker_diarization`. Probe attributes so we survive
+        # pyannote version drift.
+        annotation = result
+        for attr in ("exclusive_speaker_diarization", "speaker_diarization", "annotation"):
+            if hasattr(result, attr):
+                annotation = getattr(result, attr)
+                break
+
+        if not hasattr(annotation, "itertracks"):
+            log.warning(
+                "Diarization returned unexpected type %s — falling back to ASR-only",
+                type(result).__name__,
+            )
+            return [], {}
+
+        # Harvest per-speaker centroid embeddings. Ordered the same as
+        # `speaker_diarization.labels()` per pyannote's DiarizeOutput docs.
+        label_embeddings: dict[str, np.ndarray] = {}
+        emb_matrix = getattr(result, "speaker_embeddings", None)
+        if emb_matrix is not None:
+            try:
+                source = getattr(result, "speaker_diarization", annotation)
+                labels = list(source.labels())
+                arr = np.asarray(emb_matrix)
+                for i, lbl in enumerate(labels):
+                    if i < arr.shape[0]:
+                        label_embeddings[str(lbl)] = arr[i]
+            except Exception as e:
+                log.warning("Could not harvest diarization embeddings: %s", e)
+
+        raw: list[tuple[float, float, str]] = []
+        for segment, _track, label in annotation.itertracks(yield_label=True):
+            raw.append((float(segment.start), float(segment.end), str(label)))
+        raw.sort(key=lambda x: x[0])
+
+        # Merge abutting same-speaker turns (<= 0.3s gap).
+        merged: list[tuple[float, float, str]] = []
+        for start, end, label in raw:
+            if merged and merged[-1][2] == label and start - merged[-1][1] <= 0.3:
+                ps, _, _ = merged[-1]
+                merged[-1] = (ps, end, label)
+            else:
+                merged.append((start, end, label))
+        return merged, label_embeddings
+
+    def _transcribe_per_turn(
+        self,
+        audio: np.ndarray,
+        turns: list[tuple[float, float, str]],
+        label_embeddings: dict[str, np.ndarray],
+        on_partial: PartialCallback | None,
+    ) -> list[Utterance]:
+        log.info(
+            "diarize: %d turns (%s)",
+            len(turns),
+            [(round(s, 2), round(e, 2), lbl) for s, e, lbl in turns],
+        )
+
+        # Phase 1 — resolve each unique local label to a speaker using only
+        # long, valid-embedding turns. Short turns within the same chunk
+        # inherit this resolution rather than being marked "Unknown".
+        label_resolution: dict[str, tuple[str, np.ndarray, float | None]] = {}
+        for start, end, local_label in turns:
+            if local_label in label_resolution:
+                continue
+            if end - start < self._MIN_EMBED_TURN_SEC:
+                continue
+            embedding = label_embeddings.get(local_label)
+            if embedding is None:
+                continue
+            if not _valid_embedding(embedding):
+                log.warning(
+                    "discarding degenerate embedding for %s (%.2f-%.2f)",
+                    local_label, start, end,
+                )
+                continue
+            speaker, distance = self._match_speaker(embedding)
+            label_resolution[local_label] = (speaker, embedding, distance)
+
+        # Phase 2 — emit utterances in timeline order. A turn's speaker comes
+        # from Phase 1 when the label resolved; otherwise "Unknown". Embedding
+        # is attached to exactly one turn per label (the first) so cross-chunk
+        # clustering doesn't double-count the same centroid.
+        utterances: list[Utterance] = []
+        embedding_emitted: set[str] = set()
+        for start, end, local_label in turns:
+            if end - start < self._MIN_TURN_SEC:
+                continue
+            s_idx = int(start * SAMPLE_RATE)
+            e_idx = int(end * SAMPLE_RATE)
+            slice_audio = audio[s_idx:e_idx]
+            if slice_audio.size < int(SAMPLE_RATE * self._MIN_TURN_SEC):
+                continue
+
+            resolved = label_resolution.get(local_label)
+            if resolved is None:
+                speaker = "Unknown"
+                embedding_bytes = None
+                match_distance: float | None = None
+            else:
+                speaker, embedding, match_distance = resolved
+                if local_label in embedding_emitted:
+                    embedding_bytes = None
+                else:
+                    embedding_bytes = pickle.dumps(embedding)
+                    embedding_emitted.add(local_label)
+                if end - start < self._MIN_EMBED_TURN_SEC:
+                    log.info(
+                        "inherited %s for short turn %s (%.2f-%.2f)",
+                        speaker, local_label, start, end,
+                    )
+
+            segments, _info = self._model.transcribe(
+                slice_audio,
+                beam_size=5,
+                language=WHISPER_LANGUAGE,
+                condition_on_previous_text=False,
+                vad_filter=False,
+            )
+            for seg in segments:
+                text = seg.text.strip()
+                if not text:
+                    continue
+                utterances.append(
+                    Utterance(
+                        speaker=speaker,
+                        text=text,
+                        # Rebase to chunk-relative time — caller adds the
+                        # meeting-wide `elapsed` offset.
+                        start=start + seg.start,
+                        end=start + seg.end,
+                        embedding=embedding_bytes,
+                        match_distance=match_distance,
+                    )
+                )
+                # Embedding belongs to the first emitted utterance of this
+                # label, not to every ASR segment within it.
+                embedding_bytes = None
+                if on_partial:
+                    on_partial(speaker, text)
+        return utterances
+
+    # ── Speaker matching against enrolled pool ────────────────────────────
+
+    def _match_speaker(self, embedding) -> tuple[str, float | None]:
+        """Match `embedding` against the enrolled pool.
+
+        Returns (speaker, distance). `distance` is the cosine distance to the
+        winning centroid when we're confident enough to name a speaker; None
+        when the result is "Unknown" (no match).
+        """
         if not self._enrolled_pools:
-            return "Unknown"
+            return "Unknown", None
 
         from scipy.spatial.distance import cosine
 
@@ -186,7 +428,7 @@ class WhisperEngine:
             best = min(float(cosine(embedding, emb)) for emb in pool)
             per_speaker.append((name, best))
         if not per_speaker:
-            return "Unknown"
+            return "Unknown", None
         per_speaker.sort(key=lambda nd: nd[1])
 
         only_one = len(per_speaker) == 1
@@ -196,7 +438,8 @@ class WhisperEngine:
 
         passes_abs = best_dist < threshold
         passes_ratio = only_one or (best_dist < _RATIO_MARGIN * second_dist)
-        decision = best_name if (passes_abs and passes_ratio) else "Unknown"
+        matched = passes_abs and passes_ratio
+        decision = best_name if matched else "Unknown"
 
         log.info(
             "speaker-id: per_speaker=%s best=%s dist=%.3f second=%.3f "
@@ -205,4 +448,4 @@ class WhisperEngine:
             best_name, best_dist, second_dist, threshold, _RATIO_MARGIN,
             passes_abs, passes_ratio, decision,
         )
-        return decision
+        return (decision, best_dist if matched else None)

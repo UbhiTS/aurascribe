@@ -85,7 +85,7 @@ export function LiveFeed({
                 ) : (
                   <div className="flex items-center gap-2 min-w-0">
                     <h1 className="text-xl font-bold text-gray-100 tracking-tight truncate">
-                      {meeting?.title ?? (isRecording ? "Recording..." : "No transcription selected")}
+                      {meeting?.title ?? (isRecording ? "Recording..." : "Ready to AuraScribe!")}
                     </h1>
                     {meeting && (
                       <button

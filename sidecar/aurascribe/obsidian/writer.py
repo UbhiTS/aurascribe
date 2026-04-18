@@ -5,6 +5,7 @@ the app continues — transcripts still land in SQLite.
 """
 from __future__ import annotations
 
+import logging
 import re
 from datetime import date, datetime
 from pathlib import Path
@@ -15,6 +16,8 @@ import aiosqlite
 from aurascribe.config import DB_PATH, VAULT_MEETINGS, VAULT_PEOPLE
 from aurascribe.llm.prompts import format_transcript
 from aurascribe.transcription import Utterance
+
+log = logging.getLogger("aurascribe.obsidian")
 
 
 def _slug(text: str) -> str:
@@ -29,6 +32,27 @@ def _ensure_dirs() -> bool:
     VAULT_MEETINGS.mkdir(parents=True, exist_ok=True)
     VAULT_PEOPLE.mkdir(parents=True, exist_ok=True)
     return True
+
+
+def cleanup_vault_stragglers() -> int:
+    """Delete zero-byte meeting files left behind by crashed/aborted writes.
+
+    Returns the number of files removed. Safe to call on startup — if the
+    vault isn't configured, this is a no-op.
+    """
+    if VAULT_MEETINGS is None or not VAULT_MEETINGS.exists():
+        return 0
+    removed = 0
+    for path in VAULT_MEETINGS.glob("*.md"):
+        try:
+            if path.stat().st_size == 0:
+                path.unlink()
+                removed += 1
+        except Exception as e:
+            log.warning("Could not clean up %s: %s", path, e)
+    if removed:
+        log.info("Removed %d zero-byte straggler(s) from %s", removed, VAULT_MEETINGS)
+    return removed
 
 
 async def write_meeting(
@@ -49,7 +73,11 @@ async def write_meeting(
     path = VAULT_MEETINGS / filename
 
     speakers = list({u.speaker for u in utterances})
-    people_links = ", ".join(f"[[People/{s}]]" for s in speakers if s != "Me")
+    # "Speaker N" is a provisional placeholder, not a real person — don't link.
+    people_links = ", ".join(
+        f"[[People/{s}]]" for s in speakers
+        if s != "Me" and not re.match(r"^Speaker \d+$", s) and s != "Unknown"
+    )
     transcript_md = format_transcript(utterances)
 
     content = f"""---

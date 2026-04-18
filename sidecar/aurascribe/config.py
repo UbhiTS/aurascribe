@@ -65,6 +65,6 @@ MY_SPEAKER_LABEL: str = os.environ.get("MY_SPEAKER_LABEL", "Me")
 
 SAMPLE_RATE: int = 16_000
 CHANNELS: int = 1
-CHUNK_DURATION: float = 30.0      # seconds per transcription chunk
-SILENCE_DURATION: float = 1.0     # seconds of silence before ending an utterance
+CHUNK_DURATION: float = 10.0      # seconds per transcription chunk
+SILENCE_DURATION: float = 0.6     # seconds of silence before ending an utterance
 VAD_THRESHOLD: float = 0.5

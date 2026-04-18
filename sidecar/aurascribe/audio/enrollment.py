@@ -1,7 +1,8 @@
-"""Speaker enrollment — record a short voice sample and store a pyannote embedding.
+"""Speaker enrollment — record a short voice sample and store an embedding.
 
-Torch + pyannote are soft deps. Enrollment endpoints surface a 503 with a clear
-message if `[diarization]` isn't installed.
+The embedding comes from the diarization pipeline (`WhisperEngine.embed_for_enrollment`)
+so enrolled speakers live in the same vector space as the per-turn centroids
+the live loop emits. No separate embedder is loaded.
 """
 from __future__ import annotations
 
@@ -13,7 +14,7 @@ from datetime import datetime
 import aiosqlite
 import numpy as np
 
-from aurascribe.config import CHANNELS, DB_PATH, HF_TOKEN, SAMPLE_RATE
+from aurascribe.config import CHANNELS, DB_PATH, SAMPLE_RATE
 
 
 async def record_enrollment_sample(duration: float = 10.0) -> np.ndarray:
@@ -37,16 +38,9 @@ async def record_enrollment_sample(duration: float = 10.0) -> np.ndarray:
     return await future
 
 
-async def save_enrollment(person_name: str, audio: np.ndarray) -> str:
-    """Compute pyannote embedding and persist to DB. Returns person_id (uuid)."""
-    import torch
-    from pyannote.audio import Inference, Model
-
-    model = Model.from_pretrained("pyannote/embedding", token=HF_TOKEN)
-    inference = Inference(model, window="whole")
-
-    waveform = torch.from_numpy(audio).unsqueeze(0)  # (1, samples)
-    embedding = inference({"waveform": waveform, "sample_rate": SAMPLE_RATE})
+async def save_enrollment(engine, person_name: str, audio: np.ndarray) -> str:
+    """Embed via `engine` (the WhisperEngine) and persist. Returns person_id."""
+    embedding = await engine.embed_for_enrollment(audio)
     embedding_bytes = pickle.dumps(embedding)
 
     async with aiosqlite.connect(DB_PATH) as db:
