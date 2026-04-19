@@ -116,8 +116,21 @@ jobs:
           $sizeMB = [math]::Round(((Get-ChildItem -Recurse $bundleDir | Measure-Object Length -Sum).Sum / 1MB), 1)
           Write-Host "Sidecar bundle (${{ matrix.variant }}): $sizeMB MB"
 
+      # The CUDA sidecar is ~1.5 GB; NSIS's 32-bit memory-mapping crashes
+      # ("Internal compiler error #12345: error mmapping datablock") when
+      # asked to build a single compressed data block that large. The
+      # override config disables NSIS compression for the CUDA variant
+      # only — per-file storage keeps mmap regions small, at the cost of
+      # a ~2 GB installer instead of ~1.5 GB compressed. The CPU variant
+      # keeps the default LZMA compression (262 MB installer).
       - name: Build Tauri app (${{ matrix.variant }})
-        run: npm run tauri:build
+        shell: powershell
+        run: |
+          if ("${{ matrix.variant }}" -eq "cuda") {
+            npm run tauri:build -- --config src-tauri/tauri.cuda.conf.json
+          } else {
+            npm run tauri:build
+          }
 
       # Tauri's default NSIS output name is versioned + arch-tagged
       # (e.g. AuraScribe_0.1.0_x64-setup.exe). Rename to the stable
