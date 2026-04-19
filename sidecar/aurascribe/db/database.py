@@ -157,6 +157,13 @@ async def init_db() -> None:
             if col not in meeting_cols:
                 await db.execute(f"ALTER TABLE meetings ADD COLUMN {col} TEXT")
 
+        cursor = await db.execute("PRAGMA table_info(voices)")
+        voice_cols = {row[1] async for row in cursor}
+        # avatar_ext stores the file extension of an uploaded voice avatar
+        # (e.g. "png", "jpg"). NULL = use the generated initials circle.
+        if "avatar_ext" not in voice_cols:
+            await db.execute("ALTER TABLE voices ADD COLUMN avatar_ext TEXT")
+
         # Crash-recovery reconciliation. If the sidecar was killed mid-meeting
         # (taskkill, crash, power loss), the row is still status='recording'.
         # Finalize with ended_at = last utterance's timestamp.

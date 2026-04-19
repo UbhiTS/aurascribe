@@ -9,17 +9,33 @@ assign endpoints — this module handles the Voice objects themselves.
 from __future__ import annotations
 
 from datetime import datetime
+from pathlib import Path
 
 import aiosqlite
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, UploadFile
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
-from aurascribe.config import DB_PATH
+from aurascribe.config import AVATARS_DIR, DB_PATH
 from aurascribe.routes._shared import (
+    VOICE_PALETTE_KEYS,
     bump_meeting_tag,
     bump_meetings_for_voice,
     manager,
 )
+
+# Accepted avatar image types. Mapped to the canonical extension we store
+# on disk and on voices.avatar_ext. Anything else is rejected — we don't
+# want to serve raw SVG (XSS risk) or exotic formats the WebView may not
+# decode.
+_AVATAR_MIME_TO_EXT: dict[str, str] = {
+    "image/png": "png",
+    "image/jpeg": "jpg",
+    "image/webp": "webp",
+    "image/gif": "gif",
+}
+# 5 MB ceiling — plenty for a face crop, keeps pathological uploads out.
+_AVATAR_MAX_BYTES = 5 * 1024 * 1024
 
 router = APIRouter(prefix="/api/voices")
 
@@ -32,7 +48,7 @@ async def list_voices() -> list[dict]:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
             """
-            SELECT v.id, v.name, v.color, v.created_at, v.updated_at,
+            SELECT v.id, v.name, v.color, v.avatar_ext, v.created_at, v.updated_at,
                    COUNT(ve.id) AS snippet_count,
                    COALESCE(SUM(COALESCE(ve.end_time, 0) - COALESCE(ve.start_time, 0)), 0) AS total_seconds,
                    MAX(ve.created_at) AS last_tagged_at
@@ -53,7 +69,7 @@ async def get_voice(voice_id: str) -> dict:
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
-            "SELECT id, name, color, created_at, updated_at FROM voices WHERE id = ?",
+            "SELECT id, name, color, avatar_ext, created_at, updated_at FROM voices WHERE id = ?",
             (voice_id,),
         )
         row = await cursor.fetchone()
@@ -121,6 +137,15 @@ async def update_voice(voice_id: str, req: VoicePatch) -> dict:
             await bump_meetings_for_voice(db, voice_id)
 
         if req.color is not None:
+            # Only the curated palette keys are acceptable — anything else
+            # would produce a broken lookup on the frontend (no matching
+            # Tailwind class tuple) and a wasted UPDATE.
+            if req.color not in VOICE_PALETTE_KEYS:
+                raise HTTPException(
+                    400,
+                    f"Invalid color key '{req.color}'. Expected one of: "
+                    + ", ".join(VOICE_PALETTE_KEYS),
+                )
             await db.execute(
                 "UPDATE voices SET color = ?, updated_at = ? WHERE id = ?",
                 (req.color, datetime.now().isoformat(), voice_id),
@@ -137,11 +162,14 @@ async def delete_voice(voice_id: str) -> dict:
     tagged with this voice's name reverts to 'Unknown'."""
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
-        cursor = await db.execute("SELECT name FROM voices WHERE id = ?", (voice_id,))
+        cursor = await db.execute(
+            "SELECT name, avatar_ext FROM voices WHERE id = ?", (voice_id,)
+        )
         row = await cursor.fetchone()
         if not row:
             raise HTTPException(404, "Voice not found")
         name = row["name"]
+        avatar_ext = row["avatar_ext"]
 
         # Capture which meetings will be affected BEFORE the delete cascade
         # nukes voice_embeddings — we need the meeting list for the bump.
@@ -157,7 +185,116 @@ async def delete_voice(voice_id: str) -> dict:
         )
         await db.commit()
 
+    # Remove the avatar file (if any). Best-effort — DB row is already gone.
+    if avatar_ext:
+        try:
+            (AVATARS_DIR / f"{voice_id}.{avatar_ext}").unlink(missing_ok=True)
+        except OSError:
+            pass
+
     await manager.engine.reload_voices()
+    return {"ok": True}
+
+
+@router.get("/{voice_id}/avatar")
+async def get_voice_avatar(voice_id: str):
+    """Serve the uploaded avatar image. Returns 404 if no avatar set —
+    the frontend then falls back to the generated initials circle."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT avatar_ext FROM voices WHERE id = ?", (voice_id,)
+        )
+        row = await cursor.fetchone()
+    if not row or row[0] is None:
+        raise HTTPException(404, "No avatar")
+    ext = row[0]
+    path = AVATARS_DIR / f"{voice_id}.{ext}"
+    if not path.exists():
+        # DB says one exists but the file's gone — treat as missing rather
+        # than 500. Could happen if the user wiped APP_DATA\avatars\ by
+        # hand. Returning 404 lets the UI fall back gracefully.
+        raise HTTPException(404, "Avatar file missing on disk")
+    # Short cache: avatars rarely change, but when they do we want the
+    # swap to show up quickly. The URL carries no hash; `max-age=10` is
+    # the cheapest way to nudge the WebView without versioning every URL.
+    return FileResponse(
+        path,
+        media_type=f"image/{'jpeg' if ext == 'jpg' else ext}",
+        headers={"Cache-Control": "public, max-age=10"},
+    )
+
+
+@router.post("/{voice_id}/avatar")
+async def upload_voice_avatar(voice_id: str, file: UploadFile) -> dict:
+    """Upload an image to replace the generated avatar for a voice.
+    Re-uploading overwrites any existing image (and swaps the stored
+    extension if the content-type changed)."""
+    mime = (file.content_type or "").lower()
+    ext = _AVATAR_MIME_TO_EXT.get(mime)
+    if ext is None:
+        raise HTTPException(
+            400,
+            f"Unsupported image type '{mime}'. Accepted: "
+            + ", ".join(_AVATAR_MIME_TO_EXT.keys()),
+        )
+    data = await file.read()
+    if len(data) == 0:
+        raise HTTPException(400, "Empty upload")
+    if len(data) > _AVATAR_MAX_BYTES:
+        raise HTTPException(
+            413, f"Avatar too large ({len(data)} bytes > {_AVATAR_MAX_BYTES})"
+        )
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT avatar_ext FROM voices WHERE id = ?", (voice_id,)
+        )
+        row = await cursor.fetchone()
+        if not row:
+            raise HTTPException(404, "Voice not found")
+        old_ext = row[0]
+
+        # If the extension changed (e.g. user uploads a .png over a .jpg),
+        # remove the stale file before writing the new one so we don't
+        # leave orphaned blobs sitting in APP_DATA\avatars.
+        if old_ext and old_ext != ext:
+            try:
+                (AVATARS_DIR / f"{voice_id}.{old_ext}").unlink(missing_ok=True)
+            except OSError:
+                pass
+
+        (AVATARS_DIR / f"{voice_id}.{ext}").write_bytes(data)
+        await db.execute(
+            "UPDATE voices SET avatar_ext = ?, updated_at = ? WHERE id = ?",
+            (ext, datetime.now().isoformat(), voice_id),
+        )
+        await db.commit()
+
+    return {"ok": True, "avatar_ext": ext}
+
+
+@router.delete("/{voice_id}/avatar")
+async def delete_voice_avatar(voice_id: str) -> dict:
+    """Clear the custom avatar and revert to the generated initials
+    circle. Doesn't touch the voice itself."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT avatar_ext FROM voices WHERE id = ?", (voice_id,)
+        )
+        row = await cursor.fetchone()
+        if not row:
+            raise HTTPException(404, "Voice not found")
+        ext = row[0]
+        if ext:
+            try:
+                (AVATARS_DIR / f"{voice_id}.{ext}").unlink(missing_ok=True)
+            except OSError:
+                pass
+        await db.execute(
+            "UPDATE voices SET avatar_ext = NULL, updated_at = ? WHERE id = ?",
+            (datetime.now().isoformat(), voice_id),
+        )
+        await db.commit()
     return {"ok": True}
 
 

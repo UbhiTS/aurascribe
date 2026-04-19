@@ -1,12 +1,12 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   CheckCircle2, Loader, Pause, Pencil, Play, Trash2, Users, X,
-  ArrowRightLeft, AlertCircle,
+  ArrowRightLeft, AlertCircle, Upload,
 } from "lucide-react";
 import { api } from "../lib/api";
 import type { Voice, VoiceDetail, VoiceSnippet } from "../lib/api";
 import { Avatar } from "../components/Avatar";
-import { colorForSpeaker } from "../lib/speakerColors";
+import { avatarSrcFor, colorForSpeaker, PALETTE_KEYS, SPEAKER_PALETTE, type PaletteKey } from "../lib/speakerColors";
 
 // Min embeddings before a Voice participates in auto-matching. Mirrors the
 // backend gate in whisper.py — keep in sync if that changes.
@@ -87,7 +87,7 @@ export function Voices({ voices, onVoicesChanged }: Props) {
                           : "hover:bg-gray-900/70"
                       }`}
                     >
-                      <Avatar name={v.name} size="sm" gradient={colorForSpeaker(v.name, voices).avatar} />
+                      <Avatar name={v.name} size="sm" gradient={colorForSpeaker(v.name, voices).avatar} src={avatarSrcFor(v.name, voices)} />
                       <div className="flex-1 min-w-0">
                         <div className="text-sm text-gray-200 truncate">{v.name}</div>
                         <div className="flex items-center gap-1.5 text-[10px]">
@@ -149,6 +149,9 @@ function VoiceDetailPane({ detail, allVoices, onChanged, onDeleted }: DetailProp
   const [editingName, setEditingName] = useState(false);
   const [nameDraft, setNameDraft] = useState(detail.name);
   const [mergeOpen, setMergeOpen] = useState(false);
+  const [uploadingAvatar, setUploadingAvatar] = useState(false);
+  const [colorOpen, setColorOpen] = useState(false);
+  const avatarInputRef = useRef<HTMLInputElement | null>(null);
 
   useEffect(() => { setNameDraft(detail.name); }, [detail.name, detail.id]);
 
@@ -248,13 +251,89 @@ function VoiceDetailPane({ detail, allVoices, onChanged, onDeleted }: DetailProp
     }
   };
 
+  const handlePickColor = async (key: PaletteKey) => {
+    if (detail.color === key) return;
+    try {
+      await api.voices.update(detail.id, { color: key });
+      await onChanged();
+    } catch (e: any) {
+      alert(`Color update failed: ${e.message ?? e}`);
+    }
+  };
+
+  const handleAvatarUpload = async (file: File) => {
+    setUploadingAvatar(true);
+    try {
+      await api.voices.uploadAvatar(detail.id, file);
+      await onChanged();
+    } catch (e: any) {
+      alert(`Avatar upload failed: ${e.message ?? e}`);
+    } finally {
+      setUploadingAvatar(false);
+      // Reset the input so selecting the same file again re-fires onChange.
+      if (avatarInputRef.current) avatarInputRef.current.value = "";
+    }
+  };
+
+  const handleAvatarRemove = async () => {
+    try {
+      await api.voices.deleteAvatar(detail.id);
+      await onChanged();
+    } catch (e: any) {
+      alert(`Avatar remove failed: ${e.message ?? e}`);
+    }
+  };
+
   return (
     <div className="p-5 space-y-4">
       <audio ref={audioRef} preload="none" style={{ display: "none" }} />
 
       {/* Header */}
       <div className="flex items-start gap-3">
-        <Avatar name={detail.name} size="lg" gradient={colorForSpeaker(detail.name, allVoices).avatar} />
+        <div className="relative group/avatar flex-shrink-0">
+          <button
+            onClick={() => avatarInputRef.current?.click()}
+            disabled={uploadingAvatar}
+            title={detail.avatar_ext ? "Replace avatar image" : "Upload avatar image"}
+            className="block rounded-full overflow-hidden ring-1 ring-gray-700 hover:ring-gray-500 transition disabled:opacity-60"
+          >
+            <Avatar
+              name={detail.name}
+              size="lg"
+              gradient={colorForSpeaker(detail.name, allVoices).avatar}
+              src={avatarSrcFor(detail.name, allVoices)}
+            />
+          </button>
+          {/* Upload / remove overlay only appears on hover for a clean default look. */}
+          <div className="absolute inset-0 rounded-full pointer-events-none opacity-0 group-hover/avatar:opacity-100 transition flex items-end justify-center">
+            <div className="pointer-events-auto flex items-center gap-1 px-1.5 py-0.5 mb-0.5 rounded-full bg-gray-900/80 text-[9px] text-gray-200 border border-gray-700">
+              {uploadingAvatar ? (
+                <Loader size={9} className="animate-spin" />
+              ) : (
+                <Upload size={9} />
+              )}
+              {detail.avatar_ext && (
+                <button
+                  onClick={(e) => { e.stopPropagation(); handleAvatarRemove(); }}
+                  title="Remove uploaded image"
+                  className="text-rose-300 hover:text-rose-100"
+                >
+                  <X size={9} />
+                </button>
+              )}
+            </div>
+          </div>
+          <input
+            ref={avatarInputRef}
+            type="file"
+            accept="image/png,image/jpeg,image/webp,image/gif"
+            className="hidden"
+            onChange={(e) => {
+              const f = e.target.files?.[0];
+              if (f) handleAvatarUpload(f);
+            }}
+          />
+        </div>
         <div className="flex-1 min-w-0">
           {editingName ? (
             <input
@@ -295,6 +374,23 @@ function VoiceDetailPane({ detail, allVoices, onChanged, onDeleted }: DetailProp
             <span className="text-gray-400">{detail.snippet_count} {detail.snippet_count === 1 ? "sample" : "samples"}</span>
             <span className="text-gray-500">·</span>
             <span className="text-gray-400">{fmtSeconds(totalSec)} total</span>
+          </div>
+          {/* Color picker — single swatch showing the current slot; click
+              opens a 16-color popover. Persists to voices.color so every
+              surface in the app picks up the new color after refresh. */}
+          <div className="mt-2 relative inline-block">
+            <button
+              onClick={() => setColorOpen((v) => !v)}
+              title="Change color"
+              className={`w-5 h-5 rounded-full bg-gradient-to-br ${colorForSpeaker(detail.name, allVoices).avatar} ring-1 ring-gray-600 hover:ring-gray-400 transition`}
+            />
+            {colorOpen && (
+              <ColorPopover
+                current={(detail.color as PaletteKey | null) ?? null}
+                onClose={() => setColorOpen(false)}
+                onPick={(key) => { setColorOpen(false); handlePickColor(key); }}
+              />
+            )}
           </div>
         </div>
 
@@ -454,11 +550,56 @@ function MergePopover({ currentId, voices, onClose, onPick }: MergePopoverProps)
           onClick={() => onPick(v.id)}
           className="w-full text-left px-2 py-1.5 text-sm rounded hover:bg-gray-800 flex items-center gap-2"
         >
-          <Avatar name={v.name} size="xs" gradient={colorForSpeaker(v.name, voices).avatar} />
+          <Avatar name={v.name} size="xs" gradient={colorForSpeaker(v.name, voices).avatar} src={avatarSrcFor(v.name, voices)} />
           {v.name}
           <span className="ml-auto text-[10px] text-gray-500">{v.snippet_count}</span>
         </button>
       ))}
+    </div>
+  );
+}
+
+interface ColorPopoverProps {
+  current: PaletteKey | null;
+  onClose: () => void;
+  onPick: (key: PaletteKey) => void;
+}
+
+function ColorPopover({ current, onClose, onPick }: ColorPopoverProps) {
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") onClose(); };
+    const onClick = (e: MouseEvent) => {
+      const t = e.target as HTMLElement;
+      if (!t.closest("[data-color-popover]")) onClose();
+    };
+    window.addEventListener("keydown", onKey);
+    window.addEventListener("mousedown", onClick);
+    return () => {
+      window.removeEventListener("keydown", onKey);
+      window.removeEventListener("mousedown", onClick);
+    };
+  }, [onClose]);
+
+  return (
+    <div
+      data-color-popover
+      className="absolute z-30 top-full left-0 mt-2 p-3 rounded-lg border border-gray-700 bg-gray-900/95 backdrop-blur shadow-xl"
+    >
+      <div className="flex items-center gap-3">
+        {PALETTE_KEYS.map((key) => {
+          const c = SPEAKER_PALETTE[key];
+          const selected = current === key;
+          return (
+            <button
+              key={key}
+              onClick={() => onPick(key)}
+              title={key}
+              className={`w-5 h-5 rounded-full bg-gradient-to-br ${c.avatar} transition
+                ${selected ? "ring-2 ring-offset-2 ring-offset-gray-900 ring-gray-200 scale-110" : "opacity-80 hover:opacity-100 hover:scale-110"}`}
+            />
+          );
+        })}
+      </div>
     </div>
   );
 }

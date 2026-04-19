@@ -362,15 +362,15 @@ Frontend console: DevTools in the Tauri webview (right-click → Inspect in dev;
 
 ## Roadmap
 
-- **Done** — Tauri + React + sidecar scaffold; SQLite + config + LLM client + Obsidian writer; live transcription with speculative partials; pyannote 3.1 diarization; tag-as-you-go Voices + provisional clustering + per-utterance re-assignment; recompute; real-time intelligence (highlights, action items, support coaching); editable prompts; daily brief aggregation; YYYY/MM vault structure; meeting trim + split; mid-recording re-adoption; NSIS installer + PyInstaller sidecar bundling; CI matrix for CUDA/CPU variants; hardware auto-detect + user-configurable device/compute; first-run welcome dialog; file-based logs + crash dumps; mic-permission detection; error boundaries; follow-tail scroll pinning.
-- **Next** — WASAPI loopback capture for system audio (record Zoom / Teams / Google Meet directly, without a physical loopback device).
+- **Done** — Tauri + React + sidecar scaffold; SQLite + config + LLM client + Obsidian writer; live transcription with speculative partials; pyannote 3.1 diarization; tag-as-you-go Voices + provisional clustering + per-utterance re-assignment; recompute; real-time intelligence (highlights, action items, support coaching); editable prompts; daily brief aggregation; YYYY/MM vault structure; meeting trim + split; mid-recording re-adoption; NSIS installer + PyInstaller sidecar bundling; CI matrix for CUDA/CPU variants; hardware auto-detect + user-configurable device/compute; first-run welcome dialog; file-based logs + crash dumps; mic-permission detection; error boundaries; follow-tail scroll pinning; speaker tag popover with contains-query search + meeting roster chips; persistent globally-unique speaker colors (palette slot stored on `voices.color`); Voices-page color swatch picker + custom avatar upload.
+- **Next** — WASAPI loopback capture for system audio — capture the speaker mix (Zoom / Teams / Google Meet participants) + the local mic in parallel and merge the two streams before diarization. Loopback alone misses the local user's voice, so both sources are required.
 - **Next** — Code-signing for the installer (kill the "Unknown publisher" SmartScreen warning).
 - **Backlog** — NVIDIA Parakeet-TDT 0.6B v3 as an optional ASR backend (currently #1 on Open ASR Leaderboard). Needs NeMo, which is painful on Windows — deferred.
 - **Backlog** — Multi-vault / per-meeting vault routing.
 - **Backlog** — Scheduled meeting pre-briefs (pull upcoming calendar entries + relevant prior meetings into a pre-meeting card).
 - **Backlog** — Structured telemetry (opt-in Sentry or local crash reporter upload).
-- **Backlog** — Speaker color picker in the Voices page (override the auto-assigned palette slot).
-- **Backlog** — Custom avatar upload per speaker (replaces the generated initials circle with a user-provided image).
+- **Backlog** — MCP server — expose meetings / voices / intel over Model Context Protocol so external agents (Claude Desktop, coding assistants, etc.) can query the local corpus and pull relevant context on demand.
+- **Backlog** — Mic test panel — live input-level meter + short record/playback loop in Settings (or the first-run dialog) so the user can verify device + gain before starting a meeting.
 
 ---
 

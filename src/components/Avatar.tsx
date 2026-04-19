@@ -25,6 +25,10 @@ interface Props {
   // resolved a SpeakerColor (e.g. when rendering bubbles — they share
   // the same object with the bubble tint).
   gradient?: string;
+  // When present, renders the image instead of the generated initials
+  // circle. Gradient + initials still mount as a short-lived fallback so
+  // there's no visual hole while the `<img>` decodes.
+  src?: string | null;
 }
 
 const SIZE = {
@@ -37,14 +41,28 @@ const SIZE = {
 // Pure: rendered once per (name,size) tuple. TranscriptView renders many
 // avatars per WS push, and the parent list re-renders on each — memo skips
 // those re-renders since the props are stable.
-export const Avatar = memo(function Avatar({ name, size = "md", className = "", gradient }: Props) {
+export const Avatar = memo(function Avatar({ name, size = "md", className = "", gradient, src }: Props) {
   const resolved = gradient ?? colorForSpeaker(name).avatar;
   return (
     <div
-      className={`flex-shrink-0 rounded-full bg-gradient-to-br ${resolved} flex items-center justify-center font-semibold text-white shadow-inner ${SIZE[size]} ${className}`}
+      className={`relative flex-shrink-0 rounded-full bg-gradient-to-br ${resolved} flex items-center justify-center font-semibold text-white shadow-inner overflow-hidden ${SIZE[size]} ${className}`}
       title={name}
     >
       {initials(name)}
+      {src && (
+        <img
+          src={src}
+          alt={name}
+          loading="lazy"
+          className="absolute inset-0 w-full h-full object-cover"
+          onError={(e) => {
+            // Image failed to load — hide it so the underlying initials
+            // circle is visible. Common when the voice has avatar_ext in
+            // the DB but the file was removed outside the app.
+            (e.currentTarget as HTMLImageElement).style.display = "none";
+          }}
+        />
+      )}
     </div>
   );
 });

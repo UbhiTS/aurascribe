@@ -5,7 +5,7 @@ import type { Meeting, Voice } from "../lib/api";
 import { TranscriptView } from "../components/TranscriptView";
 import { TitleSuggestPopover } from "../components/TitleSuggestPopover";
 import { Avatar } from "../components/Avatar";
-import { colorForSpeaker } from "../lib/speakerColors";
+import { avatarSrcFor, colorForSpeaker } from "../lib/speakerColors";
 
 interface Props {
   meeting: Meeting | null;
@@ -279,7 +279,7 @@ export function Review({
                         className={`inline-flex items-center gap-1.5 pl-1 pr-2 py-0.5 rounded-full border ${c.border} bg-gray-900/60 text-[11px] text-gray-200`}
                         title={name}
                       >
-                        <Avatar name={name} size="xs" gradient={c.avatar} />
+                        <Avatar name={name} size="xs" gradient={c.avatar} src={avatarSrcFor(name, voices)} />
                         <span className={name === selfSpeaker ? "text-brand-400" : ""}>{name}</span>
                       </span>
                     );

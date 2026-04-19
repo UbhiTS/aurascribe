@@ -90,6 +90,11 @@ AUDIO_DIR.mkdir(parents=True, exist_ok=True)
 # startup the log is still there for diagnosis.
 LOGS_DIR: Path = APP_DATA / "logs"
 LOGS_DIR.mkdir(parents=True, exist_ok=True)
+# Per-voice avatar images. File name is `<voice_id>.<ext>` where `ext` is
+# mirrored on voices.avatar_ext so we can serve the right MIME without
+# re-probing the file. Images are scrubbed from disk on voice delete.
+AVATARS_DIR: Path = APP_DATA / "avatars"
+AVATARS_DIR.mkdir(parents=True, exist_ok=True)
 
 # User-editable LLM prompt templates. Seeded from the package-bundled copies
 # on first run (or whenever the user deletes a file — the default returns).

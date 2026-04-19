@@ -6,7 +6,7 @@ import {
 import { api } from "../lib/api";
 import type { Utterance, Voice } from "../lib/api";
 import { Avatar } from "./Avatar";
-import { colorForSpeaker, type SpeakerColor } from "../lib/speakerColors";
+import { avatarSrcFor, colorForSpeaker, type SpeakerColor } from "../lib/speakerColors";
 
 // Distance threshold below which we consider a speaker match confident enough
 // to visually merge into the previous bubble. Empirically, same-speaker
@@ -441,6 +441,7 @@ export function TranscriptView({
             text={livePartial.text}
             mine={livePartial.speaker === selfSpeaker}
             color={colorForSpeaker(livePartial.speaker, voices)}
+            voices={voices}
           />
         )}
 
@@ -505,7 +506,7 @@ function Bubble({
   const showVoiceSearch = voices.length > 0;
   return (
     <div className={`flex gap-3 items-start group/bubble ${mine ? "flex-row-reverse" : ""}`}>
-      <Avatar name={u.speaker} size="md" gradient={color.avatar} />
+      <Avatar name={u.speaker} size="md" gradient={color.avatar} src={avatarSrcFor(u.speaker, voices)} />
       <div className={`flex-1 min-w-0 ${mine ? "items-end flex flex-col" : ""}`}>
         <div className={`flex items-center gap-2 mb-1 ${mine ? "flex-row-reverse" : ""}`}>
           <button
@@ -626,7 +627,7 @@ function Bubble({
                   onClick={() => onAssign(v.name)}
                   className="w-full text-left px-2 py-1 text-sm rounded hover:bg-gray-800 flex items-center gap-2"
                 >
-                  <Avatar name={v.name} size="xs" gradient={colorForSpeaker(v.name, voices).avatar} />
+                  <Avatar name={v.name} size="xs" gradient={colorForSpeaker(v.name, voices).avatar} src={avatarSrcFor(v.name, voices)} />
                   <span className={v.name === selfSpeaker ? "text-brand-400" : ""}>{v.name}</span>
                 </button>
               ))}
@@ -666,10 +667,10 @@ function Bubble({
   );
 }
 
-function LivePartialBubble({ speaker, text, mine, color }: { speaker: string; text: string; mine: boolean; color: SpeakerColor }) {
+function LivePartialBubble({ speaker, text, mine, color, voices }: { speaker: string; text: string; mine: boolean; color: SpeakerColor; voices: Voice[] }) {
   return (
     <div className={`flex gap-3 items-start opacity-75 ${mine ? "flex-row-reverse" : ""}`}>
-      <Avatar name={speaker} size="md" gradient={color.avatar} />
+      <Avatar name={speaker} size="md" gradient={color.avatar} src={avatarSrcFor(speaker, voices)} />
       <div className={`flex-1 min-w-0 ${mine ? "items-end flex flex-col" : ""}`}>
         <div className={`flex items-center gap-2 mb-1 ${mine ? "flex-row-reverse" : ""}`}>
           <span className="text-[11px] font-medium uppercase tracking-wider px-2 py-0.5 rounded-full border border-gray-700 text-gray-300 bg-gray-900/60">

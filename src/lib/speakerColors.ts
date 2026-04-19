@@ -22,6 +22,7 @@
 // All colors must have the 500/700 (gradient), 500/30 (border),
 // 500/15 (bg), and 50 (text) shades in the Tailwind theme.
 
+import { api } from "./api";
 import type { Voice } from "./api";
 
 export interface SpeakerColor {
@@ -82,4 +83,16 @@ export function colorForSpeaker(name: string, voices?: Voice[]): SpeakerColor {
   // Non-voice speakers (Speaker N clusters, untagged names): name-hash
   // fallback. Collisions possible but they're transient speakers anyway.
   return fallbackColor(name);
+}
+
+// URL for the custom uploaded avatar of `name`, or null if the speaker
+// has no Voice row or no uploaded image. `updated_at` is used as a
+// cache-busting query param so that when the user swaps images mid-
+// session, the WebView fetches the new file instead of replaying the
+// cached one.
+export function avatarSrcFor(name: string, voices?: Voice[]): string | null {
+  if (!voices || !name) return null;
+  const v = voices.find((x) => x.name === name);
+  if (!v || !v.avatar_ext) return null;
+  return api.voices.avatarUrl(v.id, v.updated_at);
 }

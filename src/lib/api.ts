@@ -94,6 +94,10 @@ export interface Voice {
   id: string;
   name: string;
   color: string | null;
+  // File extension of the uploaded avatar image, or null if the user
+  // hasn't uploaded one. Non-null means GET /api/voices/:id/avatar will
+  // serve the image; null means render the generated initials circle.
+  avatar_ext: string | null;
   created_at: string;
   updated_at: string;
   // Aggregates returned by /api/voices list view.
@@ -121,6 +125,7 @@ export interface VoiceDetail {
   id: string;
   name: string;
   color: string | null;
+  avatar_ext: string | null;
   created_at: string;
   updated_at: string;
   snippet_count: number;
@@ -292,8 +297,14 @@ export class ApiError extends Error {
 }
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
+  // FormData bodies must NOT carry a Content-Type header — the browser
+  // adds its own with the multipart boundary. Setting application/json
+  // here would break the upload. For plain JSON bodies we keep the
+  // default so every caller doesn't have to set it explicitly.
+  const isFormData = typeof FormData !== "undefined" && init?.body instanceof FormData;
+  const headers: HeadersInit = isFormData ? {} : { "Content-Type": "application/json" };
   const res = await fetch(BASE + path, {
-    headers: { "Content-Type": "application/json" },
+    headers,
     cache: "no-store",
     ...init,
   });
@@ -400,6 +411,21 @@ export const api = {
         method: "POST",
         body: JSON.stringify({ from_id: fromId, into_id: intoId }),
       }),
+    // Cache-buster defaults to the voice's updated_at so the WebView
+    // reliably fetches the new image after an upload. Works fine against
+    // the server's 10s Cache-Control max-age.
+    avatarUrl: (id: string, cacheKey?: string | null) =>
+      `${BASE}/voices/${id}/avatar${cacheKey ? `?v=${encodeURIComponent(cacheKey)}` : ""}`,
+    uploadAvatar: (id: string, file: File) => {
+      const fd = new FormData();
+      fd.append("file", file);
+      return request<{ ok: boolean; avatar_ext: string }>(
+        `/voices/${id}/avatar`,
+        { method: "POST", body: fd },
+      );
+    },
+    deleteAvatar: (id: string) =>
+      request<{ ok: boolean }>(`/voices/${id}/avatar`, { method: "DELETE" }),
   },
   llm: {
     models: () => request<{ models: string[] }>("/models"),
