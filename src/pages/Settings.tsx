@@ -335,7 +335,7 @@ export function Settings({ appStatus, obsidianConfigured }: Props) {
             k="llm_model" label="Model id" hint="The exact id the provider expects (e.g. gpt-4o, gemini-2.0-flash, claude-sonnet-4-6, or the local model id)." />
           <TokenSlider cfg={cfg} drafts={drafts} onChange={setDraft}
             k="llm_context_tokens" label="Context window"
-            stops={[4096, 8192, 16384, 32768, 65536, 131072, 524288, 1048576]}
+            stops={[4096, 8192, 16384, 32768, 65536, 131072, 262144, 524288, 1048576]}
             hint="Total token budget of the chosen model. Used to size long-context calls like the Daily Brief." />
           <p className="text-[11px] text-gray-500 mt-1">
             Status: {lmModels.length > 0
