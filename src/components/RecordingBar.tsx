@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Mic, Square, Clock } from "lucide-react";
 import { api } from "../lib/api";
 import { MicAudioProvider } from "../lib/MicAudioContext";
@@ -16,19 +16,28 @@ export function RecordingBar({ isRecording, devices, onStarted, onStopped }: Pro
   const [deviceIndex, setDeviceIndex] = useState<number | undefined>(undefined);
   const [loading, setLoading] = useState(false);
   const [elapsed, setElapsed] = useState(0);
-  const timerRef = useState<ReturnType<typeof setInterval> | null>(null);
+  const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const selectedDeviceName = devices.find((d) => d.index === deviceIndex)?.name ?? null;
 
   const startTimer = () => {
-    if (timerRef[0]) clearInterval(timerRef[0]);
-    const t = setInterval(() => setElapsed((e) => e + 1), 1000);
-    (timerRef as any)[0] = t;
+    if (timerRef.current) clearInterval(timerRef.current);
+    timerRef.current = setInterval(() => setElapsed((e) => e + 1), 1000);
   };
 
   const stopTimer = () => {
-    if (timerRef[0]) clearInterval(timerRef[0]);
+    if (timerRef.current) {
+      clearInterval(timerRef.current);
+      timerRef.current = null;
+    }
     setElapsed(0);
   };
+
+  // Guarantee the interval is cleared if the component unmounts mid-recording
+  // (e.g. user navigates away). Without this, the setInterval would keep
+  // firing setElapsed against an unmounted component.
+  useEffect(() => () => {
+    if (timerRef.current) clearInterval(timerRef.current);
+  }, []);
 
   const handleStart = async () => {
     setLoading(true);

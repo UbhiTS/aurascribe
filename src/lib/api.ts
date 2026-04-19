@@ -1,4 +1,9 @@
-const BASE = "/api";
+// Dev: Vite proxies /api → sidecar, so relative URLs work.
+// Prod: Tauri webview origin is `tauri://localhost` (or similar) with no
+// proxy — we must hit the sidecar by its absolute URL. Keep this in sync
+// with `SIDECAR_WS_BASE` in lib/useWebSocket.ts.
+export const SIDECAR_HTTP_BASE = import.meta.env.DEV ? "" : "http://127.0.0.1:8765";
+const BASE = `${SIDECAR_HTTP_BASE}/api`;
 
 export interface Utterance {
   id?: string;
@@ -23,16 +28,19 @@ export interface Meeting {
   ended_at: string | null;
   status: "recording" | "processing" | "done";
   summary: string | null;
-  action_items: string | null;
+  // Action items extracted from the final summary. Parsed server-side from
+  // the stored JSON TEXT column, so clients get native arrays.
+  action_items: string[] | null;
   vault_path: string | null;
   audio_path: string | null;
   utterances?: Utterance[];
-  // Live intelligence — JSON strings for the array fields, plain text for
-  // support_intelligence. Populated incrementally during recording by the
+  // Live intelligence — populated incrementally during recording by the
   // realtime-intelligence loop. Null until the LLM has run at least once.
-  live_highlights: string | null;
-  live_action_items_self: string | null;
-  live_action_items_others: string | null;
+  // Parsed server-side from the stored JSON TEXT columns; support_intelligence
+  // stays a plain text field (markdown-ish).
+  live_highlights: string[] | null;
+  live_action_items_self: string[] | null;
+  live_action_items_others: ActionItemOther[] | null;
   live_support_intelligence: string | null;
   // Bumped on every pill/voice change that affects this meeting's labels.
   // Compared against last_recomputed_at by `tagsPending` to flag the
@@ -72,22 +80,14 @@ export const EMPTY_LIVE_INTEL: LiveIntel = {
 
 export function liveIntelFromMeeting(m: Meeting | null): LiveIntel {
   if (!m) return EMPTY_LIVE_INTEL;
+  // All four source fields are already native arrays (parsed server-side
+  // — see `normalize_meeting_row` in sidecar/aurascribe/routes/_shared.py).
   return {
-    highlights: safeJsonArray<string>(m.live_highlights),
-    actionItemsSelf: safeJsonArray<string>(m.live_action_items_self),
-    actionItemsOthers: safeJsonArray<ActionItemOther>(m.live_action_items_others),
+    highlights: m.live_highlights ?? [],
+    actionItemsSelf: m.live_action_items_self ?? [],
+    actionItemsOthers: m.live_action_items_others ?? [],
     supportIntelligence: m.live_support_intelligence ?? "",
   };
-}
-
-function safeJsonArray<T>(raw: string | null): T[] {
-  if (!raw) return [];
-  try {
-    const v = JSON.parse(raw);
-    return Array.isArray(v) ? (v as T[]) : [];
-  } catch {
-    return [];
-  }
 }
 
 export interface Voice {

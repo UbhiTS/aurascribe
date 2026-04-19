@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { Sparkles, Loader, Pencil, CheckSquare, Square, RefreshCw, Lightbulb } from "lucide-react";
 import type { AppStatus, LiveIntel, Meeting, Utterance, Voice } from "../lib/api";
 import { api } from "../lib/api";
+import { useClockTick } from "../lib/useClockTick";
 import { RecordingBar } from "../components/RecordingBar";
 import { TranscriptView } from "../components/TranscriptView";
 import { TitleSuggestPopover } from "../components/TitleSuggestPopover";
@@ -71,7 +72,7 @@ export function LiveFeed({
     }
   };
 
-  const finalActionItems = parseActionItems(meeting?.action_items ?? null);
+  const finalActionItems = meeting?.action_items ?? [];
 
   return (
     <div className="h-full flex flex-col min-h-0">
@@ -365,10 +366,10 @@ function LiveIntelProgress({
     useState<number | null>(null);
   const [lastSeenTick, setLastSeenTick] = useState(intelTick);
   const [lastSeenUtteranceCount, setLastSeenUtteranceCount] = useState(utteranceCount);
-  // Bumped on an interval so the component re-renders and the derived
-  // "remaining seconds" updates. Using a counter (not storing Date.now)
-  // keeps the component pure w.r.t. the clock.
-  const [clockTick, setClockTick] = useState(0);
+  // 500ms render tick while recording. 500ms is fast enough that the
+  // "Ns" readout never looks frozen, slow enough not to thrash React.
+  // Pure w.r.t. the wall clock — each render reads a fresh Date.now().
+  const clockTick = useClockTick(500, isRecording);
 
   // Reset everything when a new recording starts. Using meetingId is
   // safer than isRecording: isRecording toggles in the stop window
@@ -379,7 +380,6 @@ function LiveIntelProgress({
     setFirstUtteranceSinceIntel(null);
     setLastSeenTick(intelTick);
     setLastSeenUtteranceCount(utteranceCount);
-    setClockTick(0);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [meetingId]);
 
@@ -410,17 +410,8 @@ function LiveIntelProgress({
     }
   }, [utteranceCount, lastSeenUtteranceCount]);
 
-  // 500ms render tick while recording. 500ms is fast enough that the
-  // "Ns" readout never looks frozen, slow enough not to thrash React.
-  useEffect(() => {
-    if (!isRecording) return;
-    const id = window.setInterval(() => setClockTick((c) => c + 1), 500);
-    return () => window.clearInterval(id);
-  }, [isRecording]);
-
-  // `clockTick` re-renders every 500ms — each render reads a fresh
-  // Date.now(). Kept as a counter (not storing Date.now) so the
-  // component is pure w.r.t. the wall clock.
+  // clockTick drives the re-render cadence — we read it into a void
+  // reference so TypeScript doesn't flag it as unused.
   void clockTick;
   const now = Date.now();
 
@@ -644,16 +635,6 @@ function ActionItem({ text }: { text: string }) {
       <span className={`text-gray-300 ${done ? "line-through text-gray-600" : ""}`}>{text}</span>
     </li>
   );
-}
-
-function parseActionItems(raw: string | null): string[] {
-  if (!raw) return [];
-  try {
-    const v = JSON.parse(raw);
-    return Array.isArray(v) ? v : [];
-  } catch {
-    return [];
-  }
 }
 
 function extractHighlights(summary: string): string {

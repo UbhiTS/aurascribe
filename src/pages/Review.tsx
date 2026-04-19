@@ -37,7 +37,7 @@ export function Review({
   const suggestBtnRef = useRef<HTMLButtonElement | null>(null);
 
   const selfSpeaker = voices.find((v) => v.name === "Me")?.name ?? "Me";
-  const actionItems = useMemo(() => parseActionItems(meeting?.action_items ?? null), [meeting]);
+  const actionItems = meeting?.action_items ?? [];
   const duration = useMemo(() => {
     if (!meeting?.started_at || !meeting?.ended_at) return null;
     const ms = new Date(meeting.ended_at).getTime() - new Date(meeting.started_at).getTime();
@@ -392,16 +392,6 @@ function ActionItem({ text }: { text: string }) {
       <span className={`text-gray-300 ${done ? "line-through text-gray-600" : ""}`}>{text}</span>
     </li>
   );
-}
-
-function parseActionItems(raw: string | null): string[] {
-  if (!raw) return [];
-  try {
-    const v = JSON.parse(raw);
-    return Array.isArray(v) ? v : [];
-  } catch {
-    return [];
-  }
 }
 
 function fmtDuration(ms: number): string {

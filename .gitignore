@@ -35,3 +35,10 @@ Thumbs.db
 *.db
 *.db-journal
 sidecar/models/
+
+# PyInstaller build output. The aurascribe-sidecar/ placeholder tree
+# (with .gitkeep) is kept so Tauri's bundle-resources glob matches even
+# before build:sidecar has been run.
+sidecar/build/
+sidecar/dist/aurascribe-sidecar/*
+!sidecar/dist/aurascribe-sidecar/.gitkeep

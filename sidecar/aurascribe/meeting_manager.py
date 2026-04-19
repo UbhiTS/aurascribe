@@ -62,6 +62,29 @@ PartialCallback = Callable[[str, str, str], Awaitable[None]]
 StatusCallback = Callable[[str, dict], Awaitable[None]]
 
 
+def extract_action_items(summary_md: str) -> list[str]:
+    """Parse the `## Action Items` section of an LLM-generated summary.
+
+    Pure text extraction — no state, no side effects. Lifted out of
+    MeetingManager so the API layer (which also needs to re-extract after
+    /summarize-style endpoints) can call it without reaching into a
+    private method on the manager instance.
+    """
+    items: list[str] = []
+    in_section = False
+    for line in summary_md.splitlines():
+        if "## Action Items" in line:
+            in_section = True
+            continue
+        if in_section:
+            if line.startswith("## "):
+                break
+            stripped = line.strip()
+            if stripped.startswith("- "):
+                items.append(stripped[2:])
+    return items
+
+
 class MeetingManager:
     def __init__(self, engine: TranscriptionEngine | None = None) -> None:
         self.capture = AudioCapture()
@@ -478,7 +501,7 @@ class MeetingManager:
                     meeting_summary_prompt(transcript, title),
                     system=MEETING_SUMMARY_SYSTEM,
                 )
-                action_items = self._extract_action_items(summary_md)
+                action_items = extract_action_items(summary_md)
 
                 await write_meeting(
                     meeting_id=meeting_id,
@@ -552,22 +575,6 @@ class MeetingManager:
 
         async with aiofiles.open(path, "r", encoding="utf-8") as f:
             return await f.read()
-
-    @staticmethod
-    def _extract_action_items(summary_md: str) -> list[str]:
-        items: list[str] = []
-        in_section = False
-        for line in summary_md.splitlines():
-            if "## Action Items" in line:
-                in_section = True
-                continue
-            if in_section:
-                if line.startswith("## "):
-                    break
-                stripped = line.strip()
-                if stripped.startswith("- "):
-                    items.append(stripped[2:])
-        return items
 
     # ── Callbacks ─────────────────────────────────────────────────────────────
 

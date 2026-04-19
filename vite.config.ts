@@ -18,4 +18,22 @@ export default defineConfig({
     },
   },
   envPrefix: ['VITE_', 'TAURI_'],
+  build: {
+    // Split vendor libs into their own long-lived chunks so app-code edits
+    // don't bust the vendor cache on every release.
+    rollupOptions: {
+      output: {
+        manualChunks(id) {
+          if (id.includes('node_modules/react-dom') ||
+              id.includes('node_modules/react/') ||
+              id.includes('node_modules/scheduler')) {
+            return 'react'
+          }
+          if (id.includes('node_modules/lucide-react')) return 'icons'
+          if (id.includes('node_modules/@fontsource')) return 'fonts'
+          return undefined
+        },
+      },
+    },
+  },
 })

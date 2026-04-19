@@ -36,7 +36,6 @@ class AudioCapture:
         self._loop: asyncio.AbstractEventLoop | None = None
         self._stream = None  # sounddevice.InputStream when started
         self._ring: deque[np.ndarray] = deque(maxlen=_RING_MAXLEN)
-        self._ring_mark: int = 0
         # Resampling state — only used when the device's native rate isn't 16kHz.
         self._resampler = None
         self._accum: np.ndarray = np.zeros(0, dtype=np.float32)
@@ -85,17 +84,6 @@ class AudioCapture:
         if not snapshot:
             return None
         return np.concatenate(snapshot)
-
-    def mark_position(self) -> None:
-        self._ring_mark = len(self._ring)
-
-    def get_audio_since_mark(self, max_seconds: float = 10.0) -> np.ndarray | None:
-        snapshot = list(self._ring)
-        new_blocks = snapshot[self._ring_mark:]
-        if not new_blocks:
-            return None
-        max_frames = int(max_seconds * SAMPLE_RATE / 512)
-        return np.concatenate(new_blocks[-max_frames:])
 
     def list_devices(self) -> list[dict]:
         """Return unique input-capable devices.
@@ -192,7 +180,6 @@ class AudioCapture:
         while not self._queue.empty():
             self._queue.get_nowait()
         self._ring.clear()
-        self._ring_mark = 0
         self._accum = np.zeros(0, dtype=np.float32)
 
         self._loop = asyncio.get_running_loop()

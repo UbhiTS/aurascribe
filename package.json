@@ -10,9 +10,12 @@
     "preview": "vite preview",
     "tauri": "tauri",
     "tauri:dev": "tauri dev",
-    "tauri:build": "tauri build"
+    "tauri:build": "tauri build",
+    "build:sidecar": "powershell -NoProfile -ExecutionPolicy Bypass -File sidecar/build.ps1",
+    "package": "npm run build:sidecar && npm run tauri:build"
   },
   "dependencies": {
+    "@fontsource/inter": "^5.2.8",
     "@tauri-apps/api": "^2",
     "@tauri-apps/plugin-shell": "^2",
     "react": "^19.2.4",
@@ -33,6 +36,7 @@
     "globals": "^17.4.0",
     "lucide-react": "^1.7.0",
     "postcss": "^8.5.8",
+    "svgo": "^4.0.1",
     "tailwindcss": "^3.4.19",
     "typescript": "~5.9.3",
     "typescript-eslint": "^8.57.0",

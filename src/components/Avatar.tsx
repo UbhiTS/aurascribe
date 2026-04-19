@@ -2,6 +2,8 @@
 // and a stable background color drawn from a curated palette.
 // No photos — we don't have them and don't want to fetch anything remote.
 
+import { memo } from "react";
+
 const PALETTE = [
   "from-brand-500 to-brand-700",
   "from-emerald-500 to-emerald-700",
@@ -41,7 +43,10 @@ const SIZE = {
   lg: "w-10 h-10 text-sm",
 };
 
-export function Avatar({ name, size = "md", className = "" }: Props) {
+// Pure: rendered once per (name,size) tuple. TranscriptView renders many
+// avatars per WS push, and the parent list re-renders on each — memo skips
+// those re-renders since the props are stable.
+export const Avatar = memo(function Avatar({ name, size = "md", className = "" }: Props) {
   const gradient = PALETTE[hash(name) % PALETTE.length];
   return (
     <div
@@ -51,4 +56,4 @@ export function Avatar({ name, size = "md", className = "" }: Props) {
       {initials(name)}
     </div>
   );
-}
+});

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { Suspense, lazy, useCallback, useEffect, useRef, useState } from "react";
 import { api, EMPTY_LIVE_INTEL, liveIntelFromMeeting } from "./lib/api";
 import type {
   ActionItemOther,
@@ -12,12 +12,27 @@ import { useWebSocket } from "./lib/useWebSocket";
 import { useLLMHealth } from "./lib/useLLMHealth";
 import { Shell } from "./components/Shell";
 import type { Page } from "./components/Sidebar";
-import { LiveFeed } from "./pages/LiveFeed";
-import { MeetingLibrary } from "./pages/MeetingLibrary";
-import { Review } from "./pages/Review";
-import { Voices } from "./pages/Voices";
-import { DailyBrief } from "./pages/DailyBrief";
-import { Settings } from "./pages/Settings";
+
+// Pages lazy-loaded so the initial bundle only carries the Live page. Every
+// other page is a separate chunk fetched when the user navigates to it.
+const LiveFeed = lazy(() =>
+  import("./pages/LiveFeed").then((m) => ({ default: m.LiveFeed })),
+);
+const MeetingLibrary = lazy(() =>
+  import("./pages/MeetingLibrary").then((m) => ({ default: m.MeetingLibrary })),
+);
+const Review = lazy(() =>
+  import("./pages/Review").then((m) => ({ default: m.Review })),
+);
+const Voices = lazy(() =>
+  import("./pages/Voices").then((m) => ({ default: m.Voices })),
+);
+const DailyBrief = lazy(() =>
+  import("./pages/DailyBrief").then((m) => ({ default: m.DailyBrief })),
+);
+const Settings = lazy(() =>
+  import("./pages/Settings").then((m) => ({ default: m.Settings })),
+);
 
 type StatusEvent =
   | "loading" | "ready" | "recording" | "processing" | "done" | "error";
@@ -77,27 +92,46 @@ export default function App() {
     api.meetings.get(reviewMeetingId).then(setReviewMeeting).catch(console.error);
   }, [reviewMeetingId]);
 
-  // Poll /api/status until engine_ready — WS "ready" broadcast can fire before
-  // the client's socket connects on cached-model fast boot.
+  // Two-phase /api/status polling:
+  //   1. Startup: poll every 1s until engine_ready. WS "ready" broadcast
+  //      can fire before the client's socket connects on cached-model
+  //      fast boot, so we need the pull too.
+  //   2. Heartbeat: once ready, keep a slow 30s poll running. If the
+  //      sidecar crashes or is killed (OOM, user task-manager), we want
+  //      the UI to notice and surface the disconnect state instead of
+  //      looking healthy but being functionally dead.
   useEffect(() => {
     let cancelled = false;
+    let timer: number | null = null;
+    let isReady = false;  // local, so the timing doesn't depend on React state flush
+
     const tick = async () => {
       try {
         const s = await api.status();
         if (cancelled) return;
         setAppStatus(s);
         if (s.engine_ready) {
+          isReady = true;
           setSystemStatus((prev) => (prev === "loading" ? "ready" : prev));
           setStatusMessage((prev) => (prev === "Loading models..." ? "" : prev));
-          return;
         }
       } catch {
-        // sidecar not up yet
+        // Request failed — sidecar not up yet (startup) or crashed (post-ready).
+        if (!cancelled && isReady) {
+          setSystemStatus("error");
+          setStatusMessage("Sidecar unreachable");
+        }
       }
-      if (!cancelled) setTimeout(tick, 1000);
+      if (!cancelled) {
+        // Fast poll during startup; slow heartbeat after ready.
+        timer = window.setTimeout(tick, isReady ? 30_000 : 1000);
+      }
     };
     tick();
-    return () => { cancelled = true; };
+    return () => {
+      cancelled = true;
+      if (timer !== null) window.clearTimeout(timer);
+    };
   }, []);
 
   const refreshVoices = useCallback(() => {
@@ -204,49 +238,51 @@ export default function App() {
       statusMessage={statusMessage}
       obsidianConfigured={obsidianConfigured}
     >
-      {page === "live" && (
-        <LiveFeed
-          appStatus={appStatus}
-          meeting={liveMeeting}
-          setMeeting={setLiveMeeting}
-          meetingId={liveMeetingId}
-          liveUtterances={liveUtterances}
-          livePartial={livePartial}
-          liveIntel={liveIntel}
-          intelTick={intelTick}
-          voices={voices}
-          onVoicesChanged={refreshVoices}
-          onMeetingStarted={handleMeetingStarted}
-          onMeetingStopped={handleMeetingStopped}
-          bumpRefreshKey={() => setRefreshKey((k) => k + 1)}
-        />
-      )}
-      {page === "library" && (
-        <MeetingLibrary
-          activeMeetingId={appStatus?.current_meeting_id ?? null}
-          refreshKey={refreshKey}
-          // Load a library meeting into Review only. Live pane is untouched.
-          onOpen={(id) => { setReviewMeetingId(id); setPage("review"); }}
-          selectedId={reviewMeetingId}
-        />
-      )}
-      {page === "review" && (
-        <Review
-          meeting={reviewMeeting}
-          meetingId={reviewMeetingId}
-          setMeeting={setReviewMeeting}
-          voices={voices}
-          onVoicesChanged={refreshVoices}
-          onBack={() => setPage("library")}
-          onMeetingChanged={() => setRefreshKey((k) => k + 1)}
-          onOpenMeeting={(id) => { setReviewMeetingId(id); }}
-        />
-      )}
-      {page === "voices" && (
-        <Voices voices={voices} onVoicesChanged={refreshVoices} />
-      )}
-      {page === "daily" && <DailyBrief signal={dailyBriefSignal} />}
-      {page === "settings" && <Settings appStatus={appStatus} obsidianConfigured={obsidianConfigured} />}
+      <Suspense fallback={null}>
+        {page === "live" && (
+          <LiveFeed
+            appStatus={appStatus}
+            meeting={liveMeeting}
+            setMeeting={setLiveMeeting}
+            meetingId={liveMeetingId}
+            liveUtterances={liveUtterances}
+            livePartial={livePartial}
+            liveIntel={liveIntel}
+            intelTick={intelTick}
+            voices={voices}
+            onVoicesChanged={refreshVoices}
+            onMeetingStarted={handleMeetingStarted}
+            onMeetingStopped={handleMeetingStopped}
+            bumpRefreshKey={() => setRefreshKey((k) => k + 1)}
+          />
+        )}
+        {page === "library" && (
+          <MeetingLibrary
+            activeMeetingId={appStatus?.current_meeting_id ?? null}
+            refreshKey={refreshKey}
+            // Load a library meeting into Review only. Live pane is untouched.
+            onOpen={(id) => { setReviewMeetingId(id); setPage("review"); }}
+            selectedId={reviewMeetingId}
+          />
+        )}
+        {page === "review" && (
+          <Review
+            meeting={reviewMeeting}
+            meetingId={reviewMeetingId}
+            setMeeting={setReviewMeeting}
+            voices={voices}
+            onVoicesChanged={refreshVoices}
+            onBack={() => setPage("library")}
+            onMeetingChanged={() => setRefreshKey((k) => k + 1)}
+            onOpenMeeting={(id) => { setReviewMeetingId(id); }}
+          />
+        )}
+        {page === "voices" && (
+          <Voices voices={voices} onVoicesChanged={refreshVoices} />
+        )}
+        {page === "daily" && <DailyBrief signal={dailyBriefSignal} />}
+        {page === "settings" && <Settings appStatus={appStatus} obsidianConfigured={obsidianConfigured} />}
+      </Suspense>
     </Shell>
   );
 }

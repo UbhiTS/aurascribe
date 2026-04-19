@@ -1,5 +1,10 @@
 import { useEffect, useRef, useState } from "react";
 
+// Dev: Vite proxies /ws to the sidecar, so a same-origin URL works.
+// Prod: Tauri webview origin is `tauri://localhost` — connect to the sidecar
+// directly. Must match `SIDECAR_HTTP_BASE` in lib/api.ts.
+const SIDECAR_WS_URL = import.meta.env.DEV ? null : "ws://127.0.0.1:8765/ws";
+
 export type WSMessage =
   | { type: "utterances"; meeting_id: string; data: { id?: string; speaker: string; text: string; start_time: number; end_time: number; match_distance?: number | null }[] }
   | { type: "partial_utterance"; meeting_id: string; speaker: string; text: string }
@@ -26,8 +31,11 @@ export function useWebSocket(onMessage: Handler): { connected: boolean } {
 
     const connect = () => {
       if (cancelled) return;
-      const proto = window.location.protocol === "https:" ? "wss" : "ws";
-      socket = new WebSocket(`${proto}://${window.location.host}/ws`);
+      const url = SIDECAR_WS_URL ?? (() => {
+        const proto = window.location.protocol === "https:" ? "wss" : "ws";
+        return `${proto}://${window.location.host}/ws`;
+      })();
+      socket = new WebSocket(url);
 
       socket.onopen = () => {
         if (!cancelled) setConnected(true);

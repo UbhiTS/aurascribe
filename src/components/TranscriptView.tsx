@@ -106,6 +106,21 @@ export function TranscriptView({
   const [newSpeakerDraft, setNewSpeakerDraft] = useState("");
   const bottomRef = useRef<HTMLDivElement>(null);
 
+  // Follow-tail scrolling — only auto-scroll to the bottom when the user is
+  // already parked at the live edge. If they've scrolled up to read back,
+  // leave the viewport alone (no jumping on every livePartial update).
+  // Threshold is generous so a small re-layout doesn't un-pin the user.
+  const scrollContainerRef = useRef<HTMLDivElement>(null);
+  const isPinnedRef = useRef(true);
+  const lastMeetingIdRef = useRef<string | null>(null);
+  const PIN_THRESHOLD_PX = 48;
+
+  const handleScroll: React.UIEventHandler<HTMLDivElement> = (e) => {
+    const el = e.currentTarget;
+    const distanceFromBottom = el.scrollHeight - (el.scrollTop + el.clientHeight);
+    isPinnedRef.current = distanceFromBottom < PIN_THRESHOLD_PX;
+  };
+
   // Shared <audio> element + which bubble is currently playing. We drive the
   // stop condition off a ref (not state) so the timeupdate handler stays
   // free of re-renders.
@@ -202,10 +217,36 @@ export function TranscriptView({
     });
   }, [liveUtterances]);
 
+  // Smooth scroll on new finalised utterances — the sparse, "interesting"
+  // event. Only fires when the user is parked at the live edge.
   useEffect(() => {
-    if (!isRecording) return;  // only auto-tail the live feed, not past meetings
+    if (!isRecording) return;
+    if (!isPinnedRef.current) return;
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [utterances, livePartial, isRecording]);
+  }, [utterances, isRecording]);
+
+  // The live partial updates multiple times per second as characters stream
+  // in. Smooth-scrolling on every tick looks jittery even when pinned; use
+  // an instant jump so pinned-tail users stay glued to the bottom without
+  // the viewport wobbling.
+  useEffect(() => {
+    if (!isRecording) return;
+    if (!isPinnedRef.current) return;
+    bottomRef.current?.scrollIntoView({ behavior: "instant" as ScrollBehavior });
+  }, [livePartial, isRecording]);
+
+  // Switching meetings always snaps to the bottom, regardless of prior
+  // pinned state — a fresh meeting's "live edge" is where the user wants
+  // to start reading.
+  useEffect(() => {
+    if (meetingId === lastMeetingIdRef.current) return;
+    lastMeetingIdRef.current = meetingId;
+    isPinnedRef.current = true;
+    // Defer until after the current render so the transcript has mounted.
+    requestAnimationFrame(() => {
+      bottomRef.current?.scrollIntoView({ behavior: "instant" as ScrollBehavior });
+    });
+  }, [meetingId]);
 
   // Close popover on outside click / escape.
   useEffect(() => {
@@ -314,7 +355,16 @@ export function TranscriptView({
       {/* Shared audio element — one per TranscriptView instance. Never
           rendered visibly; control happens via playSegment / stopPlayback. */}
       <audio ref={audioRef} preload="none" style={{ display: "none" }} />
-      <div className="flex-1 overflow-y-auto scrollbar-thin px-6 py-6 space-y-5">
+      <div
+        ref={scrollContainerRef}
+        onScroll={handleScroll}
+        // `overflow-anchor: auto` tells Chromium (WebView2) to pin the
+        // scroll position to an element when content above the viewport
+        // changes size — cancels the residual shift when the live partial
+        // pill is replaced by a taller finalised bubble.
+        style={{ overflowAnchor: "auto" }}
+        className="flex-1 overflow-y-auto scrollbar-thin px-6 py-6 space-y-5"
+      >
         {groups.map((g, i) => {
           // Synthesize an Utterance-shaped object so the existing Bubble
           // renderer stays per-"bubble" — the DB rows below are still

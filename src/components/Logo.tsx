@@ -1,7 +1,6 @@
-// Detailed feather + side-accent artwork from public/logos/feather.svg.
-// 200+ traced paths, recolored into two tones at build time by
-// scripts/recolor or at Python-side during setup: feather center in soft
-// lavender (#b8a8e8) and side accents in dark lavender (#6d5c95).
+// Feather mark served from public/logos/feather.svg. Two-tone recolour
+// (soft lavender #b8a8e8 centre, dark lavender #6d5c95 accents) is baked
+// into the SVG — no runtime transform.
 
 interface Props {
   size?: number;

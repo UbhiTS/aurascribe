@@ -1,3 +1,4 @@
+import { memo } from "react";
 import { Activity, FolderClosed, Calendar, Settings as SettingsIcon, Users } from "lucide-react";
 import { Logo } from "./Logo";
 
@@ -16,7 +17,10 @@ const NAV: { id: Page; label: string; icon: typeof Activity }[] = [
   { id: "settings", label: "Settings", icon: SettingsIcon },
 ];
 
-export function Sidebar({ page, onNavigate }: Props) {
+// Sidebar re-renders on every Shell prop change (WS connects, LLM status polls,
+// splash state). Pure on `{page, onNavigate}`, so memo elides the work —
+// callers already pass a stable onNavigate (setPage from useState).
+export const Sidebar = memo(function Sidebar({ page, onNavigate }: Props) {
   return (
     <nav className="w-52 flex-shrink-0 bg-gray-950 border-r border-gray-800 flex flex-col">
       {/* Brand */}
@@ -49,4 +53,4 @@ export function Sidebar({ page, onNavigate }: Props) {
       </div>
     </nav>
   );
-}
+});

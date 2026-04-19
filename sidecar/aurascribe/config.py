@@ -85,6 +85,11 @@ MODELS_DIR.mkdir(parents=True, exist_ok=True)
 # meeting, named <meeting_id>.opus. Deleted alongside the meeting row.
 AUDIO_DIR: Path = APP_DATA / "audio"
 AUDIO_DIR.mkdir(parents=True, exist_ok=True)
+# Logs + crash dumps. Survives uninstall (it's under APP_DATA, which the
+# user owns), which is exactly what we want — if the sidecar dies on
+# startup the log is still there for diagnosis.
+LOGS_DIR: Path = APP_DATA / "logs"
+LOGS_DIR.mkdir(parents=True, exist_ok=True)
 
 # User-editable LLM prompt templates. Seeded from the package-bundled copies
 # on first run (or whenever the user deletes a file — the default returns).

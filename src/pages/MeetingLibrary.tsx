@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useState } from "react";
 import { Search, Clock, FileText, Trash2, Loader, CheckSquare, Square } from "lucide-react";
 import { api } from "../lib/api";
 import type { Meeting } from "../lib/api";
@@ -41,14 +41,17 @@ export function MeetingLibrary({ activeMeetingId, refreshKey, onOpen, selectedId
     return meetings.filter((m) => m.title.toLowerCase().includes(q));
   }, [meetings, query]);
 
-  const toggle = (id: string) => {
+  // Stable callbacks so the memoized MeetingCard below doesn't re-render
+  // every time the user types in the search box (which rebuilds `filtered`
+  // and re-renders this component).
+  const toggle = useCallback((id: string) => {
     if (id === activeMeetingId) return;
     setSelected((prev) => {
       const next = new Set(prev);
       next.has(id) ? next.delete(id) : next.add(id);
       return next;
     });
-  };
+  }, [activeMeetingId]);
 
   const handleBulkDelete = async () => {
     const ids = [...selected];
@@ -113,8 +116,8 @@ export function MeetingLibrary({ activeMeetingId, refreshKey, onOpen, selectedId
               active={m.id === activeMeetingId}
               selected={selected.has(m.id)}
               highlighted={selectedId === m.id}
-              onToggleSelect={() => toggle(m.id)}
-              onOpen={() => onOpen(m.id)}
+              onToggleSelect={toggle}
+              onOpen={onOpen}
             />
           ))}
         </div>
@@ -123,11 +126,14 @@ export function MeetingLibrary({ activeMeetingId, refreshKey, onOpen, selectedId
   );
 }
 
-function MeetingCard({
+// Memoised so typing in the search box (which rebuilds `filtered`) doesn't
+// re-render every card. Callbacks take the meeting id instead of closing
+// over it — keeps the onToggleSelect/onOpen identities stable across renders.
+const MeetingCard = memo(function MeetingCard({
   m, active, selected, highlighted, onToggleSelect, onOpen,
 }: {
   m: Meeting; active: boolean; selected: boolean; highlighted: boolean;
-  onToggleSelect: () => void; onOpen: () => void;
+  onToggleSelect: (id: string) => void; onOpen: (id: string) => void;
 }) {
   const speakers = useSpeakers(m);
   const takeaways = useTakeaways(m);
@@ -138,11 +144,11 @@ function MeetingCard({
           ? "border-brand-500/60 bg-brand-950/30 shadow-lg shadow-brand-500/10"
           : "border-gray-800 bg-gray-900/40 hover:border-gray-700 hover:bg-gray-900/70"
       }`}
-      onClick={onOpen}
+      onClick={() => onOpen(m.id)}
     >
       {!active && (
         <button
-          onClick={(e) => { e.stopPropagation(); onToggleSelect(); }}
+          onClick={(e) => { e.stopPropagation(); onToggleSelect(m.id); }}
           className="absolute top-3 right-3 text-gray-500 hover:text-brand-400"
           title="Select"
         >
@@ -184,7 +190,7 @@ function MeetingCard({
       )}
     </div>
   );
-}
+});
 
 function useSpeakers(m: Meeting): string[] {
   const [s, setS] = useState<string[]>([]);
