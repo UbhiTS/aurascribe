@@ -138,6 +138,8 @@ _CONFIG_KEYS = {
     "llm_model",
     "llm_context_tokens",
     "whisper_model",
+    "whisper_device",
+    "whisper_compute_type",
     "whisper_language",
     "obsidian_vault",
     "rt_highlights_debounce_sec",
@@ -282,14 +284,119 @@ if OBSIDIAN_VAULT:
 else:
     VAULT_MEETINGS = VAULT_PEOPLE = VAULT_DAILY = None
 
-# ── ASR (faster-whisper) — Phase 3 consumes these ────────────────────────────
+# ── ASR (faster-whisper) — device-adaptive defaults ──────────────────────────
+#
+# We probe the machine once at import to pick a safe set of defaults:
+#   * No CUDA GPU              → cpu + int8 + small model (fits on any laptop)
+#   * CUDA GPU with ≥8 GB VRAM → cuda + float16 + large-v3-turbo (fastest)
+#   * CUDA GPU with 4-8 GB     → cuda + int8_float16 + large-v3-turbo
+#   * CUDA GPU with <4 GB      → cuda + int8 + medium
+#
+# All three values are user-overridable via config.json / Settings. We keep
+# the probe result around as module-level state so Settings can surface
+# "Detected: RTX 4090, 24 GB" without re-probing.
 
-WHISPER_MODEL: str = _cfg_str("whisper_model", "large-v3-turbo")
-# Device / compute-type are deliberately fixed — swapping them at runtime
-# can brick the pipeline (wrong CUDA/CPU path, unsupported compute type).
-# Edit these constants in-source if you need to retune.
-WHISPER_DEVICE: str = "cuda"
-WHISPER_COMPUTE_TYPE: str = "float16"
+
+def _probe_hardware() -> dict:
+    """One-shot probe of the local accelerator, run at config import.
+
+    We deliberately ask ctranslate2 first (faster-whisper's backend) —
+    it has its own CUDA bindings via the `nvidia-*-cu12` wheels and is
+    the actual thing that benefits from a GPU. PyTorch may be a
+    CPU-only wheel (our CPU-variant build ships `torch+cpu`) while
+    ctranslate2 can still run Whisper on CUDA fine.
+
+    Torch is a secondary probe for device-name / VRAM metadata. If torch
+    can't see the GPU (CPU-only wheel), we still return `device=cuda`
+    with no display name — enough for the auto-detect to pick the right
+    defaults, and the Settings UI handles the null name gracefully.
+
+    Never raises — a failure at any layer just falls through to the
+    next / stays on CPU defaults.
+    """
+    info: dict = {"device": "cpu", "device_name": None, "vram_gb": None}
+
+    # Primary: ctranslate2 — authoritative for whisper performance.
+    try:
+        import ctranslate2  # type: ignore
+        if ctranslate2.get_cuda_device_count() > 0:
+            info["device"] = "cuda"
+    except Exception:
+        pass
+
+    # Secondary: torch — for device name + VRAM, and as a fallback
+    # detection path in case ctranslate2 isn't installed yet.
+    try:
+        import torch  # type: ignore
+        torch_has_cuda = torch.cuda.is_available()
+        if torch_has_cuda:
+            info["device"] = "cuda"
+        if info["device"] == "cuda" and torch_has_cuda:
+            try:
+                info["device_name"] = str(torch.cuda.get_device_name(0))
+            except Exception:
+                pass
+            try:
+                props = torch.cuda.get_device_properties(0)
+                info["vram_gb"] = round(props.total_memory / (1024**3), 1)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    return info
+
+
+HARDWARE_PROBE: dict = _probe_hardware()
+
+
+def _default_whisper_device() -> str:
+    return str(HARDWARE_PROBE["device"])
+
+
+def _default_whisper_compute_type() -> str:
+    device = _default_whisper_device()
+    if device != "cuda":
+        return "int8"
+    vram = HARDWARE_PROBE.get("vram_gb")
+    if vram is None or vram >= 8:
+        return "float16"
+    if vram >= 4:
+        return "int8_float16"
+    return "int8"
+
+
+def _default_whisper_model() -> str:
+    """Pick a model that'll actually run well on the detected hardware.
+
+    `large-v3-turbo` is terrific on GPU but excruciating on CPU (~8x realtime
+    on an i7). On CPU we start with `small` (~1x realtime, still usable
+    quality), which the user can upgrade once they see how it performs.
+    """
+    device = _default_whisper_device()
+    if device != "cuda":
+        return "small"
+    vram = HARDWARE_PROBE.get("vram_gb")
+    if vram is not None and vram < 4:
+        return "medium"
+    return "large-v3-turbo"
+
+
+WHISPER_MODEL: str = _cfg_str("whisper_model", _default_whisper_model())
+WHISPER_DEVICE: str = _cfg_str("whisper_device", _default_whisper_device())
+WHISPER_COMPUTE_TYPE: str = _cfg_str("whisper_compute_type", _default_whisper_compute_type())
+
+# Safety net: float16 is a no-op / error on CPU. If the user has crossed
+# streams (e.g. device=cpu, compute_type=float16 from an old config) clamp
+# to a safe combo and log.
+if WHISPER_DEVICE == "cpu" and WHISPER_COMPUTE_TYPE == "float16":
+    import logging as _cfg_log
+    _cfg_log.getLogger("aurascribe").warning(
+        "config: whisper_compute_type=float16 is GPU-only; coercing to int8 "
+        "because whisper_device=cpu. Override in Settings if needed."
+    )
+    WHISPER_COMPUTE_TYPE = "int8"
+
 WHISPER_LANGUAGE: str = _cfg_str("whisper_language", "en")
 
 # ── Diarization (pyannote) — Phase 4 consumes these ──────────────────────────

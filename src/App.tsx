@@ -12,6 +12,7 @@ import { useWebSocket } from "./lib/useWebSocket";
 import { useLLMHealth } from "./lib/useLLMHealth";
 import { Shell } from "./components/Shell";
 import type { Page } from "./components/Sidebar";
+import { WelcomeDialog } from "./components/WelcomeDialog";
 
 // Pages lazy-loaded so the initial bundle only carries the Live page. Every
 // other page is a separate chunk fetched when the user navigates to it.
@@ -237,7 +238,19 @@ export default function App() {
       systemStatus={systemStatus}
       statusMessage={statusMessage}
       obsidianConfigured={obsidianConfigured}
+      hardware={appStatus?.hardware ?? null}
+      asr={appStatus?.asr ?? null}
+      diarization={appStatus?.diarization ?? null}
     >
+      {/* Only render once the engine has finished loading — the welcome
+          dialog displays the detected hardware, so we want the status
+          poll to have brought in appStatus.hardware first. */}
+      {systemStatus !== "loading" && appStatus?.hardware && (
+        <WelcomeDialog
+          hardware={appStatus.hardware}
+          onOpenSettings={() => setPage("settings")}
+        />
+      )}
       <Suspense fallback={null}>
         {page === "live" && (
           <LiveFeed

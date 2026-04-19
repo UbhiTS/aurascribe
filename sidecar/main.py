@@ -118,6 +118,27 @@ def main() -> None:
     _install_excepthook(log)
     _check_extras(log)
 
+    # One-line startup summary of the ASR device so `tauri dev` output +
+    # users' sidecar.log make it obvious what's being used. Helpful when
+    # debugging "why is transcription so slow?" — it's usually CPU mode.
+    from aurascribe import config as _cfg
+    probe = _cfg.HARDWARE_PROBE
+    if probe["device"] == "cuda":
+        log.info(
+            "asr: device=cuda (%s%s) compute=%s model=%s",
+            probe.get("device_name") or "unknown",
+            f", {probe['vram_gb']} GB" if probe.get("vram_gb") else "",
+            _cfg.WHISPER_COMPUTE_TYPE,
+            _cfg.WHISPER_MODEL,
+        )
+    else:
+        log.warning(
+            "asr: running on CPU (no CUDA GPU detected) — transcription will "
+            "be ~5-10\u00d7 slower than on a GPU. Override in Settings if you "
+            "have CUDA installed. compute=%s model=%s",
+            _cfg.WHISPER_COMPUTE_TYPE, _cfg.WHISPER_MODEL,
+        )
+
     host = os.environ.get("SIDECAR_HOST", "127.0.0.1")
     port = int(os.environ.get("SIDECAR_PORT", "8765"))
     # `log_config=None` stops uvicorn from installing its own logging config

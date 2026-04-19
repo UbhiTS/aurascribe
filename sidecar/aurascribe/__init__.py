@@ -1,7 +1,26 @@
 """AuraScribe sidecar package."""
 from __future__ import annotations
 
+import warnings as _warnings
+
 __version__ = "0.1.0"
+
+# Silence the noisy UserWarning pyannote.audio 3.3+ emits when torchcodec's
+# DLLs fail to load on Windows. torchcodec is a transitive dep pulled in by
+# pyannote for audio decoding; it tries to load libtorchcodec_core{4-8}.dll
+# at import time and spews ~40 lines of traceback as a *warning* when none
+# of the probed ABI versions exist. pyannote falls back to a working
+# decoder either way, so the warning is pure log noise.
+_warnings.filterwarnings(
+    "ignore",
+    message=r".*libtorchcodec_core\d+\.dll.*",
+    category=UserWarning,
+)
+_warnings.filterwarnings(
+    "ignore",
+    message=r".*torchcodec.*",
+    category=UserWarning,
+)
 
 
 def _wire_windows_cuda_dlls() -> None:

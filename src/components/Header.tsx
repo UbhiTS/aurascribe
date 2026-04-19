@@ -1,5 +1,6 @@
-import { Book, Brain, Mic, Plug, PlugZap, Radio } from "lucide-react";
+import { Book, Brain, Cpu, Mic, Plug, PlugZap, Radio, Users, Zap } from "lucide-react";
 import type { LLMHealth } from "../lib/useLLMHealth";
+import type { AppStatus } from "../lib/api";
 
 type StatusEvent =
   | "loading" | "ready" | "recording" | "processing" | "done" | "error";
@@ -12,6 +13,23 @@ interface Props {
   obsidianConfigured: boolean;
   systemStatus: StatusEvent;
   statusMessage: string;
+  hardware: AppStatus["hardware"] | null;
+  asr: AppStatus["asr"] | null;
+  diarization: AppStatus["diarization"] | null;
+}
+
+// Visual grammar for the compute chips: a single colour per location so
+// green=GPU / amber=CPU / gray=disabled reads consistently at a glance.
+function computeChipClass(device: "cuda" | "cpu" | null): string {
+  if (device === "cuda") return "text-emerald-300 border-emerald-800/50 bg-emerald-950/30";
+  if (device === "cpu") return "text-amber-300 border-amber-800/50 bg-amber-950/30";
+  return "text-gray-400 border-gray-800 bg-gray-900/60";
+}
+
+function deviceLabel(device: "cuda" | "cpu" | null): string {
+  if (device === "cuda") return "GPU";
+  if (device === "cpu") return "CPU";
+  return "off";
 }
 
 function StatusPill({ status, message }: { status: StatusEvent; message: string }) {
@@ -35,6 +53,7 @@ function StatusPill({ status, message }: { status: StatusEvent; message: string 
 export function Header({
   wsConnected, llm, activeAudioDevice,
   isRecording, obsidianConfigured, systemStatus, statusMessage,
+  hardware, asr, diarization,
 }: Props) {
   // Provider online when the model list is non-empty. Prefer the configured
   // model name for display; fall back to whatever the provider reports.
@@ -124,6 +143,54 @@ export function Header({
             >
               {activeAudioDevice ?? "Default mic"}
             </span>
+          </div>
+        </>
+      )}
+
+      {/* Compute-placement chips. Two of them — one per pipeline — so the
+          user always knows where Whisper and pyannote are actually running.
+          The two can diverge (ctranslate2 has its own CUDA path; torch may
+          be CPU-only), which this layout makes obvious. */}
+      {asr && (
+        <>
+          <div className="h-4 w-px bg-gray-800" />
+          <div
+            className={`flex items-center gap-1.5 px-2 py-0.5 rounded-full text-[11px] border ${computeChipClass(asr.device)}`}
+            title={[
+              `Whisper · ${asr.model}`,
+              `device: ${asr.device.toUpperCase()}`,
+              `precision: ${asr.compute_type}`,
+              hardware?.device === "cuda" && hardware.device_name
+                ? `on ${hardware.device_name}${hardware.vram_gb ? ` (${hardware.vram_gb} GB VRAM)` : ""}`
+                : null,
+            ].filter(Boolean).join(" · ")}
+          >
+            {asr.device === "cuda" ? <Zap size={11} /> : <Cpu size={11} />}
+            <span className="font-medium">Whisper</span>
+            <span className="font-mono opacity-80 truncate max-w-[140px]">{asr.model}</span>
+            <span className="opacity-70">·</span>
+            <span className="font-semibold">{deviceLabel(asr.device)}</span>
+          </div>
+        </>
+      )}
+      {diarization && (
+        <>
+          <div
+            className={`flex items-center gap-1.5 px-2 py-0.5 rounded-full text-[11px] border ${computeChipClass(diarization.device)}`}
+            title={
+              diarization.enabled
+                ? `Speaker diarization · device: ${diarization.device?.toUpperCase()}${
+                    diarization.device === "cpu" && asr?.device === "cuda"
+                      ? " (install a CUDA torch wheel to move diarization to the GPU)"
+                      : ""
+                  }`
+                : "Speaker diarization is disabled — requires HF_TOKEN + accepting the pyannote license."
+            }
+          >
+            <Users size={11} />
+            <span className="font-medium">Diarize</span>
+            <span className="opacity-70">·</span>
+            <span className="font-semibold">{deviceLabel(diarization.device)}</span>
           </div>
         </>
       )}

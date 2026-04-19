@@ -73,6 +73,11 @@ async def put_settings_data_dir(req: DataDirSettings) -> dict:
 # Declarative spec for every editable config field. Ordering here is purely
 # for developer convenience — the UI picks its own groupings via the key
 # names. Each tuple is (key, default_for_display).
+# Defaults shown under each field in the Settings UI. `None` means "no
+# preset default — fall back to auto-detect". The ASR trio (`whisper_model`,
+# `whisper_device`, `whisper_compute_type`) compute their defaults from the
+# hardware probe so the placeholder reflects what'd run if the user clears
+# their override. See `_probe_hardware` in aurascribe.config.
 _CONFIG_FIELDS: list[tuple[str, object]] = [
     ("hf_token",                       None),
     ("my_speaker_label",               "Me"),
@@ -80,7 +85,9 @@ _CONFIG_FIELDS: list[tuple[str, object]] = [
     ("llm_api_key",                    "lm-studio"),
     ("llm_model",                      "local-model"),
     ("llm_context_tokens",             4096),
-    ("whisper_model",                  "large-v3-turbo"),
+    ("whisper_model",                  config._default_whisper_model()),
+    ("whisper_device",                 config._default_whisper_device()),
+    ("whisper_compute_type",           config._default_whisper_compute_type()),
     ("whisper_language",               "en"),
     ("obsidian_vault",                 None),
     ("rt_highlights_debounce_sec",     20.0),
@@ -101,6 +108,8 @@ def _effective_for(key: str) -> object:
         "llm_model":                      config.LLM_MODEL,
         "llm_context_tokens":             config.LLM_CONTEXT_TOKENS,
         "whisper_model":                  config.WHISPER_MODEL,
+        "whisper_device":                 config.WHISPER_DEVICE,
+        "whisper_compute_type":           config.WHISPER_COMPUTE_TYPE,
         "whisper_language":               config.WHISPER_LANGUAGE,
         "obsidian_vault":                 str(config.OBSIDIAN_VAULT) if config.OBSIDIAN_VAULT else None,
         "rt_highlights_debounce_sec":     config.RT_HIGHLIGHTS_DEBOUNCE_SEC,
@@ -120,6 +129,8 @@ class UserConfigUpdate(BaseModel):
     llm_model: str | None = None
     llm_context_tokens: int | None = None
     whisper_model: str | None = None
+    whisper_device: str | None = None
+    whisper_compute_type: str | None = None
     whisper_language: str | None = None
     obsidian_vault: str | None = None
     rt_highlights_debounce_sec: float | None = None

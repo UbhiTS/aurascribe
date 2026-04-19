@@ -140,6 +140,29 @@ export interface AppStatus {
   // header uses this directly instead of inferring from meeting vault_paths
   // (which only land after the first markdown write).
   obsidian_configured: boolean;
+  // Detected at sidecar import. Settings surfaces this as "Detected: …"
+  // next to the device override, and the live page flags CPU-mode users.
+  hardware: {
+    device: "cuda" | "cpu";
+    device_name: string | null;
+    vram_gb: number | null;
+  };
+  // What the ASR engine is actually configured to use. Stable across the
+  // session — matches sidecar/aurascribe/config.py values at import time.
+  asr: {
+    model: string;
+    device: "cuda" | "cpu";
+    compute_type: string;
+  };
+  // Speaker diarization runtime state. `device` is null when disabled
+  // (no HF_TOKEN, licence not accepted, or pyannote failed to load).
+  // cuda != asr.device can legitimately happen when torch is CPU-only but
+  // ctranslate2 has CUDA — the UI surfaces this so users know why
+  // diarization is slower than whisper even on a GPU machine.
+  diarization: {
+    enabled: boolean;
+    device: "cuda" | "cpu" | null;
+  };
 }
 
 export interface DailyBriefDecision {
@@ -190,6 +213,8 @@ export type ConfigKey =
   | "llm_model"
   | "llm_context_tokens"
   | "whisper_model"
+  | "whisper_device"
+  | "whisper_compute_type"
   | "whisper_language"
   | "obsidian_vault"
   | "rt_highlights_debounce_sec"
@@ -243,6 +268,29 @@ export interface DailyBriefResponse {
   exists: boolean;
 }
 
+/** Typed HTTP error so callers can branch on status + structured detail
+ *  (e.g. FastAPI's 403 for mic-permission denial, which carries a
+ *  `{message, kind}` dict in `detail`). The `message` exposed via the
+ *  Error.message property is always a string — safe to render as-is. */
+export class ApiError extends Error {
+  status: number;
+  detail: unknown;
+
+  constructor(status: number, detail: unknown) {
+    // Unwrap a string or `{message}` so `error.message` is always readable.
+    const msg =
+      typeof detail === "string"
+        ? detail
+        : detail && typeof detail === "object" && "message" in detail
+          ? String((detail as { message: unknown }).message)
+          : "Request failed";
+    super(msg);
+    this.name = "ApiError";
+    this.status = status;
+    this.detail = detail;
+  }
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(BASE + path, {
     headers: { "Content-Type": "application/json" },
@@ -250,14 +298,20 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     ...init,
   });
   if (!res.ok) {
-    const err = await res.json().catch(() => ({ detail: res.statusText }));
-    throw new Error(err.detail ?? "Request failed");
+    const body = await res.json().catch(() => ({ detail: res.statusText }));
+    throw new ApiError(res.status, body.detail);
   }
   return res.json();
 }
 
 export const api = {
   status: () => request<AppStatus>("/status"),
+  system: {
+    openMicSettings: () =>
+      request<{ ok: boolean; reason?: string }>("/system/open-mic-settings", {
+        method: "POST",
+      }),
+  },
   meetings: {
     list: (days = 2, limit = 20, offset = 0) =>
       request<Meeting[]>(`/meetings?days=${days}&limit=${limit}&offset=${offset}`),

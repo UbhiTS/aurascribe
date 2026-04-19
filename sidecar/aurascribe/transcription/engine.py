@@ -6,7 +6,7 @@ pyannote 3.1 diarization, which layers on top of the engine output.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Callable, Protocol
+from typing import Awaitable, Callable, Protocol
 
 import numpy as np
 
@@ -36,10 +36,14 @@ class Utterance:
 
 
 PartialCallback = Callable[[str, str], None]  # (speaker, partial_text)
+StageCallback = Callable[[str], Awaitable[None]]  # (human-readable stage)
 
 
 class TranscriptionEngine(Protocol):
-    async def load(self) -> None: ...
+    # `on_stage` is optional — StubEngine ignores it; WhisperEngine uses
+    # it to broadcast "Downloading …" / "Loading diarization …" between
+    # its heavy load phases so the splash stays informative on first run.
+    async def load(self, on_stage: StageCallback | None = None) -> None: ...
     async def reload_voices(self) -> None: ...
     async def transcribe(
         self,
@@ -56,7 +60,9 @@ class StubEngine:
     def __init__(self) -> None:
         self._ready = False
 
-    async def load(self) -> None:
+    async def load(self, on_stage: StageCallback | None = None) -> None:
+        if on_stage:
+            await on_stage("StubEngine loaded")
         self._ready = True
 
     async def reload_voices(self) -> None:

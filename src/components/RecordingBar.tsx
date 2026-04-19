@@ -1,9 +1,14 @@
 import { useEffect, useRef, useState } from "react";
-import { Mic, Square, Clock } from "lucide-react";
-import { api } from "../lib/api";
+import { Mic, MicOff, Square, Clock, ExternalLink, X } from "lucide-react";
+import { api, ApiError } from "../lib/api";
 import { MicAudioProvider } from "../lib/MicAudioContext";
 import { VuMeter } from "./VuMeter";
 import { Waveform } from "./Waveform";
+
+interface MicError {
+  message: string;
+  kind: "permission" | "unknown";
+}
 
 interface Props {
   isRecording: boolean;
@@ -16,6 +21,8 @@ export function RecordingBar({ isRecording, devices, onStarted, onStopped }: Pro
   const [deviceIndex, setDeviceIndex] = useState<number | undefined>(undefined);
   const [loading, setLoading] = useState(false);
   const [elapsed, setElapsed] = useState(0);
+  const [micError, setMicError] = useState<MicError | null>(null);
+  const [openingSettings, setOpeningSettings] = useState(false);
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const selectedDeviceName = devices.find((d) => d.index === deviceIndex)?.name ?? null;
 
@@ -41,12 +48,41 @@ export function RecordingBar({ isRecording, devices, onStarted, onStopped }: Pro
 
   const handleStart = async () => {
     setLoading(true);
+    setMicError(null);
     try {
       const res = await api.meetings.start("", deviceIndex);
       onStarted(res.meeting_id);
       startTimer();
+    } catch (e) {
+      // 403 from the sidecar carries structured {message, kind} detail —
+      // "permission" means we know Windows is blocking us and can offer
+      // the one-click settings opener. Any other mic-related failure gets
+      // shown as a generic error with the same UI shape.
+      if (e instanceof ApiError && e.status === 403) {
+        const d = (e.detail ?? {}) as { message?: string; kind?: string };
+        setMicError({
+          message: d.message ?? e.message,
+          kind: d.kind === "permission" ? "permission" : "unknown",
+        });
+      } else if (e instanceof Error) {
+        setMicError({ message: e.message, kind: "unknown" });
+      } else {
+        setMicError({ message: "Could not start recording.", kind: "unknown" });
+      }
     } finally {
       setLoading(false);
+    }
+  };
+
+  const handleOpenMicSettings = async () => {
+    setOpeningSettings(true);
+    try {
+      await api.system.openMicSettings();
+    } catch {
+      // Best-effort — if the shell dispatch fails, the modal stays open
+      // with the instruction text, which is the fallback the user needs.
+    } finally {
+      setOpeningSettings(false);
     }
   };
 
@@ -121,6 +157,49 @@ export function RecordingBar({ isRecording, devices, onStarted, onStopped }: Pro
         </div>
       )}
     </div>
+
+    {micError && (
+      <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm">
+        <div className="bg-gray-900 border border-gray-700 rounded-xl shadow-2xl p-5 w-96">
+          <div className="flex items-start justify-between gap-3 mb-3">
+            <div className="flex items-center gap-2">
+              <MicOff size={16} className="text-red-400" />
+              <h3 className="text-sm font-semibold text-gray-100">
+                {micError.kind === "permission" ? "Microphone blocked" : "Couldn't start recording"}
+              </h3>
+            </div>
+            <button
+              onClick={() => setMicError(null)}
+              className="text-gray-500 hover:text-gray-300"
+              title="Dismiss"
+            >
+              <X size={14} />
+            </button>
+          </div>
+          <p className="text-xs text-gray-300 leading-relaxed mb-4 whitespace-pre-wrap">
+            {micError.message}
+          </p>
+          <div className="flex gap-2 justify-end">
+            <button
+              onClick={() => setMicError(null)}
+              className="px-3 py-1.5 text-xs text-gray-400 hover:text-gray-200 rounded-lg hover:bg-gray-800"
+            >
+              Dismiss
+            </button>
+            {micError.kind === "permission" && (
+              <button
+                onClick={handleOpenMicSettings}
+                disabled={openingSettings}
+                className="flex items-center gap-1.5 px-3 py-1.5 text-xs bg-brand-600 hover:bg-brand-700 disabled:opacity-50 text-white rounded-lg"
+              >
+                <ExternalLink size={11} />
+                Open Windows mic settings
+              </button>
+            )}
+          </div>
+        </div>
+      </div>
+    )}
     </MicAudioProvider>
   );
 }

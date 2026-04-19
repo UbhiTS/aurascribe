@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import pickle
+from typing import Awaitable, Callable
 
 import aiosqlite
 import numpy as np
@@ -35,6 +36,36 @@ from aurascribe.config import (
 from aurascribe.transcription.engine import PartialCallback, Utterance
 
 log = logging.getLogger("aurascribe.whisper")
+
+# Stage-progress callback, awaited between load phases so the caller can
+# broadcast status to the frontend.
+StageCallback = Callable[[str], Awaitable[None]]
+
+
+def _is_whisper_cached(model_name: str) -> bool:
+    """Best-effort check for a pre-downloaded whisper model in MODELS_DIR.
+
+    faster-whisper uses HuggingFace's cache layout: weights live under
+    `MODELS_DIR/models--<org>--<repo>/snapshots/<sha>/`. When the file
+    layout changes across versions the guess may be wrong; the worst case
+    is that we show "Downloading..." for a model that's actually already
+    cached, which is merely misleading — it still loads fine.
+    """
+    try:
+        for entry in MODELS_DIR.iterdir():
+            name = entry.name.lower()
+            if not name.startswith("models--"):
+                continue
+            if model_name.lower() in name:
+                # Has at least one real weight file inside?
+                for f in entry.rglob("*"):
+                    if f.suffix in (".bin", ".safetensors") and f.stat().st_size > 1_000_000:
+                        return True
+    except FileNotFoundError:
+        return False
+    except Exception:
+        return False
+    return False
 
 # Cosine-distance thresholds. Edit here to retune speaker identification.
 _THRESH_MULTI = 0.55
@@ -80,15 +111,47 @@ class WhisperEngine:
         # {voice_name: [embedding, ...]} — the pool accumulates tagged
         # snippets as the user assigns utterances to voices.
         self._voice_pools: dict[str, list[np.ndarray]] = {}
+        # Records where pyannote's pipeline actually landed after load:
+        # "cuda" if we successfully moved it to the GPU, "cpu" if it loaded
+        # but torch couldn't see a GPU (common when torch is CPU-only but
+        # ctranslate2 has CUDA), or None when the pipeline failed to load
+        # entirely (no HF token, licence not accepted, extras missing).
+        self._diarization_device: str | None = None
         self._ready = False
 
-    async def load(self) -> None:
+    async def load(self, on_stage: "StageCallback | None" = None) -> None:
+        """Load whisper + diarization models. `on_stage` (optional) is
+        awaited before each heavy phase with a short human-readable label
+        — the MeetingManager uses it to broadcast fine-grained status
+        updates so the splash doesn't look hung during the ~2 min first
+        run while Whisper and pyannote weights download."""
         loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, self._load_sync)
+
+        # Whisper phase. The first load for a given `whisper_model` is a
+        # download (~100 MB to 1.6 GB depending on size); subsequent loads
+        # are instant reads from MODELS_DIR. We detect the cached case by
+        # looking for the HF snapshot dir so we can set the right message.
+        if on_stage:
+            cached = _is_whisper_cached(WHISPER_MODEL)
+            verb = "Loading" if cached else "Downloading"
+            await on_stage(
+                f"{verb} Whisper model '{WHISPER_MODEL}'... "
+                f"({'instant' if cached else '1–5 min, one-time'})"
+            )
+        await loop.run_in_executor(None, self._load_whisper_sync)
+
+        # Diarization phase. Pyannote downloads the segmentation + embedding
+        # weights on first use; total ~200 MB. Also potentially slow on a
+        # cold cache but much quicker than whisper.
+        if self._enable_speaker_id:
+            if on_stage:
+                await on_stage("Loading speaker diarization pipeline...")
+            await loop.run_in_executor(None, self._load_diarization_sync)
+
         await self._load_voices()
         self._ready = True
 
-    def _load_sync(self) -> None:
+    def _load_whisper_sync(self) -> None:
         from faster_whisper import WhisperModel
 
         log.info(
@@ -102,23 +165,37 @@ class WhisperEngine:
             download_root=str(MODELS_DIR),
         )
 
-        if self._enable_speaker_id:
-            try:
-                from pyannote.audio import Pipeline
-                import torch
+    def _load_diarization_sync(self) -> None:
+        try:
+            from pyannote.audio import Pipeline
+            import torch
 
-                log.info("Loading %s", DIARIZATION_MODEL)
-                pipe = Pipeline.from_pretrained(DIARIZATION_MODEL, token=HF_TOKEN)
-                if WHISPER_DEVICE == "cuda" and torch.cuda.is_available():
-                    pipe.to(torch.device("cuda"))
-                self._diarization_pipeline = pipe
-            except Exception as e:
-                log.warning(
-                    "Diarization disabled (pipeline unavailable — accept license at "
-                    "https://hf.co/%s and set HF_TOKEN): %s",
-                    DIARIZATION_MODEL, e,
-                )
-                self._diarization_pipeline = None
+            log.info("Loading %s", DIARIZATION_MODEL)
+            pipe = Pipeline.from_pretrained(DIARIZATION_MODEL, token=HF_TOKEN)
+            if WHISPER_DEVICE == "cuda" and torch.cuda.is_available():
+                pipe.to(torch.device("cuda"))
+                self._diarization_device = "cuda"
+            else:
+                # Pipeline loaded but we can't move it to GPU — either the
+                # user configured cpu, or torch is CPU-only. Either way,
+                # pyannote runs on CPU and inference is ~10× slower than
+                # the GPU path. Log so the user knows what to fix.
+                self._diarization_device = "cpu"
+                if WHISPER_DEVICE == "cuda":
+                    log.info(
+                        "diarization: staying on CPU (torch.cuda.is_available()=False). "
+                        "Install a CUDA-enabled torch wheel to move diarization to GPU: "
+                        "pip install --index-url https://download.pytorch.org/whl/cu121 torch torchaudio"
+                    )
+            self._diarization_pipeline = pipe
+        except Exception as e:
+            log.warning(
+                "Diarization disabled (pipeline unavailable — accept license at "
+                "https://hf.co/%s and set HF_TOKEN): %s",
+                DIARIZATION_MODEL, e,
+            )
+            self._diarization_pipeline = None
+            self._diarization_device = None
 
     async def _load_voices(self) -> None:
         pools: dict[str, list[np.ndarray]] = {}
@@ -142,6 +219,25 @@ class WhisperEngine:
 
     async def reload_voices(self) -> None:
         await self._load_voices()
+
+    # ── Runtime introspection (surfaced in /api/status for the header) ───────
+
+    @property
+    def whisper_model(self) -> str:
+        return WHISPER_MODEL
+
+    @property
+    def whisper_device(self) -> str:
+        return WHISPER_DEVICE
+
+    @property
+    def whisper_compute_type(self) -> str:
+        return WHISPER_COMPUTE_TYPE
+
+    @property
+    def diarization_device(self) -> str | None:
+        """Where pyannote actually landed, or None when disabled."""
+        return self._diarization_device
 
     async def transcribe(
         self,

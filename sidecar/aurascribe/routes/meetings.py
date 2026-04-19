@@ -14,6 +14,7 @@ from fastapi import APIRouter, HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
+from aurascribe.audio.capture import MicUnavailableError
 from aurascribe.config import AUDIO_DIR, DB_PATH
 from aurascribe.llm.analysis import is_placeholder_title
 from aurascribe.llm.client import LLMUnavailableError
@@ -48,6 +49,11 @@ async def start_meeting(req: StartMeetingRequest) -> dict:
     try:
         meeting_id = await manager.start_meeting(title=req.title, device=req.device)
         return {"meeting_id": meeting_id, "status": "recording"}
+    except MicUnavailableError as e:
+        # 403 + structured detail so the frontend can show the "Open
+        # Windows mic settings" affordance for permission denials, and a
+        # generic try-again dialog for everything else.
+        raise HTTPException(403, detail={"message": str(e), "kind": e.kind})
     except RuntimeError as e:
         raise HTTPException(400, str(e))
 

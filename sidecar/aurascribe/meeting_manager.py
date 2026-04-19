@@ -115,7 +115,18 @@ class MeetingManager:
 
     async def initialize(self) -> None:
         await self._emit_status("loading", {"message": "Loading transcription models..."})
-        await self.engine.load()
+
+        async def _on_stage(message: str) -> None:
+            await self._emit_status("loading", {"message": message})
+
+        # Engine.load calls back into _on_stage between phases so the UI can
+        # show "Downloading Whisper …" / "Loading diarization …" rather than
+        # a single opaque "Loading…" for 1–5 minutes on first run.
+        try:
+            await self.engine.load(on_stage=_on_stage)
+        except TypeError:
+            # Back-compat for engines that don't accept on_stage.
+            await self.engine.load()
         self._ready = True
         await self._emit_status("ready", {"message": "Models loaded. Ready to record."})
 

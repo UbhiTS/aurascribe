@@ -28,6 +28,20 @@ _STOP_SENTINEL: object = object()
 _RING_MAXLEN = int(30 * SAMPLE_RATE / 512)  # 30s of 512-sample blocks
 
 
+class MicUnavailableError(RuntimeError):
+    """Microphone couldn't be opened — most commonly because Windows has
+    denied mic access to the app, the device is in use by another process,
+    or the selected device index has disappeared (Bluetooth headset gone).
+
+    Carries a UI-friendly `kind` so the frontend can show the right
+    affordance (e.g. "Open Windows mic settings" for permission denials).
+    """
+
+    def __init__(self, message: str, *, kind: str = "unknown") -> None:
+        super().__init__(message)
+        self.kind = kind
+
+
 class AudioCapture:
     def __init__(self) -> None:
         self._vad_model = None
@@ -183,15 +197,45 @@ class AudioCapture:
         self._accum = np.zeros(0, dtype=np.float32)
 
         self._loop = asyncio.get_running_loop()
-        self._stream = sd.InputStream(
-            device=device,
-            samplerate=native_sr,
-            channels=CHANNELS,
-            dtype="float32",
-            blocksize=blocksize,
-            callback=self._audio_callback,
-        )
-        self._stream.start()
+        # Opening + starting the InputStream is where Windows mic permission
+        # denial manifests — sounddevice surfaces it as a PortAudioError with
+        # an opaque "Unanticipated host error" / error-code message. Translate
+        # it into a structured error the API layer can return as 403 + kind.
+        try:
+            self._stream = sd.InputStream(
+                device=device,
+                samplerate=native_sr,
+                channels=CHANNELS,
+                dtype="float32",
+                blocksize=blocksize,
+                callback=self._audio_callback,
+            )
+            self._stream.start()
+        except Exception as e:
+            self._stream = None
+            msg = str(e).lower()
+            # Windows privacy denial + "device in use" both show up as
+            # PortAudio host errors. We can't distinguish them reliably,
+            # so we hand the user the most common fix.
+            is_probable_permission = (
+                "unanticipated host error" in msg
+                or "invalid device" in msg
+                or "access is denied" in msg
+                or "0x80070005" in msg   # E_ACCESSDENIED
+            )
+            if is_probable_permission:
+                raise MicUnavailableError(
+                    "Microphone could not be opened. Most commonly this is "
+                    "Windows blocking mic access — check Settings → Privacy → "
+                    "Microphone and ensure AuraScribe is allowed. If another "
+                    "app (Teams, Zoom, Discord) is holding the mic, close it "
+                    "and try again.",
+                    kind="permission",
+                ) from e
+            raise MicUnavailableError(
+                f"Microphone could not be opened: {e}",
+                kind="unknown",
+            ) from e
 
     async def stop(self) -> None:
         if self._stream is not None:

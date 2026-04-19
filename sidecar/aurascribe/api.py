@@ -8,9 +8,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import subprocess
+import sys
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
 from aurascribe import __version__
@@ -138,6 +140,14 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
 
 @app.get("/api/status")
 async def get_status() -> dict:
+    # ASR / diarization runtime facts — `engine_ready` gates diarization_device
+    # because pyannote may not have finished loading yet (or failed to load
+    # entirely, in which case diarization is disabled). Whisper config comes
+    # from config.py directly so the header can show the model + device even
+    # during the loading phase — those values are decided at import time.
+    engine = manager.engine
+    diar_device = getattr(engine, "diarization_device", None) if manager.is_ready else None
+    diar_enabled = manager.is_ready and diar_device is not None
     return {
         "ok": True,
         "version": __version__,
@@ -146,13 +156,52 @@ async def get_status() -> dict:
         "current_meeting_id": manager.current_meeting_id,
         "audio_devices": manager.list_audio_devices(),
         "active_audio_device": manager.active_device_name,
-        # True iff config.obsidian_vault is set. Lets the header show the
-        # vault state without waiting for a vault_path to be stamped on a
-        # meeting (which only happens after the first markdown write).
         "obsidian_configured": config.OBSIDIAN_VAULT is not None,
+        # Hardware the sidecar probed at import. Frozen for the lifetime of
+        # the process; survives in the UI as the "Detected:" chip.
+        "hardware": {
+            "device": config.HARDWARE_PROBE["device"],
+            "device_name": config.HARDWARE_PROBE.get("device_name"),
+            "vram_gb": config.HARDWARE_PROBE.get("vram_gb"),
+        },
+        # What the running pipelines are actually doing. Values here let the
+        # header show "Whisper large-v3-turbo · GPU" and "Diarization · CPU"
+        # chips so the user always knows where the compute is happening.
+        "asr": {
+            "model": config.WHISPER_MODEL,
+            "device": config.WHISPER_DEVICE,
+            "compute_type": config.WHISPER_COMPUTE_TYPE,
+        },
+        "diarization": {
+            "enabled": diar_enabled,
+            "device": diar_device,  # "cuda" | "cpu" | None
+        },
     }
 
 
 @app.get("/api/models")
 async def list_models() -> dict:
     return {"models": await get_available_models()}
+
+
+@app.post("/api/system/open-mic-settings")
+async def open_mic_settings() -> dict:
+    """Launch the OS microphone-privacy settings pane.
+
+    Called from the frontend's "permission denied" dialog so the user
+    gets a one-click path to the fix rather than having to hunt through
+    Windows Settings manually. No-op on non-Windows (returns a hint).
+    """
+    if sys.platform != "win32":
+        return {"ok": False, "reason": "only-windows"}
+    try:
+        # `ms-settings:` is a Windows shell URI scheme. `cmd /c start` is the
+        # canonical dispatcher — same pattern as intel.open-prompt.
+        subprocess.Popen(
+            ["cmd", "/c", "start", "", "ms-settings:privacy-microphone"],
+            shell=False,
+            close_fds=True,
+        )
+    except Exception as e:
+        raise HTTPException(500, f"Could not open mic settings: {e}")
+    return {"ok": True}

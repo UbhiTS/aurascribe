@@ -17,10 +17,18 @@ interface Props {
 // only — a bad Obsidian path shouldn't block saving LLM changes.
 const SECTION_KEYS = {
   llm: ["llm_base_url", "llm_api_key", "llm_model", "llm_context_tokens"] as ConfigKey[],
-  speech: ["whisper_model", "whisper_language", "my_speaker_label"] as ConfigKey[],
+  speech: ["whisper_model", "whisper_device", "whisper_compute_type", "whisper_language", "my_speaker_label"] as ConfigKey[],
   diarization: ["hf_token"] as ConfigKey[],
   obsidian: ["obsidian_vault"] as ConfigKey[],
   realtime: ["rt_highlights_debounce_sec", "rt_highlights_max_interval_sec", "rt_highlights_window_sec"] as ConfigKey[],
+};
+
+// Per-field option lists for fields rendered as a <select>. Keys not listed
+// here fall through to a plain <input>. Option strings are what gets stored
+// in config.json — matches what faster-whisper / ctranslate2 accept.
+const ENUM_OPTIONS: Partial<Record<ConfigKey, readonly string[]>> = {
+  whisper_device: ["cuda", "cpu"],
+  whisper_compute_type: ["float16", "int8_float16", "int8", "float32"],
 };
 
 const NUMERIC_KEYS = new Set<ConfigKey>([
@@ -348,7 +356,7 @@ export function Settings({ appStatus, obsidianConfigured }: Props) {
         <ConfigSection
           icon={<Languages size={14} className="text-emerald-400" />}
           title="Speech & Transcription"
-          description="faster-whisper model selection and language. Device / compute-type stay env-only."
+          description="faster-whisper model + device. Defaults auto-pick from your hardware; override anything below and restart to apply."
           sectionId="speech"
           keys={SECTION_KEYS.speech}
           isDirty={isDirty}
@@ -357,8 +365,28 @@ export function Settings({ appStatus, obsidianConfigured }: Props) {
           sectionSavedAt={sectionSavedAt}
           onSave={() => saveSection("speech", SECTION_KEYS.speech)}
         >
+          {appStatus?.hardware && (
+            <div className="col-span-full -mt-1 mb-1 flex items-center gap-2 px-2.5 py-1.5 rounded-lg border border-gray-800 bg-gray-950/50 text-[11px] text-gray-400">
+              <Cpu size={11} className="text-brand-400 flex-shrink-0" />
+              <span>
+                Detected: <span className="text-gray-200 font-mono">{appStatus.hardware.device}</span>
+                {appStatus.hardware.device_name && (
+                  <> · <span className="text-gray-200">{appStatus.hardware.device_name}</span></>
+                )}
+                {appStatus.hardware.vram_gb != null && (
+                  <> · <span className="text-gray-300">{appStatus.hardware.vram_gb} GB VRAM</span></>
+                )}
+              </span>
+            </div>
+          )}
           <ConfigField cfg={cfg} drafts={drafts} onChange={setDraft}
-            k="whisper_model" label="Whisper model" hint="e.g. large-v3-turbo, large-v3, medium, small.en" />
+            k="whisper_model" label="Whisper model" hint="e.g. large-v3-turbo, large-v3, medium, small, base, tiny" />
+          <ConfigField cfg={cfg} drafts={drafts} onChange={setDraft}
+            k="whisper_device" label="Device"
+            hint="cuda uses your NVIDIA GPU; cpu runs everywhere but is 5–10× slower." />
+          <ConfigField cfg={cfg} drafts={drafts} onChange={setDraft}
+            k="whisper_compute_type" label="Compute precision"
+            hint="float16 = fast (GPU only). int8_float16 = half VRAM. int8 = smallest (CPU-friendly)." />
           <ConfigField cfg={cfg} drafts={drafts} onChange={setDraft}
             k="whisper_language" label="Language" hint="ISO code. en, es, fr, de, …" />
           <ConfigField cfg={cfg} drafts={drafts} onChange={setDraft}
@@ -560,9 +588,13 @@ interface ConfigFieldProps {
   label: string;
   type?: "text" | "password" | "number";
   hint?: string;
+  // Optional dropdown options. When provided, renders as a <select>
+  // instead of a free-text <input>. The leading empty option restores
+  // the auto-detected default.
+  options?: readonly string[];
 }
 
-function ConfigField({ cfg, drafts, onChange, k, label, type = "text", hint }: ConfigFieldProps) {
+function ConfigField({ cfg, drafts, onChange, k, label, type = "text", hint, options }: ConfigFieldProps) {
   const field = cfg?.settings[k];
   const value = drafts[k] ?? "";
   const overridden = field?.override !== null && field?.override !== undefined;
@@ -575,6 +607,7 @@ function ConfigField({ cfg, drafts, onChange, k, label, type = "text", hint }: C
     ? (effective ? "••••••" : "(empty)")
     : (effective !== null && effective !== undefined ? String(effective) : "(empty)");
   const showEffective = effective != null && String(effective) !== value;
+  const resolvedOptions = options ?? ENUM_OPTIONS[k];
 
   return (
     <div>
@@ -590,19 +623,37 @@ function ConfigField({ cfg, drafts, onChange, k, label, type = "text", hint }: C
           </span>
         )}
       </div>
-      <input
-        type={type}
-        spellCheck={false}
-        value={value}
-        onChange={(e) => onChange(k, e.target.value)}
-        placeholder={placeholder}
-        disabled={!cfg}
-        className="w-full text-xs font-mono px-2.5 py-1.5 rounded-lg
-                   bg-gray-950/70 border border-gray-800
-                   text-gray-200 placeholder-gray-600
-                   focus:outline-none focus:border-brand-600
-                   disabled:opacity-50"
-      />
+      {resolvedOptions ? (
+        <select
+          value={value}
+          onChange={(e) => onChange(k, e.target.value)}
+          disabled={!cfg}
+          className="w-full text-xs font-mono px-2.5 py-1.5 rounded-lg
+                     bg-gray-950/70 border border-gray-800
+                     text-gray-200
+                     focus:outline-none focus:border-brand-600
+                     disabled:opacity-50"
+        >
+          <option value="">auto ({placeholder || "detect"})</option>
+          {resolvedOptions.map((o) => (
+            <option key={o} value={o}>{o}</option>
+          ))}
+        </select>
+      ) : (
+        <input
+          type={type}
+          spellCheck={false}
+          value={value}
+          onChange={(e) => onChange(k, e.target.value)}
+          placeholder={placeholder}
+          disabled={!cfg}
+          className="w-full text-xs font-mono px-2.5 py-1.5 rounded-lg
+                     bg-gray-950/70 border border-gray-800
+                     text-gray-200 placeholder-gray-600
+                     focus:outline-none focus:border-brand-600
+                     disabled:opacity-50"
+        />
+      )}
       {hint && <p className="text-[10px] text-gray-500 mt-1">{hint}</p>}
       {showEffective && (
         <p className="text-[10px] text-gray-500 mt-1 font-mono break-all">
