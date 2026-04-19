@@ -8,8 +8,6 @@ type StatusEvent =
 interface Props {
   wsConnected: boolean;
   llm: LLMHealth;
-  activeAudioDevice: string | null;
-  isRecording: boolean;
   obsidianConfigured: boolean;
   systemStatus: StatusEvent;
   statusMessage: string;
@@ -51,8 +49,8 @@ function StatusPill({ status, message }: { status: StatusEvent; message: string 
 }
 
 export function Header({
-  wsConnected, llm, activeAudioDevice,
-  isRecording, obsidianConfigured, systemStatus, statusMessage,
+  wsConnected, llm,
+  obsidianConfigured, systemStatus, statusMessage,
   hardware, asr, diarization,
 }: Props) {
   // Provider online when the model list is non-empty. Prefer the configured

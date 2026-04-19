@@ -12,8 +12,6 @@ interface Props {
   onNavigate: (p: Page) => void;
   wsConnected: boolean;
   llm: LLMHealth;
-  activeAudioDevice: string | null;
-  isRecording: boolean;
   systemStatus: StatusEvent;
   statusMessage: string;
   obsidianConfigured: boolean;
@@ -25,7 +23,6 @@ interface Props {
 
 export function Shell({
   page, onNavigate, wsConnected, llm,
-  activeAudioDevice, isRecording,
   systemStatus, statusMessage, obsidianConfigured, hardware,
   asr, diarization, children,
 }: Props) {
@@ -36,8 +33,6 @@ export function Shell({
         <Header
           wsConnected={wsConnected}
           llm={llm}
-          activeAudioDevice={activeAudioDevice}
-          isRecording={isRecording}
           systemStatus={systemStatus}
           statusMessage={statusMessage}
           obsidianConfigured={obsidianConfigured}

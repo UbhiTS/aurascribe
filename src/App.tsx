@@ -234,16 +234,12 @@ export default function App() {
   // a recording.
   const obsidianConfigured = appStatus?.obsidian_configured ?? false;
 
-  const isRecording = appStatus?.is_recording ?? false;
-
   return (
     <Shell
       page={page}
       onNavigate={setPage}
       wsConnected={wsConnected}
       llm={llm}
-      activeAudioDevice={appStatus?.active_audio_device ?? null}
-      isRecording={isRecording}
       systemStatus={systemStatus}
       statusMessage={statusMessage}
       obsidianConfigured={obsidianConfigured}
