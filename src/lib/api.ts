@@ -301,6 +301,15 @@ export const api = {
       }),
     summarize: (id: string) =>
       request<Meeting>(`/meetings/${id}/summarize`, { method: "POST" }),
+    suggestTitle: (id: string) =>
+      // Response includes the refreshed Meeting because this endpoint
+      // also persists a fresh AI summary as a side effect — a single
+      // LLM call produces both artefacts, so we return both and let
+      // the caller update its local state without a second fetch.
+      request<{ suggestions: string[]; meeting: Meeting }>(
+        `/meetings/${id}/suggest-title`,
+        { method: "POST" },
+      ),
     trim: (id: string, opts: { before?: number; after?: number }) =>
       request<{ ok: boolean; shifted_by: number }>(`/meetings/${id}/trim`, {
         method: "POST",

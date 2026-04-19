@@ -29,8 +29,14 @@ from aurascribe import config
 from aurascribe.config import AUDIO_DIR, DB_PATH
 from aurascribe.db.database import init_db
 from aurascribe.llm import daily_brief as daily_brief_mod
-from aurascribe.llm.client import LLMUnavailableError, chat, get_available_models
-from aurascribe.llm.prompts import MEETING_SUMMARY_SYSTEM, format_transcript, meeting_summary_prompt
+from aurascribe.llm.client import LLMUnavailableError, get_available_models
+from aurascribe.llm.analysis import (
+    AnalysisEmptyError,
+    AnalysisResult,
+    analyze_meeting,
+    is_placeholder_title,
+)
+from aurascribe.llm.prompts import format_transcript
 from aurascribe.meeting_manager import MeetingManager
 from aurascribe.obsidian.writer import cleanup_vault_stragglers, rewrite_meeting_vault
 from aurascribe.transcription import Utterance
@@ -109,6 +115,30 @@ def _delete_audio_files(meeting_ids: list[str]) -> None:
                 _log.getLogger("aurascribe").warning(
                     "could not delete audio file %s: %s", p, e
                 )
+
+
+def _delete_vault_files(vault_paths: list[str | None]) -> None:
+    """Remove the Obsidian markdown files for the given meetings.
+
+    Pass absolute paths as stored in `meetings.vault_path`. Entries that
+    are None/empty or point at a non-existent file are silently skipped
+    — meetings that pre-date vault configuration or were never written
+    simply have nothing to remove. Like `_delete_audio_files`, this is
+    best-effort: the DB row is already gone, so the worst case is a
+    stale file that the vault-straggler cleanup on next boot will not
+    touch (it only prunes files for meeting IDs that still exist)."""
+    import logging as _log
+    log = _log.getLogger("aurascribe")
+    for vp in vault_paths:
+        if not vp:
+            continue
+        p = Path(vp)
+        if not p.exists():
+            continue
+        try:
+            p.unlink()
+        except Exception as e:
+            log.warning("could not delete vault file %s: %s", p, e)
 
 
 async def _broadcast(payload: dict) -> None:
@@ -190,25 +220,38 @@ async def bulk_delete_meetings(req: BulkDeleteRequest) -> dict:
         return {"ok": True, "deleted": 0}
     placeholders = ",".join("?" * len(req.ids))
     async with aiosqlite.connect(DB_PATH) as db:
+        # Collect vault_paths before the DELETE — same reason as the
+        # single-delete path: the pointers die with the rows.
+        cursor = await db.execute(
+            f"SELECT vault_path FROM meetings WHERE id IN ({placeholders})", req.ids
+        )
+        vault_paths = [row[0] async for row in cursor]
         await db.execute(f"DELETE FROM utterances WHERE meeting_id IN ({placeholders})", req.ids)
         await db.execute(f"DELETE FROM meetings WHERE id IN ({placeholders})", req.ids)
         await db.commit()
     _delete_audio_files(req.ids)
+    _delete_vault_files(vault_paths)
     return {"ok": True, "deleted": len(req.ids)}
 
 
 @app.delete("/api/meetings/all")
 async def clear_all_meetings(days: int = 2) -> dict:
     cutoff = (datetime.now() - timedelta(days=days)).isoformat()
+    vault_paths: list[str | None] = []
     async with aiosqlite.connect(DB_PATH) as db:
-        cursor = await db.execute("SELECT id FROM meetings WHERE started_at >= ?", (cutoff,))
-        ids = [row[0] async for row in cursor]
+        cursor = await db.execute(
+            "SELECT id, vault_path FROM meetings WHERE started_at >= ?", (cutoff,)
+        )
+        rows = [row async for row in cursor]
+        ids = [r[0] for r in rows]
+        vault_paths = [r[1] for r in rows]
         if ids:
             placeholders = ",".join("?" * len(ids))
             await db.execute(f"DELETE FROM utterances WHERE meeting_id IN ({placeholders})", ids)
             await db.execute(f"DELETE FROM meetings WHERE id IN ({placeholders})", ids)
             await db.commit()
     _delete_audio_files(ids)
+    _delete_vault_files(vault_paths)
     return {"ok": True, "deleted": len(ids)}
 
 
@@ -242,11 +285,20 @@ async def _rewrite_vault(meeting_id: str) -> None:
 
 @app.delete("/api/meetings/{meeting_id}")
 async def delete_meeting(meeting_id: str) -> dict:
+    # Read vault_path before the DELETE so we can unlink the markdown
+    # file after the DB row is gone. Must read first — once the row is
+    # deleted, we've lost the pointer.
     async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT vault_path FROM meetings WHERE id = ?", (meeting_id,)
+        )
+        row = await cursor.fetchone()
+        vault_path = row[0] if row else None
         await db.execute("DELETE FROM utterances WHERE meeting_id = ?", (meeting_id,))
         await db.execute("DELETE FROM meetings WHERE id = ?", (meeting_id,))
         await db.commit()
     _delete_audio_files([meeting_id])
+    _delete_vault_files([vault_path])
     return {"ok": True}
 
 
@@ -281,15 +333,30 @@ async def rename_meeting(meeting_id: str, req: RenameMeetingRequest) -> dict:
     return {"ok": True}
 
 
-@app.post("/api/meetings/{meeting_id}/summarize")
-async def summarize_meeting(meeting_id: str) -> dict:
+async def _run_analysis(meeting_id: str) -> tuple[AnalysisResult, str | None, str | None]:
+    """Shared body for the two analysis-driven endpoints.
+
+    Loads the meeting + utterances, runs the combined title+summary LLM
+    call, and returns the parsed result alongside the fields the caller
+    needs for its follow-up work: the current title (for placeholder
+    detection) and the current vault_path (for auto-rename file moves).
+
+    Raises HTTPException for the cases both endpoints share:
+      404 — no such meeting
+      400 — no transcript to analyze
+      503 — LLM provider unreachable
+      502 — LLM returned empty (reasoning burn) or non-JSON
+    """
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
-        cursor = await db.execute("SELECT title FROM meetings WHERE id = ?", (meeting_id,))
+        cursor = await db.execute(
+            "SELECT title, vault_path FROM meetings WHERE id = ?", (meeting_id,)
+        )
         row = await cursor.fetchone()
         if not row:
             raise HTTPException(404, "Meeting not found")
-        title = row["title"]
+        current_title = row["title"]
+        current_vault_path = row["vault_path"]
         cursor = await db.execute(
             "SELECT id, speaker, text, start_time, end_time FROM utterances "
             "WHERE meeting_id = ? ORDER BY start_time",
@@ -298,7 +365,7 @@ async def summarize_meeting(meeting_id: str) -> dict:
         utt_rows = await cursor.fetchall()
 
     if not utt_rows:
-        raise HTTPException(400, "No transcript available to summarize")
+        raise HTTPException(400, "No transcript available to analyze")
 
     utterances = [
         Utterance(speaker=r["speaker"], text=r["text"], start=r["start_time"], end=r["end_time"])
@@ -307,12 +374,27 @@ async def summarize_meeting(meeting_id: str) -> dict:
     transcript = format_transcript(utterances)
 
     try:
-        summary_md = await chat(meeting_summary_prompt(transcript, title), system=MEETING_SUMMARY_SYSTEM)
+        result = await analyze_meeting(
+            transcript=transcript,
+            current_title=current_title,
+        )
     except LLMUnavailableError as e:
         raise HTTPException(503, str(e))
+    except AnalysisEmptyError:
+        raise HTTPException(
+            502,
+            "The LLM returned no content. Most likely your model "
+            "(reasoning model?) burned its whole output budget on internal "
+            "thinking before producing JSON. Fix: in Settings, raise "
+            "`llm_context_tokens` (try 16384+), or switch `llm_model` to a "
+            "non-reasoning model. Then hit Try again.",
+        )
+    return result, current_title, current_vault_path
 
+
+async def _persist_summary(meeting_id: str, summary_md: str) -> None:
+    """Write summary + extracted action_items to the meeting row."""
     action_items = manager._extract_action_items(summary_md)
-
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
             "UPDATE meetings SET summary = ?, action_items = ? WHERE id = ?",
@@ -320,13 +402,94 @@ async def summarize_meeting(meeting_id: str) -> dict:
         )
         await db.commit()
 
-    await _rewrite_vault(meeting_id)
 
+async def _rename_with_vault_move(
+    meeting_id: str, new_title: str, old_vault_path: str | None
+) -> None:
+    """Apply a rename and move the Obsidian file to match — same machinery
+    the /rename endpoint uses, factored out so the auto-rename path
+    doesn't duplicate it."""
+    new_title = new_title.strip()
+    if not new_title:
+        return
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE meetings SET title = ? WHERE id = ?", (new_title, meeting_id)
+        )
+        await db.commit()
+    if old_vault_path:
+        old_file = Path(old_vault_path)
+        if old_file.exists():
+            try:
+                old_file.unlink()
+            except OSError:
+                pass  # best-effort; _rewrite_vault below creates the new one
+
+
+async def _fetch_meeting_row(meeting_id: str) -> dict:
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute("SELECT * FROM meetings WHERE id = ?", (meeting_id,))
         row = await cursor.fetchone()
     return dict(row) if row else {}
+
+
+@app.post("/api/meetings/{meeting_id}/summarize")
+async def summarize_meeting(meeting_id: str) -> dict:
+    """Generate/refresh the AI summary.
+
+    Piggyback: since the combined LLM call also produces title
+    suggestions, if the meeting still carries a placeholder title
+    (e.g. "Transcription <timestamp>") we auto-apply the top suggestion
+    as the new title, updating the Obsidian file to match. A user-
+    supplied title is never overwritten.
+    """
+    result, current_title, current_vault_path = await _run_analysis(meeting_id)
+
+    if not result.summary_markdown:
+        raise HTTPException(
+            502,
+            "The LLM replied but the summary section was missing or malformed. "
+            "Check the sidecar log for the raw output, then try again.",
+        )
+    await _persist_summary(meeting_id, result.summary_markdown)
+
+    # Free auto-rename — only applies when the user hasn't typed their
+    # own title yet, and only when we actually got a usable suggestion.
+    if is_placeholder_title(current_title) and result.titles:
+        await _rename_with_vault_move(meeting_id, result.titles[0], current_vault_path)
+
+    await _rewrite_vault(meeting_id)
+    return await _fetch_meeting_row(meeting_id)
+
+
+@app.post("/api/meetings/{meeting_id}/suggest-title")
+async def suggest_meeting_title(meeting_id: str) -> dict:
+    """Return 3 AI-generated title candidates.
+
+    Piggyback: the underlying call also yields a summary, so we persist
+    it here too — one click in the UI refreshes both artefacts. The
+    frontend applies the user's chosen title via PATCH so rename/vault
+    sync stays in one code path.
+    """
+    result, _current_title, _old_vault = await _run_analysis(meeting_id)
+
+    if not result.titles:
+        raise HTTPException(
+            502,
+            "The LLM replied but no title candidates were parseable. "
+            "Check the sidecar log for the raw output, then hit Try again.",
+        )
+
+    # Side-effect: the same response contains a fresh summary. Persist
+    # it so the user doesn't have to click AI Summary separately for
+    # basically-free output.
+    if result.summary_markdown:
+        await _persist_summary(meeting_id, result.summary_markdown)
+        await _rewrite_vault(meeting_id)
+
+    meeting = await _fetch_meeting_row(meeting_id)
+    return {"suggestions": result.titles, "meeting": meeting}
 
 
 class TrimMeetingRequest(BaseModel):

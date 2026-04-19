@@ -1,8 +1,9 @@
-import { useMemo, useState } from "react";
-import { ArrowLeft, Clock, Loader, Pencil, Sparkles, CheckSquare, Square, FileText, Wand2 } from "lucide-react";
+import { useMemo, useRef, useState } from "react";
+import { ArrowLeft, Clock, Loader, Pencil, Sparkles, CheckSquare, Square, FileText, Trash2, Wand2 } from "lucide-react";
 import { api, tagsPending } from "../lib/api";
 import type { Meeting, Voice } from "../lib/api";
 import { TranscriptView } from "../components/TranscriptView";
+import { TitleSuggestPopover } from "../components/TitleSuggestPopover";
 
 interface Props {
   meeting: Meeting | null;
@@ -25,6 +26,15 @@ export function Review({
   const [busy, setBusy] = useState(false);
   const [recomputing, setRecomputing] = useState(false);
   const [transcriptKey, setTranscriptKey] = useState(0);
+  // Delete confirmation — we don't use window.confirm() because the
+  // Tauri webview silently returns falsy for it.
+  const [confirmDelete, setConfirmDelete] = useState(false);
+  const [deleting, setDeleting] = useState(false);
+  // Anchor + visibility for the AI title-suggestion popover. The anchor
+  // is the sparkles button's bounding box so the popover lands right
+  // underneath it regardless of where the title is on screen.
+  const [titleSuggestAnchor, setTitleSuggestAnchor] = useState<{ top: number; left: number } | null>(null);
+  const suggestBtnRef = useRef<HTMLButtonElement | null>(null);
 
   const selfSpeaker = voices.find((v) => v.name === "Me")?.name ?? "Me";
   const actionItems = useMemo(() => parseActionItems(meeting?.action_items ?? null), [meeting]);
@@ -95,6 +105,23 @@ export function Review({
       alert(`Recompute failed: ${e.message ?? e}`);
     } finally {
       setRecomputing(false);
+    }
+  };
+
+  const handleDelete = async () => {
+    if (!meetingId || deleting) return;
+    setDeleting(true);
+    try {
+      await api.meetings.delete(meetingId);
+      // Bump the library's refresh key FIRST so it re-fetches without
+      // this row, then navigate back. onBack alone doesn't trigger a
+      // reload — the library's list is cached until refreshKey changes.
+      onMeetingChanged();
+      onBack();
+    } catch (e: any) {
+      setDeleting(false);
+      setConfirmDelete(false);
+      alert(`Delete failed: ${e.message ?? e}`);
     }
   };
 
@@ -169,6 +196,18 @@ export function Review({
                 </button>
               </>
             )}
+            {/* Visual separator keeps the destructive delete from
+                blurring with the positive actions on its left. */}
+            <div className="h-5 w-px bg-gray-800 mx-1" />
+            <button
+              onClick={() => setConfirmDelete(true)}
+              disabled={busy || summarizing || recomputing || deleting}
+              title="Delete this meeting"
+              className="flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-medium rounded-lg border transition-colors disabled:opacity-50 border-red-900/60 text-red-400 bg-red-950/20 hover:bg-red-950/40 hover:border-red-800"
+            >
+              <Trash2 size={12} />
+              Delete
+            </button>
           </div>
         </div>
       </div>
@@ -197,6 +236,23 @@ export function Review({
                       className="flex-shrink-0 text-gray-500 hover:text-gray-200 transition-colors"
                     >
                       <Pencil size={14} />
+                    </button>
+                    <button
+                      ref={suggestBtnRef}
+                      onClick={() => {
+                        // Anchor the popover to the button's bottom-left
+                        // corner in viewport space.
+                        const rect = suggestBtnRef.current?.getBoundingClientRect();
+                        if (!rect) return;
+                        setTitleSuggestAnchor({
+                          top: rect.bottom + 6,
+                          left: rect.left,
+                        });
+                      }}
+                      title="Suggest a title with AI"
+                      className="flex-shrink-0 text-gray-500 hover:text-brand-400 transition-colors"
+                    >
+                      <Sparkles size={14} />
                     </button>
                   </div>
                 )}
@@ -259,6 +315,56 @@ export function Review({
           )}
         </aside>
       </div>
+
+      {titleSuggestAnchor && meetingId && (
+        <TitleSuggestPopover
+          meetingId={meetingId}
+          anchor={titleSuggestAnchor}
+          onClose={() => setTitleSuggestAnchor(null)}
+          onAnalyzed={(refreshed) => {
+            // The suggest-title endpoint also refreshes the summary as a
+            // side effect. Swap in the whole row so Summary + Action
+            // Items cards reflect it without a second fetch.
+            setMeeting(refreshed);
+            onMeetingChanged();
+          }}
+          onRenamed={(newTitle) => {
+            setMeeting(meeting ? { ...meeting, title: newTitle } : null);
+            onMeetingChanged();
+          }}
+        />
+      )}
+
+      {confirmDelete && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm">
+          <div className="bg-gray-900 border border-gray-700 rounded-xl shadow-2xl p-5 w-96">
+            <h3 className="text-sm font-semibold text-gray-100 mb-1">
+              Delete this meeting?
+            </h3>
+            <p className="text-xs text-gray-400 mb-4 leading-relaxed break-words">
+              <span className="text-gray-300 font-medium">{meeting.title}</span>
+              {" "}will be permanently removed from AuraScribe, along with its
+              audio recording and Obsidian vault file. This cannot be undone.
+            </p>
+            <div className="flex gap-2 justify-end">
+              <button
+                onClick={() => setConfirmDelete(false)}
+                disabled={deleting}
+                className="px-3 py-1.5 text-xs text-gray-400 hover:text-gray-200 rounded-lg hover:bg-gray-800 transition-colors disabled:opacity-50"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={handleDelete}
+                disabled={deleting}
+                className="px-3 py-1.5 text-xs bg-red-600 hover:bg-red-700 disabled:opacity-50 text-white rounded-lg transition-colors"
+              >
+                {deleting ? "Deleting…" : "Delete"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

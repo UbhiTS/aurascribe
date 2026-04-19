@@ -268,7 +268,8 @@ export function MeetingList({ selectedId, activeMeetingId, onSelect, onDeleted, 
                   Delete {selected.size} meeting{selected.size !== 1 ? "s" : ""}?
                 </h3>
                 <p className="text-xs text-gray-400 mb-4 leading-relaxed">
-                  This cannot be undone. Obsidian vault files will not be removed.
+                  Their audio recordings and Obsidian vault files will be removed too.
+                  This cannot be undone.
                 </p>
               </>
             ) : (
@@ -277,9 +278,8 @@ export function MeetingList({ selectedId, activeMeetingId, onSelect, onDeleted, 
                   Clear all meetings?
                 </h3>
                 <p className="text-xs text-gray-400 mb-4 leading-relaxed">
-                  {deletableMeetings.length} meeting{deletableMeetings.length !== 1 ? "s" : ""} from the last {days} day{days !== 1 ? "s" : ""} will be permanently deleted.
+                  {deletableMeetings.length} meeting{deletableMeetings.length !== 1 ? "s" : ""} from the last {days} day{days !== 1 ? "s" : ""} will be permanently deleted, along with their audio recordings and Obsidian vault files.
                   {activeMeetingId && " The active recording will be kept."}
-                  {" "}Obsidian vault files will not be removed.
                 </p>
               </>
             )}
