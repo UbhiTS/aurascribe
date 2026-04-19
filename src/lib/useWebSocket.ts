@@ -8,7 +8,13 @@ const SIDECAR_WS_URL = import.meta.env.DEV ? null : "ws://127.0.0.1:8765/ws";
 export type WSMessage =
   | { type: "utterances"; meeting_id: string; data: { id?: string; speaker: string; text: string; start_time: number; end_time: number; match_distance?: number | null }[] }
   | { type: "partial_utterance"; meeting_id: string; speaker: string; text: string }
-  | { type: "status"; event: string; message?: string; meeting_id?: string; vault_path?: string };
+  | { type: "status"; event: string; message?: string; meeting_id?: string; vault_path?: string }
+  // ~30Hz while recording. `rms` and `peak` are both in [0, 1], computed
+  // off the same 16kHz mono blocks that feed Whisper — so the UI
+  // visualizers reflect the signal that's actually being transcribed
+  // (mic + AEC-cancelled loopback, when system audio is enabled),
+  // not just the raw mic via getUserMedia.
+  | { type: "audio_level"; rms: number; peak: number };
 
 type Handler = (msg: WSMessage) => void;
 

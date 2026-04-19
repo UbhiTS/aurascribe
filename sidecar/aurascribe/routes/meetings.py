@@ -41,13 +41,32 @@ router = APIRouter(prefix="/api/meetings")
 
 class StartMeetingRequest(BaseModel):
     title: str = ""
+    # Mic device to open. Ignored when `capture_mic` is False.
     device: int | None = None
+    # Optional WASAPI output-device index — when set, the sidecar opens a
+    # second loopback stream on that device. Combined with `capture_mic`
+    # this drives the three UX modes:
+    #   * mic only      → capture_mic=True,  loopback_device=None
+    #   * system only   → capture_mic=False, loopback_device=<idx>
+    #   * mic + system  → capture_mic=True,  loopback_device=<idx>
+    # In mix mode the sidecar runs AEC (mic near-end / loopback reference)
+    # and sums the cleaned mic with the system audio; in system-only mode
+    # AEC is skipped since there's no near-end signal to cancel against.
+    loopback_device: int | None = None
+    # Whether to open the microphone stream at all. Default True keeps
+    # back-compat for any client that hasn't been updated.
+    capture_mic: bool = True
 
 
 @router.post("/start")
 async def start_meeting(req: StartMeetingRequest) -> dict:
     try:
-        meeting_id = await manager.start_meeting(title=req.title, device=req.device)
+        meeting_id = await manager.start_meeting(
+            title=req.title,
+            device=req.device,
+            loopback_device=req.loopback_device,
+            capture_mic=req.capture_mic,
+        )
         return {"meeting_id": meeting_id, "status": "recording"}
     except MicUnavailableError as e:
         # 403 + structured detail so the frontend can show the "Open
@@ -68,6 +87,41 @@ async def stop_meeting(req: StopMeetingRequest = StopMeetingRequest()) -> dict:
         return await manager.stop_meeting(summarize=req.summarize)
     except RuntimeError as e:
         raise HTTPException(400, str(e))
+
+
+# ── Monitor mode ────────────────────────────────────────────────────────────
+#
+# Feeds the idle-state VU meter + waveform from the same capture pipeline a
+# real meeting uses (minus ASR / DB). The frontend starts a monitor whenever
+# the user lands on a non-mic-only source config; real meeting start tears
+# the monitor down automatically, so callers don't have to sequence that.
+
+
+class MonitorStartRequest(BaseModel):
+    device: int | None = None
+    loopback_device: int | None = None
+    capture_mic: bool = True
+
+
+@router.post("/monitor/start")
+async def monitor_start(req: MonitorStartRequest) -> dict:
+    try:
+        await manager.start_monitor(
+            device=req.device,
+            loopback_device=req.loopback_device,
+            capture_mic=req.capture_mic,
+        )
+        return {"ok": True}
+    except MicUnavailableError as e:
+        raise HTTPException(403, detail={"message": str(e), "kind": e.kind})
+    except RuntimeError as e:
+        raise HTTPException(400, str(e))
+
+
+@router.post("/monitor/stop")
+async def monitor_stop() -> dict:
+    await manager.stop_monitor()
+    return {"ok": True}
 
 
 # ── List / bulk delete / clear ──────────────────────────────────────────────

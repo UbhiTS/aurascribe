@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { Mic, MicOff, Square, Clock, ExternalLink, X } from "lucide-react";
+import { Mic, MicOff, Square, Clock, ExternalLink, X, Volume2 } from "lucide-react";
 import { api, ApiError } from "../lib/api";
 import { MicAudioProvider } from "../lib/MicAudioContext";
 import { VuMeter } from "./VuMeter";
@@ -10,21 +10,91 @@ interface MicError {
   kind: "permission" | "unknown";
 }
 
+// Three source modes the user can pick. Encodes intent — what's being
+// recorded — instead of making the user compose it from raw device
+// pickers. Labels mirror the <option> text in the UI.
+type SourceMode = "mic" | "system" | "mix";
+
 interface Props {
   isRecording: boolean;
   devices: { index: number; name: string }[];
+  outputDevices: { index: number; name: string }[];
   onStarted: (id: string) => void;
   onStopped: () => void;
 }
 
-export function RecordingBar({ isRecording, devices, onStarted, onStopped }: Props) {
+// localStorage keys. Device selection is stored by device *name* (not
+// index), because sounddevice / soundcard indices aren't stable across
+// reboots or USB re-plugs. Names are resolved back to current indices at
+// read time; a missing name falls back to the system default.
+const LS_MODE = "aurascribe.source.mode";
+const LS_MIC_NAME = "aurascribe.source.mic";
+const LS_SPEAKER_NAME = "aurascribe.source.speaker";
+
+function readMode(): SourceMode {
+  const v = window.localStorage.getItem(LS_MODE);
+  return v === "mic" || v === "system" || v === "mix" ? v : "mic";
+}
+
+export function RecordingBar({ isRecording, devices, outputDevices, onStarted, onStopped }: Props) {
+  const [mode, setMode] = useState<SourceMode>(() => readMode());
   const [deviceIndex, setDeviceIndex] = useState<number | undefined>(undefined);
+  // Loopback / system-audio source. undefined = no system-audio capture
+  // in this session. Populated via localStorage + the current output list.
+  const [loopbackIndex, setLoopbackIndex] = useState<number | undefined>(undefined);
   const [loading, setLoading] = useState(false);
   const [elapsed, setElapsed] = useState(0);
   const [micError, setMicError] = useState<MicError | null>(null);
   const [openingSettings, setOpeningSettings] = useState(false);
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const selectedDeviceName = devices.find((d) => d.index === deviceIndex)?.name ?? null;
+
+  // Resolve the persisted mic/speaker names back to current indices whenever
+  // the device lists arrive or change. Names missing from the list fall
+  // through to `undefined` (= OS default), which is the safe default when
+  // the user's last-picked device was unplugged between sessions.
+  useEffect(() => {
+    const wantedMic = window.localStorage.getItem(LS_MIC_NAME);
+    if (!wantedMic) { setDeviceIndex(undefined); return; }
+    const found = devices.find((d) => d.name === wantedMic);
+    setDeviceIndex(found?.index);
+  }, [devices]);
+
+  useEffect(() => {
+    // Speaker names include a "(default)" suffix when they match the OS
+    // default; strip it before comparing so a default change between
+    // sessions doesn't invalidate the stored selection.
+    const normalize = (s: string) => s.replace(/\s*\(default\)\s*$/i, "");
+    const wantedSpk = window.localStorage.getItem(LS_SPEAKER_NAME);
+    if (wantedSpk) {
+      const wanted = normalize(wantedSpk);
+      const found = outputDevices.find((d) => normalize(d.name) === wanted);
+      if (found) { setLoopbackIndex(found.index); return; }
+    }
+    // No stored selection (or the stored endpoint has disappeared) — fall
+    // through to the OS default speaker, i.e. the one tagged "(default)"
+    // by the backend enumeration. Unlike the mic picker there's no
+    // "Default speaker" sentinel option (soundcard needs a concrete id),
+    // so we resolve the default explicitly here.
+    const def = outputDevices.find((d) => /\(default\)/i.test(d.name));
+    setLoopbackIndex(def?.index);
+  }, [outputDevices]);
+
+  useEffect(() => {
+    window.localStorage.setItem(LS_MODE, mode);
+  }, [mode]);
+  const persistMic = (idx: number | undefined) => {
+    setDeviceIndex(idx);
+    const name = devices.find((d) => d.index === idx)?.name ?? "";
+    if (name) window.localStorage.setItem(LS_MIC_NAME, name);
+    else window.localStorage.removeItem(LS_MIC_NAME);
+  };
+  const persistLoopback = (idx: number | undefined) => {
+    setLoopbackIndex(idx);
+    const name = outputDevices.find((d) => d.index === idx)?.name ?? "";
+    if (name) window.localStorage.setItem(LS_SPEAKER_NAME, name);
+    else window.localStorage.removeItem(LS_SPEAKER_NAME);
+  };
 
   const startTimer = () => {
     if (timerRef.current) clearInterval(timerRef.current);
@@ -46,11 +116,64 @@ export function RecordingBar({ isRecording, devices, onStarted, onStopped }: Pro
     if (timerRef.current) clearInterval(timerRef.current);
   }, []);
 
+  // Pre-recording monitor. When idle + mode is anything other than
+  // "mic" (where browser getUserMedia already drives the visualizers),
+  // keep the sidecar's capture pipeline open so VU + waveform animate
+  // with the exact signal the user would record on Start. The server
+  // tears the monitor down automatically when a real meeting starts.
+  //
+  // Important: `outputDevices` comes from a polled /api/status array
+  // and gets a fresh reference every poll even when the content is
+  // identical. Depending on it directly makes the effect thrash
+  // dozens of times per second — re-opening and re-closing audio
+  // streams each time. So we mirror it into a ref that the effect
+  // reads on-demand, and key the effect only on the concrete picker
+  // state the user actually changes.
+  const outputDevicesRef = useRef(outputDevices);
+  useEffect(() => { outputDevicesRef.current = outputDevices; }, [outputDevices]);
+  useEffect(() => {
+    if (isRecording) return;        // real meeting is emitting audio_level
+    if (mode === "mic") return;     // browser getUserMedia path
+    const outs = outputDevicesRef.current;
+    const defaultSpk = outs.find((d) => /\(default\)/i.test(d.name))?.index;
+    const resolvedLoopback = loopbackIndex ?? defaultSpk;
+    if (resolvedLoopback === undefined) return;  // no output device available
+    api.meetings.monitorStart({
+      device: mode === "system" ? undefined : deviceIndex,
+      loopbackDevice: resolvedLoopback,
+      captureMic: mode !== "system",
+    }).catch(() => {
+      // Monitor failures are non-fatal — a mic permission denial or
+      // loopback glitch just means the VU goes dark until the user picks
+      // a different source or hits Start Recording.
+    });
+    return () => {
+      api.meetings.monitorStop().catch(() => {});
+    };
+  }, [isRecording, mode, deviceIndex, loopbackIndex]);
+
   const handleStart = async () => {
     setLoading(true);
     setMicError(null);
     try {
-      const res = await api.meetings.start("", deviceIndex);
+      // Derive the three-way mode into the backend's two booleans — keeps
+      // the API shape simple but still supports system-only (capture_mic
+      // off, loopback on), mic-only, and mix.
+      const captureMic = mode !== "system";
+      // "Default speaker" selection has no dedicated index (soundcard needs
+      // a concrete id), so when the user leaves it on the sentinel we
+      // resolve the current default by the "(default)" suffix baked into
+      // the enumeration names.
+      const resolvedLoopback =
+        loopbackIndex ??
+        outputDevices.find((d) => /\(default\)/i.test(d.name))?.index;
+      const loopbackDevice = mode === "mic" ? undefined : resolvedLoopback;
+      const micDevice = captureMic ? deviceIndex : undefined;
+      const res = await api.meetings.start("", {
+        device: micDevice,
+        loopbackDevice,
+        captureMic,
+      });
       onStarted(res.meeting_id);
       startTimer();
     } catch (e) {
@@ -105,7 +228,7 @@ export function RecordingBar({ isRecording, devices, onStarted, onStopped }: Pro
 
   return (
     <MicAudioProvider deviceName={selectedDeviceName}>
-    <div className={`flex items-center gap-3 px-4 py-3 rounded-xl border transition-all ${
+    <div className={`flex items-center gap-3 px-4 py-3 rounded-xl border transition-all min-h-[72px] ${
       isRecording ? "bg-red-950/40 border-red-800/50" : "bg-gray-900 border-gray-800"
     }`}>
       <div className={`flex-shrink-0 w-3 h-3 rounded-full ${
@@ -114,38 +237,91 @@ export function RecordingBar({ isRecording, devices, onStarted, onStopped }: Pro
       <VuMeter />
       <Waveform />
 
-      {isRecording ? (
-        <>
-          <span className="text-sm text-gray-300 font-medium">Recording</span>
-          <span className="flex items-center gap-1 text-sm text-red-400 font-mono">
-            <Clock size={13} />
-            {fmt(elapsed)}
-          </span>
-          <div className="ml-auto">
-            <button
-              onClick={handleStop}
-              disabled={loading}
-              className="flex items-center gap-2 px-3 py-1.5 bg-red-600 hover:bg-red-700 disabled:opacity-50 text-white text-sm rounded-lg transition-colors"
-            >
-              <Square size={14} />
-              Stop
-            </button>
-          </div>
-        </>
-      ) : (
-        <div className="ml-auto flex items-center gap-3">
-          {devices.length > 1 && (
-            <select
-              value={deviceIndex ?? ""}
-              onChange={(e) => setDeviceIndex(e.target.value ? parseInt(e.target.value) : undefined)}
-              className="text-xs text-gray-400 bg-gray-800 border border-gray-700 rounded px-2 py-1 outline-none"
-            >
-              <option value="">Default mic</option>
-              {devices.map((d) => (
-                <option key={d.index} value={d.index}>{d.name}</option>
-              ))}
-            </select>
+      {isRecording && (
+        <span className="flex items-center gap-1 text-sm text-red-400 font-mono">
+          <Clock size={13} />
+          {fmt(elapsed)}
+        </span>
+      )}
+
+      {/* Source controls — always rendered, disabled during recording so
+          the user can see what they're capturing from without being
+          tempted to hot-swap mid-meeting (capture-pipeline switches
+          mid-record aren't supported and the locking would fight HMR). */}
+      <div className="ml-auto flex items-center gap-3">
+        <label className="flex items-center gap-1.5 text-xs text-gray-500" title="What to record">
+          <span className="text-gray-400">Source:</span>
+          <select
+            value={mode}
+            onChange={(e) => setMode(e.target.value as SourceMode)}
+            disabled={isRecording}
+            className="text-xs text-gray-200 bg-gray-800 border border-gray-700 rounded px-2 py-1 outline-none disabled:opacity-60 disabled:cursor-not-allowed"
+          >
+            <option value="mic">Microphone</option>
+            {outputDevices.length > 0 && (
+              <option value="system">System Audio</option>
+            )}
+            {outputDevices.length > 0 && (
+              <option value="mix">Mix (Mic + System Audio)</option>
+            )}
+          </select>
+        </label>
+
+        {/* Device pickers. In "mix" mode both render stacked in a single
+            column so they don't steal horizontal space from Start / Stop.
+            The bar's min-h-[72px] is sized for this stacked case, so
+            switching between 1-picker and 2-picker modes never shifts
+            the bar's height — items-center on the row + column keeps
+            everything visually centered regardless. */}
+        <div className={`flex gap-1.5 ${mode === "mix" ? "flex-col" : "flex-row items-center gap-3"}`}>
+          {mode !== "system" && devices.length > 1 && (
+            <label className="flex items-center gap-1.5 text-xs text-gray-500" title="Microphone">
+              <Mic size={12} className="text-gray-500" />
+              <select
+                value={deviceIndex ?? ""}
+                onChange={(e) => persistMic(e.target.value ? parseInt(e.target.value) : undefined)}
+                disabled={isRecording}
+                className="text-xs text-gray-400 bg-gray-800 border border-gray-700 rounded px-2 py-1 outline-none w-[330px] disabled:opacity-60 disabled:cursor-not-allowed"
+              >
+                <option value="">Default mic</option>
+                {devices.map((d) => (
+                  <option key={d.index} value={d.index}>{d.name}</option>
+                ))}
+              </select>
+            </label>
           )}
+
+          {mode !== "mic" && outputDevices.length > 0 && (
+            <label
+              className="flex items-center gap-1.5 text-xs text-gray-500"
+              title="System-audio source (WASAPI loopback). Captures whatever's playing through the selected speaker — use this for Zoom/Teams/Meet participants, video playback, etc."
+            >
+              <Volume2 size={12} className="text-gray-500" />
+              <select
+                value={loopbackIndex ?? ""}
+                onChange={(e) => persistLoopback(e.target.value ? parseInt(e.target.value) : undefined)}
+                disabled={isRecording}
+                className="text-xs text-gray-400 bg-gray-800 border border-gray-700 rounded px-2 py-1 outline-none w-[330px] disabled:opacity-60 disabled:cursor-not-allowed"
+              >
+                <option value="">Default speaker</option>
+                {outputDevices.map((d) => (
+                  <option key={d.index} value={d.index}>{d.name}</option>
+                ))}
+              </select>
+            </label>
+          )}
+        </div>
+
+        {isRecording ? (
+          <button
+            onClick={handleStop}
+            disabled={loading}
+            className="flex items-center gap-2 px-3 py-1.5 bg-red-600 hover:bg-red-700 disabled:opacity-50 text-white text-sm rounded-lg transition-colors"
+          >
+            <Square size={14} />
+            Stop Recording
+          </button>
+        ) : (
           <button
             onClick={handleStart}
             disabled={loading}
@@ -154,8 +330,8 @@ export function RecordingBar({ isRecording, devices, onStarted, onStopped }: Pro
             <Mic size={14} />
             Start Recording
           </button>
-        </div>
-      )}
+        )}
+      </div>
     </div>
 
     {micError && (

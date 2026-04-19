@@ -1,4 +1,4 @@
-import { Book, Brain, Cpu, Mic, Plug, PlugZap, Radio, Users, Zap } from "lucide-react";
+import { Book, Brain, Cpu, Plug, PlugZap, Users, Zap } from "lucide-react";
 import type { LLMHealth } from "../lib/useLLMHealth";
 import type { AppStatus } from "../lib/api";
 
@@ -129,23 +129,6 @@ export function Header({
           Obsidian
         </span>
       </div>
-
-      {/* Active recording mic — only while recording */}
-      {isRecording && (
-        <>
-          <div className="h-4 w-px bg-gray-800" />
-          <div className="flex items-center gap-1.5 text-xs min-w-0">
-            <Radio size={13} className="text-red-400 animate-pulse flex-shrink-0" />
-            <Mic size={12} className="text-gray-500 flex-shrink-0" />
-            <span
-              className="text-gray-400 truncate max-w-[220px]"
-              title={activeAudioDevice ?? "Default mic"}
-            >
-              {activeAudioDevice ?? "Default mic"}
-            </span>
-          </div>
-        </>
-      )}
 
       {/* Compute-placement chips. Two of them — one per pipeline — so the
           user always knows where Whisper and pyannote are actually running.

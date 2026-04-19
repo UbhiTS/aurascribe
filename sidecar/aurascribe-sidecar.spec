@@ -40,6 +40,14 @@ for pkg in (
     # ASR + audio
     "faster_whisper", "ctranslate2", "sounddevice", "soundfile", "soxr",
     "scipy", "librosa", "numba", "numpy",
+    # pyaec ships a bundled aec.dll next to its __init__.py; collect_all
+    # picks it up so `os.path.join(os.path.dirname(__file__), "aec.dll")`
+    # still resolves inside the PyInstaller bundle.
+    "pyaec",
+    # soundcard is a cffi-backed wrapper around WASAPI — needs its cffi
+    # _soundcard.cdef and the cffi runtime collected so the pure-Python
+    # calls into the OS audio APIs still work in the frozen bundle.
+    "soundcard", "cffi",
     # Diarization
     "torch", "torchaudio", "pyannote", "pyannote.audio",
     "speechbrain", "omegaconf", "lightning_fabric", "pytorch_lightning",

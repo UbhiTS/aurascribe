@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { useMicAudio } from "../lib/MicAudioContext";
+import { useSidecarAudioLevel, FRESHNESS_MS } from "../lib/useSidecarAudioLevel";
 
 const BARS = 16;
 const GREEN_BARS = 10;
@@ -14,23 +15,32 @@ function barColor(index: number, active: boolean): string {
 
 export function VuMeter() {
   const { analyser, error } = useMicAudio();
+  const { ref: sidecarLevelRef, active: sidecarActive } = useSidecarAudioLevel();
   const [level, setLevel] = useState(0);
   const rafRef = useRef<number>(0);
   const smoothRef = useRef(0);
 
   useEffect(() => {
-    if (!analyser) return;
-    const buf = new Uint8Array(analyser.fftSize);
+    const buf = analyser ? new Uint8Array(analyser.fftSize) : null;
 
     const tick = () => {
-      analyser.getByteTimeDomainData(buf);
-
-      let sumSq = 0;
-      for (let i = 0; i < buf.length; i++) {
-        const s = (buf[i] - 128) / 128;
-        sumSq += s * s;
+      // Prefer sidecar-emitted level when a recent event is in hand —
+      // that reflects the real mixed signal (mic + AEC-cancelled
+      // loopback) instead of just the browser's mic capture. Falls back
+      // to the analyser when idle or on a WS hiccup.
+      let rms = 0;
+      const sc = sidecarLevelRef.current;
+      if (sc && performance.now() - sc.t < FRESHNESS_MS) {
+        rms = sc.rms;
+      } else if (buf && analyser) {
+        analyser.getByteTimeDomainData(buf);
+        let sumSq = 0;
+        for (let i = 0; i < buf.length; i++) {
+          const s = (buf[i] - 128) / 128;
+          sumSq += s * s;
+        }
+        rms = Math.sqrt(sumSq / buf.length);
       }
-      const rms = Math.sqrt(sumSq / buf.length);
       const raw = Math.min(100, rms * 800);
 
       const prev = smoothRef.current;
@@ -44,9 +54,12 @@ export function VuMeter() {
     rafRef.current = requestAnimationFrame(tick);
 
     return () => cancelAnimationFrame(rafRef.current);
-  }, [analyser]);
+  }, [analyser, sidecarLevelRef]);
 
-  if (error) {
+  // Only surface the "mic unavailable" affordance when we genuinely have
+  // nothing to visualize — if the sidecar is feeding levels, recording is
+  // live and the bars are accurate, browser-mic permission be damned.
+  if (error && !sidecarActive) {
     return <span className="text-xs text-gray-600">Mic unavailable</span>;
   }
 

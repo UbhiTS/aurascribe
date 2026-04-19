@@ -2,12 +2,26 @@
 
 Yields audio chunks when speech is detected. Torch is a soft dep — imported
 lazily in `start()` so the sidecar boots without the `[asr]` extra installed.
+
+When `loopback_device` is supplied to `start()`, a second WASAPI-loopback
+capture is opened on that output device via `soundcard` (the libportaudio
+bundled with `sounddevice` is built without loopback support — missing
+`PaWasapi_IsLoopback` symbol — so we can't use the same library for both
+streams). A background worker pops aligned 10ms frames from both streams,
+runs Speex-style AEC (pyaec) with the loopback as reference, sums the
+cleaned mic with the loopback, and feeds the 16kHz mono result into the
+existing 512-sample block pipeline. That lets us capture remote
+participants (Zoom/Teams/Meet) + the local speaker over a
+single-mic-on-speakers setup without getting doubled transcripts from
+acoustic echo.
 """
 from __future__ import annotations
 
 import asyncio
+import ctypes
 import logging
 import threading
+import time as _time
 from collections import deque
 from pathlib import Path
 from typing import AsyncGenerator
@@ -26,6 +40,20 @@ log = logging.getLogger("aurascribe")
 
 _STOP_SENTINEL: object = object()
 _RING_MAXLEN = int(30 * SAMPLE_RATE / 512)  # 30s of 512-sample blocks
+
+# AEC frame size (10ms @ 16kHz) and tail length (200ms @ 16kHz). Tail
+# covers the full speaker-DAC + air-travel + room-reflection path; 100ms
+# wasn't enough for a speakers-in-room setup and users reported a "large
+# hall" reverb because the linear filter ran out of length before room
+# reflections had fully decayed. 200ms converges a bit slower but catches
+# multi-bounce reverb tails that a typical desktop has.
+_AEC_FRAME = 160
+_AEC_TAIL = 3200
+# Max allowed drift between mic and loopback FIFOs before we drop samples
+# on the leading side. 80ms is well within pyaec's tail window so small
+# skew is absorbed by the filter; anything larger means a clock glitch
+# and we'd rather resync than feed mis-aligned pairs into AEC.
+_MAX_SKEW_SAMPLES = 1280  # 80ms @ 16kHz
 
 
 class MicUnavailableError(RuntimeError):
@@ -59,21 +87,44 @@ class AudioCapture:
         self._record_writer = None  # soundfile.SoundFile when recording
         self._record_samples: int = 0
         self._record_lock = threading.Lock()
+        # Loopback / AEC state — all None when loopback is disabled (the
+        # mic callback then emits blocks directly). When loopback is active,
+        # `_lb_active=True`; the mic callback pushes into `_mic_fifo` and a
+        # dedicated soundcard-loopback thread pushes into `_lb_fifo`. A
+        # separate mixer thread drains both, aligns them, runs AEC, and
+        # emits to the 512-block pipeline.
+        self._lb_active = False
+        self._lb_thread: threading.Thread | None = None
+        self._lb_thread_stop = threading.Event()
+        self._mic_fifo: deque[np.ndarray] = deque()
+        self._lb_fifo: deque[np.ndarray] = deque()
+        self._fifo_lock = threading.Lock()
+        self._aec = None                  # pyaec.Aec instance
+        self._aec_cancel = None           # direct lib.AecCancelEcho bound for ctypes fast-path
+        self._aec_handle = None           # raw AecHandle pointer
+        self._worker: threading.Thread | None = None
+        self._worker_stop = threading.Event()
+        # Sync callback fired once per 512-sample block with (rms, peak) of
+        # the mixed output, both in [0, 1]. meeting_manager installs a
+        # thread-safe shim that schedules a WS broadcast on the event loop,
+        # giving the UI live visualizers for the signal that's actually
+        # being transcribed — not just the raw mic. Stays None in code paths
+        # that don't record (e.g. offline tests).
+        self._on_level = None  # type: ignore[assignment]
 
-    def _audio_callback(self, indata: np.ndarray, frames: int, time, status) -> None:
-        chunk = indata[:, 0].astype(np.float32, copy=True)
-        if self._resampler is not None:
-            chunk = self._resampler.resample_chunk(chunk)
-            if chunk.size == 0:
-                return
+    # ── Block emission ────────────────────────────────────────────────────────
+    #
+    # Shared path for both mic-only (emitted from the mic callback) and
+    # dual-stream (emitted from the mixer thread). Appends resampled
+    # 16kHz mono float32 to `self._accum`, carves off 512-sample blocks,
+    # and dispatches them to the ring / Opus tee / VAD queue.
 
-        # Silero VAD requires exactly 512-sample blocks at 16kHz. Accumulate
-        # resampled output and emit full blocks downstream.
+    def _emit_blocks(self, chunk: np.ndarray) -> None:
         if self._accum.size:
             chunk = np.concatenate((self._accum, chunk))
-        # Emit as many full 512-sample blocks as we have.
         n_full = (chunk.size // 512) * 512
         if n_full:
+            last_block: np.ndarray | None = None
             for i in range(0, n_full, 512):
                 block = chunk[i:i + 512].copy()
                 self._ring.append(block)
@@ -90,7 +141,185 @@ class AudioCapture:
                                 log.warning("opus record write failed: %s", e)
                 if self._loop and not self._loop.is_closed():
                     self._loop.call_soon_threadsafe(self._queue.put_nowait, block)
+                last_block = block
+            # One level event per `_emit_blocks` call (~32ms at 16kHz for a
+            # single-block call, longer for worker-thread batches). Using
+            # only the last block keeps RAM touches minimal while still
+            # giving visualizers a ~30Hz refresh, which is smoother than
+            # the eye can distinguish.
+            if self._on_level is not None and last_block is not None:
+                try:
+                    rms = float(np.sqrt(np.mean(last_block * last_block)))
+                    peak = float(np.abs(last_block).max())
+                    self._on_level(rms, peak)
+                except Exception as e:
+                    log.warning("level callback failed: %s", e)
         self._accum = chunk[n_full:].copy() if n_full < chunk.size else np.zeros(0, dtype=np.float32)
+
+    def _audio_callback(self, indata: np.ndarray, frames: int, time, status) -> None:
+        chunk = indata[:, 0].astype(np.float32, copy=True)
+        if self._resampler is not None:
+            chunk = self._resampler.resample_chunk(chunk)
+            if chunk.size == 0:
+                return
+
+        # Dual-stream mode: hand off to the mixer worker via the mic FIFO.
+        # The worker is responsible for AEC + mix + block emission.
+        if self._lb_active:
+            with self._fifo_lock:
+                self._mic_fifo.append(chunk)
+            return
+
+        # Mic-only fast path — emit 512-sample blocks directly.
+        self._emit_blocks(chunk)
+
+    def _loopback_thread_main(self, speaker_id: str, emit_direct: bool) -> None:
+        """Runs in a dedicated thread while the meeting is active.
+
+        `soundcard`'s recorder is a synchronous `record(numframes=N)` call
+        inside a `with` block — there's no callback model — so we poll
+        it on a thread. Ask for 16kHz mono directly and let WASAPI's
+        shared-mode resampler/mixer handle the conversion from the
+        endpoint's native format; it's more than good enough for
+        AEC-reference quality and cuts a soxr stream we'd otherwise have
+        to run on this thread.
+
+        Two destinations depending on mode:
+          * `emit_direct=False` (mix mode): push into `_lb_fifo` for the
+            mixer worker to align with mic + run AEC.
+          * `emit_direct=True`  (system-only): no mic, no AEC — push
+            straight into `_emit_blocks` and bypass the mixer entirely.
+
+        COM init: WASAPI is a COM API; every thread that touches it must
+        have COM initialized. In mix mode sounddevice's own audio thread
+        already did this so soundcard piggybacks without issue — but in
+        system-only mode this thread is the first to touch COM in the
+        process, so we initialize explicitly. `CoInitializeEx` is a no-op
+        if COM is already up, so it's safe to always call.
+        """
+        import soundcard as sc
+        com_initialized = False
+        try:
+            ole32 = ctypes.windll.ole32  # type: ignore[attr-defined]
+            # COINIT_MULTITHREADED = 0x0 — required for audio callback
+            # threads (apartment-threaded STA would deadlock WASAPI).
+            hr = ole32.CoInitializeEx(None, 0x0)
+            # S_OK (0) or S_FALSE (1) both mean COM is usable from here.
+            # RPC_E_CHANGED_MODE (0x80010106) means someone already inited
+            # with a different apartment — benign, soundcard will still work.
+            com_initialized = hr in (0, 1)
+        except Exception as e:
+            log.warning("CoInitializeEx failed: %s", e)
+
+        try:
+            # `get_microphone(..., include_loopback=True)` lets us treat
+            # the speaker as a capture device.
+            mic = sc.get_microphone(id=speaker_id, include_loopback=True)
+        except Exception as e:
+            log.warning("soundcard: could not open loopback %s: %s", speaker_id, e)
+            if com_initialized:
+                try:
+                    ctypes.windll.ole32.CoUninitialize()  # type: ignore[attr-defined]
+                except Exception:
+                    pass
+            return
+
+        try:
+            with mic.recorder(
+                samplerate=SAMPLE_RATE,
+                channels=1,
+                blocksize=_AEC_FRAME,
+            ) as rec:
+                while not self._lb_thread_stop.is_set():
+                    chunk = rec.record(numframes=_AEC_FRAME)
+                    # `record()` returns float32 [-1, 1] shaped (N, channels).
+                    if chunk.ndim == 2:
+                        chunk = chunk[:, 0] if chunk.shape[1] == 1 else chunk.mean(axis=1)
+                    chunk = chunk.astype(np.float32, copy=False)
+                    if emit_direct:
+                        self._emit_blocks(chunk)
+                    else:
+                        with self._fifo_lock:
+                            self._lb_fifo.append(chunk)
+        except Exception as e:
+            log.warning("soundcard loopback recorder exited: %s", e)
+        finally:
+            if com_initialized:
+                try:
+                    ctypes.windll.ole32.CoUninitialize()  # type: ignore[attr-defined]
+                except Exception:
+                    pass
+
+    def _run_aec_frame(self, mic_i16: np.ndarray, ref_i16: np.ndarray) -> np.ndarray:
+        """Direct ctypes call into pyaec's bundled aec.dll — skips the list-
+        packing overhead of the pure-Python wrapper (which is a per-sample
+        hot path at 100 Hz / 10ms frames)."""
+        out = np.zeros(mic_i16.size, dtype=np.int16)
+        c_int16_p = ctypes.POINTER(ctypes.c_int16)
+        self._aec_cancel(
+            self._aec_handle,
+            mic_i16.ctypes.data_as(c_int16_p),
+            ref_i16.ctypes.data_as(c_int16_p),
+            out.ctypes.data_as(c_int16_p),
+            mic_i16.size,
+        )
+        return out
+
+    def _mix_worker(self) -> None:
+        """Drains the mic + loopback FIFOs, aligns them by sample count,
+        runs AEC per-10ms-frame, mixes cleaned-mic + loopback, and pushes
+        the result into the shared 512-block emitter. Exits when
+        `_worker_stop` is set and both FIFOs are drained (or on shutdown
+        if we need to bail early)."""
+        mic_buf = np.zeros(0, dtype=np.float32)
+        lb_buf = np.zeros(0, dtype=np.float32)
+
+        while not self._worker_stop.is_set():
+            with self._fifo_lock:
+                while self._mic_fifo:
+                    mic_buf = np.concatenate((mic_buf, self._mic_fifo.popleft()))
+                while self._lb_fifo:
+                    lb_buf = np.concatenate((lb_buf, self._lb_fifo.popleft()))
+
+            # Clock drift / first-frame arrival order can leave one side
+            # persistently ahead. Drop oldest samples on the leading side
+            # when skew exceeds the AEC tail's tolerance; preserves
+            # alignment at the cost of a tiny audible glitch.
+            if mic_buf.size > lb_buf.size + _MAX_SKEW_SAMPLES:
+                mic_buf = mic_buf[mic_buf.size - lb_buf.size - _MAX_SKEW_SAMPLES:]
+            if lb_buf.size > mic_buf.size + _MAX_SKEW_SAMPLES:
+                lb_buf = lb_buf[lb_buf.size - mic_buf.size - _MAX_SKEW_SAMPLES:]
+
+            n_frames = min(mic_buf.size, lb_buf.size) // _AEC_FRAME
+            if n_frames == 0:
+                # Nothing aligned yet — don't spin. 5ms roughly matches
+                # half an AEC frame so we wake up near the next arrival.
+                _time.sleep(0.005)
+                continue
+
+            mixed_out = np.empty(n_frames * _AEC_FRAME, dtype=np.float32)
+            for i in range(n_frames):
+                mic_f = mic_buf[i * _AEC_FRAME:(i + 1) * _AEC_FRAME]
+                lb_f = lb_buf[i * _AEC_FRAME:(i + 1) * _AEC_FRAME]
+                mic_i16 = np.clip(mic_f * 32767.0, -32768, 32767).astype(np.int16)
+                lb_i16 = np.clip(lb_f * 32767.0, -32768, 32767).astype(np.int16)
+                cleaned_i16 = self._run_aec_frame(mic_i16, lb_i16)
+                cleaned_f = cleaned_i16.astype(np.float32) * (1.0 / 32768.0)
+                # No pre-attenuation: the user reported that dropping the
+                # mic by 3 dB (plus AEC preprocess) made Mix mode sound
+                # noticeably quieter than Mic only. Summing full-level
+                # streams can hard-clip when both peak simultaneously,
+                # but that's rare in conversation and Opus + Whisper
+                # tolerate occasional clipping fine. We still clip to
+                # [-1, 1] so Opus gets a bounded signal.
+                mix = cleaned_f + lb_f
+                np.clip(mix, -1.0, 1.0, out=mix)
+                mixed_out[i * _AEC_FRAME:(i + 1) * _AEC_FRAME] = mix
+
+            consumed = n_frames * _AEC_FRAME
+            mic_buf = mic_buf[consumed:]
+            lb_buf = lb_buf[consumed:]
+            self._emit_blocks(mixed_out)
 
     def get_recent_audio(self, seconds: float = 4.0) -> np.ndarray | None:
         frames_needed = int(seconds * SAMPLE_RATE / 512)
@@ -106,6 +335,64 @@ class AudioCapture:
         DirectSound, WASAPI, WDM-KS). We dedupe by name and prefer the
         modern APIs so the UI only shows one row per physical mic.
         """
+        return self._list_devices(output=False)
+
+    def list_output_devices(self) -> list[dict]:
+        """Return output endpoints usable as a WASAPI-loopback source.
+
+        Enumerated via `soundcard` (not sounddevice) because sounddevice's
+        bundled libportaudio DLL is built without loopback support. The
+        returned `index` is this method's stable sort position — used as
+        the round-trip handle the frontend passes back to `start()` and
+        which we map to the speaker's soundcard `id` string via
+        `_resolve_loopback_speaker`. Marked as "Default speaker" when it
+        matches `sc.default_speaker()` so the UI can surface which
+        endpoint Windows actually routes audio to right now.
+        """
+        try:
+            import soundcard as sc
+        except Exception:
+            return []
+        try:
+            speakers = sc.all_speakers()
+            default_id = sc.default_speaker().id
+        except Exception:
+            return []
+
+        result: list[dict] = []
+        for i, sp in enumerate(sorted(speakers, key=lambda s: s.name.lower())):
+            result.append({
+                "index": i,
+                "name": sp.name + (" (default)" if sp.id == default_id else ""),
+                "channels": int(getattr(sp, "channels", 2) or 2),
+                "host_api": "Windows WASAPI",
+            })
+        return result
+
+    def _resolve_loopback_speaker(self, loopback_index: int) -> str | None:
+        """Reverse of `list_output_devices`: given the UI's index, return
+        the soundcard `id` string for that endpoint. Re-enumerates every
+        call because device insertion/removal can shuffle the ordering
+        between the UI's last fetch and start-time."""
+        try:
+            import soundcard as sc
+        except Exception:
+            return None
+        try:
+            speakers = sc.all_speakers()
+        except Exception:
+            return None
+        ordered = sorted(speakers, key=lambda s: s.name.lower())
+        if 0 <= loopback_index < len(ordered):
+            return str(ordered[loopback_index].id)
+        return None
+
+    def _list_devices(self, output: bool) -> list[dict]:
+        # `output=True` is handled by `list_output_devices` via soundcard —
+        # this stub stays for back-compat in case anyone calls it directly.
+        if output:
+            return self.list_output_devices()
+
         try:
             import sounddevice as sd
         except Exception:
@@ -119,7 +406,7 @@ class AudioCapture:
             "MME": 3,
         }
         # MME virtual/pseudo devices — noise in the dropdown, always skip.
-        MME_META = {"Microsoft Sound Mapper - Input", "Primary Sound Capture Driver"}
+        META = {"Microsoft Sound Mapper - Input", "Primary Sound Capture Driver"}
 
         devices = sd.query_devices()
         hostapis = sd.query_hostapis()
@@ -129,7 +416,7 @@ class AudioCapture:
             if d["max_input_channels"] <= 0:
                 continue
             name = d["name"]
-            if name in MME_META:
+            if name in META:
                 continue
             # Disconnected Bluetooth Hands-Free / A2DP endpoints leak through
             # as raw MUI strings like "Headset (@System32\drivers\bthhfenum.sys,#2;…)".
@@ -144,7 +431,9 @@ class AudioCapture:
                 if 0 <= hostapi_idx < len(hostapis)
                 else ""
             )
-            rank = HOST_RANK.get(hostapi_name, 99)
+            if hostapi_name not in HOST_RANK:
+                continue
+            rank = HOST_RANK[hostapi_name]
             existing = best.get(name)
             if existing is None or rank < existing["_rank"]:
                 best[name] = {
@@ -161,10 +450,29 @@ class AudioCapture:
             result.append(entry)
         return result
 
-    async def start(self, device: int | None = None) -> None:
+    async def start(
+        self,
+        device: int | None = None,
+        loopback_device: int | None = None,
+        capture_mic: bool = True,
+    ) -> None:
+        """Start recording. Mode is derived from the args:
+          * mic-only      → capture_mic=True,  loopback_device=None
+          * system-only   → capture_mic=False, loopback_device=<idx>
+          * mic + system  → capture_mic=True,  loopback_device=<idx>
+
+        `capture_mic=False` with `loopback_device=None` is caller error —
+        nothing to record. Raises immediately.
+        """
         import sounddevice as sd
         import soxr
         import torch
+
+        if not capture_mic and loopback_device is None:
+            raise RuntimeError(
+                "At least one audio source is required — pick a microphone, "
+                "a system-audio output, or both."
+            )
 
         if self._vad_model is None:
             self._vad_model, self._vad_utils = torch.hub.load(
@@ -175,73 +483,181 @@ class AudioCapture:
             )
             self._vad_model.eval()
 
-        # Determine the device's native sample rate. WASAPI/WDM-KS won't
-        # auto-convert from 16kHz; MME does. We always open at native rate
-        # and resample to 16kHz ourselves — same pipeline regardless of API.
-        info = sd.query_devices(device, kind="input") if device is not None else sd.query_devices(kind="input")
-        native_sr = int(info["default_samplerate"]) or SAMPLE_RATE
-
-        if native_sr == SAMPLE_RATE:
-            self._resampler = None
-            blocksize = 512
-        else:
-            self._resampler = soxr.ResampleStream(
-                native_sr, SAMPLE_RATE, num_channels=1, dtype="float32", quality="HQ"
-            )
-            # Size the input block so each callback produces ~512 samples at 16kHz.
-            blocksize = int(round(512 * native_sr / SAMPLE_RATE))
-
         while not self._queue.empty():
             self._queue.get_nowait()
         self._ring.clear()
         self._accum = np.zeros(0, dtype=np.float32)
+        with self._fifo_lock:
+            self._mic_fifo.clear()
+            self._lb_fifo.clear()
 
         self._loop = asyncio.get_running_loop()
-        # Opening + starting the InputStream is where Windows mic permission
-        # denial manifests — sounddevice surfaces it as a PortAudioError with
-        # an opaque "Unanticipated host error" / error-code message. Translate
-        # it into a structured error the API layer can return as 403 + kind.
-        try:
-            self._stream = sd.InputStream(
-                device=device,
-                samplerate=native_sr,
-                channels=CHANNELS,
-                dtype="float32",
-                blocksize=blocksize,
-                callback=self._audio_callback,
-            )
-            self._stream.start()
-        except Exception as e:
-            self._stream = None
-            msg = str(e).lower()
-            # Windows privacy denial + "device in use" both show up as
-            # PortAudio host errors. We can't distinguish them reliably,
-            # so we hand the user the most common fix.
-            is_probable_permission = (
-                "unanticipated host error" in msg
-                or "invalid device" in msg
-                or "access is denied" in msg
-                or "0x80070005" in msg   # E_ACCESSDENIED
-            )
-            if is_probable_permission:
+
+        if capture_mic:
+            # Determine the device's native sample rate. WASAPI/WDM-KS won't
+            # auto-convert from 16kHz; MME does. We always open at native
+            # rate and resample to 16kHz ourselves — same pipeline regardless
+            # of API.
+            info = sd.query_devices(device, kind="input") if device is not None else sd.query_devices(kind="input")
+            native_sr = int(info["default_samplerate"]) or SAMPLE_RATE
+
+            if native_sr == SAMPLE_RATE:
+                self._resampler = None
+                blocksize = 512
+            else:
+                self._resampler = soxr.ResampleStream(
+                    native_sr, SAMPLE_RATE, num_channels=1, dtype="float32", quality="HQ"
+                )
+                # Size the input block so each callback produces ~512 samples at 16kHz.
+                blocksize = int(round(512 * native_sr / SAMPLE_RATE))
+
+            # Opening + starting the InputStream is where Windows mic
+            # permission denial manifests — sounddevice surfaces it as a
+            # PortAudioError with an opaque "Unanticipated host error" /
+            # error-code message. Translate it into a structured error the
+            # API layer can return as 403 + kind.
+            try:
+                self._stream = sd.InputStream(
+                    device=device,
+                    samplerate=native_sr,
+                    channels=CHANNELS,
+                    dtype="float32",
+                    blocksize=blocksize,
+                    callback=self._audio_callback,
+                )
+                self._stream.start()
+            except Exception as e:
+                self._stream = None
+                msg = str(e).lower()
+                # Windows privacy denial + "device in use" both show up as
+                # PortAudio host errors. We can't distinguish them reliably,
+                # so we hand the user the most common fix.
+                is_probable_permission = (
+                    "unanticipated host error" in msg
+                    or "invalid device" in msg
+                    or "access is denied" in msg
+                    or "0x80070005" in msg   # E_ACCESSDENIED
+                )
+                if is_probable_permission:
+                    raise MicUnavailableError(
+                        "Microphone could not be opened. Most commonly this is "
+                        "Windows blocking mic access — check Settings → Privacy → "
+                        "Microphone and ensure AuraScribe is allowed. If another "
+                        "app (Teams, Zoom, Discord) is holding the mic, close it "
+                        "and try again.",
+                        kind="permission",
+                    ) from e
                 raise MicUnavailableError(
-                    "Microphone could not be opened. Most commonly this is "
-                    "Windows blocking mic access — check Settings → Privacy → "
-                    "Microphone and ensure AuraScribe is allowed. If another "
-                    "app (Teams, Zoom, Discord) is holding the mic, close it "
-                    "and try again.",
-                    kind="permission",
+                    f"Microphone could not be opened: {e}",
+                    kind="unknown",
                 ) from e
-            raise MicUnavailableError(
-                f"Microphone could not be opened: {e}",
-                kind="unknown",
-            ) from e
+
+        # Optional loopback capture. Failure semantics differ by mode:
+        #   * mix mode (mic already opened): log, fall back to mic-only,
+        #     the user's meeting still records.
+        #   * system-only mode (no mic): failure leaves us with no audio
+        #     source at all — rethrow so the caller tears down cleanly.
+        if loopback_device is not None:
+            try:
+                self._start_loopback(loopback_device, mic_active=capture_mic)
+            except Exception as e:
+                if capture_mic:
+                    log.warning(
+                        "Loopback capture unavailable on device %s: %s — "
+                        "continuing with mic-only.",
+                        loopback_device, e,
+                    )
+                    self._teardown_loopback()
+                else:
+                    # Make sure the mic stream (if any partial init ran) is
+                    # also cleaned up before rethrowing so stop() isn't
+                    # required to reach a clean state.
+                    self._teardown_loopback()
+                    raise RuntimeError(
+                        f"System audio capture failed on device {loopback_device}: {e}"
+                    ) from e
+
+    def _start_loopback(self, loopback_device: int, mic_active: bool) -> None:
+        """Resolve the UI's output-device index to a soundcard speaker id,
+        spin up the loopback-capture thread, and — when the mic is also
+        active — start the mixer worker for AEC + mix. In system-only mode
+        (mic inactive) the loopback thread emits blocks directly and no
+        mixer/AEC is initialised.
+
+        Raises on failure — caller decides whether to fall back.
+        """
+        speaker_id = self._resolve_loopback_speaker(loopback_device)
+        if speaker_id is None:
+            raise RuntimeError(f"output device index {loopback_device} not found")
+
+        if mic_active:
+            # AEC instance — frame=10ms, tail=200ms. Preprocess ON: the
+            # Speex preprocessor bundles denoise + AGC + *residual echo
+            # suppression*, and that last stage is what kills the
+            # non-linear echo leakage the adaptive filter can't fully
+            # cancel. Without it users hear a "large hall" reverb in
+            # mix mode (two copies of remote audio: clean from loopback
+            # and delayed from the mic path). The AGC will moderate mic
+            # level a bit — an acceptable tradeoff for clean audio.
+            from pyaec import Aec, lib as _aec_lib
+            self._aec = Aec(_AEC_FRAME, _AEC_TAIL, SAMPLE_RATE, True)
+            self._aec_cancel = _aec_lib.AecCancelEcho
+            self._aec_handle = self._aec._aec
+
+        # Flip the flag BEFORE starting the thread so any concurrent mic
+        # callbacks route through the FIFO — otherwise the first few ms of
+        # mic audio get emitted directly and skip AEC. `_lb_active` only
+        # gates the mic callback's dispatch, so it's safe to set True even
+        # in system-only mode (there's no mic callback in that case).
+        self._lb_active = mic_active
+        self._lb_thread_stop.clear()
+        self._lb_thread = threading.Thread(
+            target=self._loopback_thread_main,
+            args=(speaker_id, not mic_active),  # emit_direct=True when mic off
+            name="aurascribe-loopback-capture",
+            daemon=True,
+        )
+        self._lb_thread.start()
+
+        if mic_active:
+            self._worker_stop.clear()
+            self._worker = threading.Thread(
+                target=self._mix_worker, name="aurascribe-aec-mixer", daemon=True,
+            )
+            self._worker.start()
+
+    def _teardown_loopback(self) -> None:
+        """Shut down the mixer worker and loopback capture thread.
+        Idempotent — safe to call from the failure branch of
+        `_start_loopback` or from `stop()` with no loopback active."""
+        self._lb_active = False
+        self._worker_stop.set()
+        self._lb_thread_stop.set()
+        if self._worker is not None:
+            self._worker.join(timeout=2.0)
+            self._worker = None
+        if self._lb_thread is not None:
+            # Recorder context-manager exit can block on driver teardown;
+            # give it a generous deadline but don't hang forever.
+            self._lb_thread.join(timeout=3.0)
+            self._lb_thread = None
+        # Aec is a ctypes handle — dropping the reference calls AecDestroy
+        # via __del__. Clear the cached entrypoints so a subsequent run
+        # rebuilds them from the new instance.
+        self._aec = None
+        self._aec_cancel = None
+        self._aec_handle = None
+        with self._fifo_lock:
+            self._mic_fifo.clear()
+            self._lb_fifo.clear()
 
     async def stop(self) -> None:
+        self._teardown_loopback()
         if self._stream is not None:
             self._stream.stop()
             self._stream.close()
             self._stream = None
+        self._resampler = None
         if self._loop and not self._loop.is_closed():
             await self._queue.put(_STOP_SENTINEL)
 

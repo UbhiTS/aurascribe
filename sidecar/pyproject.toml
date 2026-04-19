@@ -24,6 +24,17 @@ asr = [
     "sounddevice>=0.5",
     "scipy>=1.14",
     "librosa>=0.10",
+    # Speex-style AEC as a ctypes wrapper around a bundled aec.dll (~80KB).
+    # Used to cancel the loopback reference out of the mic when the user is
+    # on speakers — otherwise remote participants would be transcribed twice
+    # (once cleanly from WASAPI-loopback, once muddy from acoustic echo).
+    "pyaec>=1.0.1",
+    # WASAPI loopback capture on Windows. We keep sounddevice for the mic
+    # (proven, callback-driven) but the libportaudio DLL it bundles is
+    # built without loopback support (PaWasapi_IsLoopback symbol missing),
+    # so we use soundcard's own cffi-based WASAPI bindings just for the
+    # loopback stream. Pure-Python wrapper — no extra DLL to ship.
+    "soundcard>=0.4.6",
 ]
 diarization = [
     "torch>=2.5",

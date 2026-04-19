@@ -60,6 +60,11 @@ _VAULT_WRITE_CHUNKS = 5
 UtteranceCallback = Callable[[str, list[Utterance]], Awaitable[None]]
 PartialCallback = Callable[[str, str, str], Awaitable[None]]
 StatusCallback = Callable[[str, dict], Awaitable[None]]
+# Fires at ~30Hz while recording with (rms, peak) both in [0, 1],
+# computed off the same 16kHz mono blocks that feed Whisper. Receivers
+# (WS broadcaster today) are expected to be cheap; slow callbacks will
+# back up the audio thread's event-loop scheduling.
+LevelCallback = Callable[[float, float], Awaitable[None]]
 
 
 def extract_action_items(summary_md: str) -> list[str]:
@@ -93,6 +98,7 @@ class MeetingManager:
         self._utterance_callbacks: list[UtteranceCallback] = []
         self._partial_callbacks: list[PartialCallback] = []
         self._status_callbacks: list[StatusCallback] = []
+        self._level_callbacks: list[LevelCallback] = []
         self._running = False
         self._ready = False
         # Friendly name of the mic currently feeding AudioCapture. None when
@@ -102,6 +108,26 @@ class MeetingManager:
         self._task: asyncio.Task | None = None
         self._spec_task: asyncio.Task | None = None
         self._transcribe_sem = asyncio.Semaphore(1)
+        # Captured at `initialize()` time (always called from the sidecar
+        # event loop during FastAPI lifespan). Reused by the audio-thread
+        # level shim to schedule async broadcasts without importing
+        # capture internals.
+        self._event_loop: asyncio.AbstractEventLoop | None = None
+        # Monitor mode: same capture pipeline as a meeting, but no record
+        # loop / no DB / no ASR. Used to drive the pre-recording VU meter
+        # + waveform in the UI so the user sees the exact signal that would
+        # be captured if they hit Start. Auto-torn-down when a real
+        # meeting starts (capture is a singleton and can't be open twice).
+        #
+        # `_monitor_lock` serializes start/stop/start sequences — React
+        # StrictMode's mount-cleanup-remount pattern (+ any rapid picker
+        # change) can fire two /monitor/start calls back-to-back before
+        # the first one has even created its stream. Without the lock,
+        # both would call capture.start() concurrently and end up with
+        # two mic InputStreams hammering the same soxr resampler, which
+        # corrupts its internal state and crashes with MemoryError.
+        self._monitoring = False
+        self._monitor_lock = asyncio.Lock()
         # Per-meeting provisional speaker state. Unknown utterances are
         # clustered in-memory: embeddings that look like an existing provisional
         # speaker reuse that label; novel ones get the next "Speaker N".
@@ -114,6 +140,7 @@ class MeetingManager:
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
     async def initialize(self) -> None:
+        self._event_loop = asyncio.get_running_loop()
         await self._emit_status("loading", {"message": "Loading transcription models..."})
 
         async def _on_stage(message: str) -> None:
@@ -130,7 +157,13 @@ class MeetingManager:
         self._ready = True
         await self._emit_status("ready", {"message": "Models loaded. Ready to record."})
 
-    async def start_meeting(self, title: str = "", device: int | None = None) -> str:
+    async def start_meeting(
+        self,
+        title: str = "",
+        device: int | None = None,
+        loopback_device: int | None = None,
+        capture_mic: bool = True,
+    ) -> str:
         if self._running:
             raise RuntimeError("Already recording")
         if not self._ready:
@@ -150,18 +183,33 @@ class MeetingManager:
         self._current_meeting_id = meeting_id
         self._provisional_pools[meeting_id] = {}
         self._provisional_next_n[meeting_id] = 1
-        self._running = True
-        try:
-            await self.capture.start(device=device)
-        except Exception:
-            # Roll back state so the next click doesn't get "Already recording".
-            self._running = False
-            self._current_meeting_id = None
-            async with aiosqlite.connect(DB_PATH) as db:
-                await db.execute("DELETE FROM meetings WHERE id = ?", (meeting_id,))
-                await db.commit()
-            raise
-        self._active_device_name = self._resolve_device_name(device)
+        # Capture transition is locked so a late /monitor/start can't
+        # sneak in between the monitor teardown and our capture.start().
+        # We also set `_running` inside the lock, so any monitor request
+        # that waits for the lock sees the "recording" state when it
+        # finally runs and bails early instead of opening a duplicate
+        # stream.
+        async with self._monitor_lock:
+            await self._stop_monitor_locked()
+            self._running = True
+            try:
+                await self.capture.start(
+                    device=device,
+                    loopback_device=loopback_device,
+                    capture_mic=capture_mic,
+                )
+            except Exception:
+                # Roll back state so the next click doesn't get "Already recording".
+                self._running = False
+                self._current_meeting_id = None
+                async with aiosqlite.connect(DB_PATH) as db:
+                    await db.execute("DELETE FROM meetings WHERE id = ?", (meeting_id,))
+                    await db.commit()
+                raise
+        # Only surface a mic name when we actually opened the mic. In
+        # system-only mode `_resolve_device_name` would still pick up a
+        # default-mic label, which would mislead the header chip.
+        self._active_device_name = self._resolve_device_name(device) if capture_mic else None
 
         audio_path = AUDIO_DIR / f"{meeting_id}.opus"
         try:
@@ -187,10 +235,15 @@ class MeetingManager:
         if not self._running or self._current_meeting_id is None:
             raise RuntimeError("No active recording")
 
-        self._running = False
-        self._active_device_name = None
-        await self.capture.stop()
-        self.capture.stop_recording()
+        # Capture transition is locked so an incoming /monitor/start
+        # can't race with our capture.stop() and land on a half-open
+        # InputStream. Once `_running` flips False + capture is stopped,
+        # the next monitor/start can proceed cleanly.
+        async with self._monitor_lock:
+            self._running = False
+            self._active_device_name = None
+            await self.capture.stop()
+            self.capture.stop_recording()
         if self._spec_task:
             self._spec_task.cancel()
             try:
@@ -598,6 +651,33 @@ class MeetingManager:
     def on_status(self, cb: StatusCallback) -> None:
         self._status_callbacks.append(cb)
 
+    def on_level(self, cb: LevelCallback) -> None:
+        """Register an async listener for per-block RMS/peak updates.
+        Wires the sync `capture._on_level` callback the first time a
+        listener is added; subsequent calls just append to the list."""
+        self._level_callbacks.append(cb)
+        if self.capture._on_level is None:
+            self.capture._on_level = self._on_capture_level
+
+    def _on_capture_level(self, rms: float, peak: float) -> None:
+        """Thread-safe shim invoked on the audio thread. Schedules the
+        async fan-out on the sidecar's event loop so broadcast() + the
+        WebSocket send_json calls don't touch audio-thread state."""
+        loop = self._event_loop
+        if loop is None or loop.is_closed():
+            return
+        try:
+            asyncio.run_coroutine_threadsafe(self._emit_level(rms, peak), loop)
+        except RuntimeError:
+            pass  # loop shutting down — drop the tick silently
+
+    async def _emit_level(self, rms: float, peak: float) -> None:
+        for cb in self._level_callbacks:
+            try:
+                await cb(rms, peak)
+            except Exception:
+                pass
+
     async def _emit_partial(self, meeting_id: str, speaker: str, text: str) -> None:
         for cb in self._partial_callbacks:
             try:
@@ -612,10 +692,97 @@ class MeetingManager:
             except Exception:
                 pass
 
+    # ── Monitor mode (idle-state visualizer source) ───────────────────────────
+    #
+    # Monitor opens the same capture pipeline as a real meeting but skips
+    # ASR / diarization / DB — the only observable effect is the
+    # ~30Hz `audio_level` WS broadcast the visualizers already consume.
+    # Lets the UI animate the VU meter + waveform live for whatever
+    # source the user has selected, *before* they hit Start Recording.
+    #
+    # Reentrancy rules:
+    #   * If a meeting is recording, monitor requests are rejected (busy).
+    #   * If an existing monitor is running, starting a new one with a
+    #     different config transparently restarts — callers don't need
+    #     to stop+start explicitly on every picker change.
+    #   * start_meeting() tears down the monitor first.
+
+    async def start_monitor(
+        self,
+        device: int | None = None,
+        loopback_device: int | None = None,
+        capture_mic: bool = True,
+    ) -> None:
+        # Serialized against stop_monitor and against concurrent calls to
+        # itself — see _monitor_lock comment in __init__.
+        async with self._monitor_lock:
+            if self._running:
+                raise RuntimeError("Can't monitor while recording")
+            # Unlike start_meeting, monitor doesn't need Whisper / pyannote —
+            # only capture + the VAD used to size blocks. VAD is loaded
+            # lazily inside capture.start() on first call. So we can boot
+            # the visualizer before the heavy models finish loading.
+            if self._monitoring:
+                await self._stop_monitor_locked()
+            await self.capture.start(
+                device=device,
+                loopback_device=loopback_device,
+                capture_mic=capture_mic,
+            )
+            self._monitoring = True
+            # Background task drains the VAD queue so the ring doesn't
+            # back up with un-consumed blocks while we're monitoring.
+            # Blocks are discarded — monitor doesn't transcribe.
+            self._monitor_drain_task = asyncio.create_task(self._monitor_drain_loop())
+
+    async def stop_monitor(self) -> None:
+        async with self._monitor_lock:
+            await self._stop_monitor_locked()
+
+    async def _stop_monitor_locked(self) -> None:
+        """Teardown half of the monitor lifecycle. Assumes caller holds
+        `_monitor_lock`. Never call from outside the lock — capture.stop()
+        can race with a concurrent capture.start() and leak an
+        InputStream whose callback keeps writing to a new resampler."""
+        if not self._monitoring:
+            return
+        self._monitoring = False
+        drain = getattr(self, "_monitor_drain_task", None)
+        if drain is not None:
+            drain.cancel()
+            try:
+                await drain
+            except (asyncio.CancelledError, Exception):
+                pass
+            self._monitor_drain_task = None
+        await self.capture.stop()
+
+    async def _monitor_drain_loop(self) -> None:
+        """Pull-and-drop loop that keeps the capture's internal queue from
+        backing up during monitor mode. The audio thread pushes 512-block
+        ndarrays; we just await + discard."""
+        try:
+            while self._monitoring:
+                chunk = await self.capture._queue.get()
+                # Capture's _STOP_SENTINEL is posted from stop(); exit
+                # cleanly rather than treating it as audio.
+                if not isinstance(chunk, np.ndarray):
+                    break
+        except asyncio.CancelledError:
+            raise
+
+    @property
+    def is_monitoring(self) -> bool:
+        return self._monitoring
+
     # ── Helpers ───────────────────────────────────────────────────────────────
 
     def list_audio_devices(self) -> list[dict]:
         return self.capture.list_devices()
+
+    def list_audio_output_devices(self) -> list[dict]:
+        """WASAPI-capable output devices for the loopback picker."""
+        return self.capture.list_output_devices()
 
     def _resolve_device_name(self, device: int | None) -> str | None:
         """Friendly name for the sounddevice index that was just opened.

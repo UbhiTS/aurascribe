@@ -88,6 +88,7 @@ export function LiveFeed({
         <RecordingBar
           isRecording={isRecording}
           devices={appStatus?.audio_devices ?? []}
+          outputDevices={appStatus?.audio_output_devices ?? []}
           onStarted={onMeetingStarted}
           onStopped={onMeetingStopped}
         />

@@ -198,6 +198,15 @@ export default function App() {
         }
       }
     }
+    if (msg.type === "audio_level") {
+      // Fan out via a DOM CustomEvent so visualizers (VuMeter / Waveform)
+      // can subscribe without threading another React context through the
+      // tree. The sidecar only emits during recording, so the absence of
+      // recent events is itself a signal for the analyser-fallback path.
+      window.dispatchEvent(new CustomEvent("aurascribe:audio-level", {
+        detail: { rms: msg.rms, peak: msg.peak, t: performance.now() },
+      }));
+    }
   }, []);
   const { connected: wsConnected } = useWebSocket(handleWsMessage);
   const llm = useLLMHealth();

@@ -84,9 +84,15 @@ async def lifespan(app: FastAPI):
         if event == "done" and data.get("meeting_id"):
             asyncio.create_task(regen_brief_for_meeting(data["meeting_id"]))
 
+    async def on_level(rms: float, peak: float) -> None:
+        # ~30Hz during recording. Small-payload broadcast, no coalescing —
+        # the WS lock is cheap and Waveform sub-samples to 20Hz anyway.
+        await broadcast({"type": "audio_level", "rms": rms, "peak": peak})
+
     manager.on_utterance(on_utterance)
     manager.on_partial(on_partial)
     manager.on_status(on_status)
+    manager.on_level(on_level)
     manager.intel.set_broadcast(broadcast)
     asyncio.create_task(manager.initialize())
     yield
@@ -162,6 +168,7 @@ async def get_status() -> dict:
         "is_recording": manager.is_recording,
         "current_meeting_id": manager.current_meeting_id,
         "audio_devices": manager.list_audio_devices(),
+        "audio_output_devices": manager.list_audio_output_devices(),
         "active_audio_device": manager.active_device_name,
         "obsidian_configured": config.OBSIDIAN_VAULT is not None,
         # Hardware the sidecar probed at import. Frozen for the lifetime of

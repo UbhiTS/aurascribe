@@ -1,5 +1,6 @@
 import { useEffect, useRef } from "react";
 import { useMicAudio } from "../lib/MicAudioContext";
+import { useSidecarAudioLevel, FRESHNESS_MS } from "../lib/useSidecarAudioLevel";
 
 // Scrolling amplitude history — one bar sampled every SAMPLE_MS, oldest drops off the left.
 const BARS = 96;
@@ -17,12 +18,12 @@ function levelColor(level: number, opacity: number): string {
 
 export function Waveform() {
   const { analyser, error } = useMicAudio();
+  const { ref: sidecarLevelRef, active: sidecarActive } = useSidecarAudioLevel();
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const history = useRef<number[]>(new Array(BARS).fill(0));
 
   useEffect(() => {
-    if (!analyser) return;
-    const sampleBuf = new Uint8Array(analyser.fftSize);
+    const sampleBuf = analyser ? new Uint8Array(analyser.fftSize) : null;
     let rafId = 0;
     let lastSample = 0;
 
@@ -30,13 +31,22 @@ export function Waveform() {
       const now = performance.now();
       if (now - lastSample >= SAMPLE_MS) {
         lastSample = now;
-        analyser.getByteTimeDomainData(sampleBuf);
-        let sumSq = 0;
-        for (let i = 0; i < sampleBuf.length; i++) {
-          const s = (sampleBuf[i] - 128) / 128;
-          sumSq += s * s;
+        // Prefer sidecar-emitted level when fresh — same fallback
+        // discipline as VuMeter so both visualizers stay in sync with
+        // whatever the transcription pipeline is actually seeing.
+        let rms = 0;
+        const sc = sidecarLevelRef.current;
+        if (sc && now - sc.t < FRESHNESS_MS) {
+          rms = sc.rms;
+        } else if (sampleBuf && analyser) {
+          analyser.getByteTimeDomainData(sampleBuf);
+          let sumSq = 0;
+          for (let i = 0; i < sampleBuf.length; i++) {
+            const s = (sampleBuf[i] - 128) / 128;
+            sumSq += s * s;
+          }
+          rms = Math.sqrt(sumSq / sampleBuf.length);
         }
-        const rms = Math.sqrt(sumSq / sampleBuf.length);
         // Same scale as VuMeter (rms * 800, capped 0–100) so color thresholds match.
         const level = Math.min(100, rms * 800);
         history.current.push(level);
@@ -79,9 +89,11 @@ export function Waveform() {
     rafId = requestAnimationFrame(tick);
 
     return () => cancelAnimationFrame(rafId);
-  }, [analyser]);
+  }, [analyser, sidecarLevelRef]);
 
-  if (error) return null;
+  // Keep the waveform rendering if we have sidecar levels even when the
+  // browser mic errored; the history gets populated from the sidecar feed.
+  if (error && !sidecarActive) return null;
   // Fixed width: 3× VuMeter (16 bars × 4px + 15 × 1px gap = 79px → 237px).
   return <canvas ref={canvasRef} className="w-[237px] h-8 flex-shrink-0" />;
 }

@@ -137,6 +137,11 @@ export interface AppStatus {
   is_recording: boolean;
   current_meeting_id: string | null;
   audio_devices: { index: number; name: string; channels: number; host_api?: string }[];
+  // WASAPI output devices usable as a loopback source. Populated from
+  // sounddevice's output-capable list filtered to WASAPI — anything else
+  // can't do loopback on Windows. Used by the second picker on the
+  // recording bar ("Capture from: …") to attach system audio to a meeting.
+  audio_output_devices: { index: number; name: string; channels: number; host_api?: string }[];
   // Friendly name of the mic the sidecar is actually pulling from right
   // now. null when idle. The dropdown in the UI can lie (default-mic, name
   // mismatch) — this is the authoritative source.
@@ -334,16 +339,51 @@ export const api = {
     clearAll: (days = 2) =>
       request<{ ok: boolean; deleted: number }>(`/meetings/all?days=${days}`, { method: "DELETE" }),
     get: (id: string) => request<Meeting>(`/meetings/${id}`),
-    start: (title: string, device?: number) =>
+    start: (
+      title: string,
+      opts: {
+        device?: number;
+        loopbackDevice?: number;
+        captureMic?: boolean;
+      } = {},
+    ) =>
       request<{ meeting_id: string; status: string }>("/meetings/start", {
         method: "POST",
-        body: JSON.stringify({ title, device }),
+        body: JSON.stringify({
+          title,
+          device: opts.device,
+          loopback_device: opts.loopbackDevice,
+          // Default true on the backend — only send when explicitly false
+          // so older callers stay mic-only by accident-free design.
+          capture_mic: opts.captureMic ?? true,
+        }),
       }),
     stop: (summarize = false) =>
       request<Meeting>("/meetings/stop", {
         method: "POST",
         body: JSON.stringify({ summarize }),
       }),
+    // Pre-recording monitor: opens the capture pipeline (same mic +
+    // loopback plumbing a real meeting uses) but skips transcription —
+    // only the ~30Hz audio_level WS broadcast is emitted, so the
+    // visualizers can animate the exact signal you'd record if you hit
+    // Start. Automatically torn down server-side when a real meeting
+    // starts; callers don't need to sequence that.
+    monitorStart: (opts: {
+      device?: number;
+      loopbackDevice?: number;
+      captureMic?: boolean;
+    } = {}) =>
+      request<{ ok: boolean }>("/meetings/monitor/start", {
+        method: "POST",
+        body: JSON.stringify({
+          device: opts.device,
+          loopback_device: opts.loopbackDevice,
+          capture_mic: opts.captureMic ?? true,
+        }),
+      }),
+    monitorStop: () =>
+      request<{ ok: boolean }>("/meetings/monitor/stop", { method: "POST" }),
     renameSpeaker: (meetingId: string, oldName: string, newName: string) =>
       request<{ ok: boolean }>(`/meetings/${meetingId}/rename-speaker`, {
         method: "POST",
