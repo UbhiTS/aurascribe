@@ -1,10 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "bundle": {
-    "windows": {
-      "nsis": {
-        "compression": "none"
-      }
-    }
+    "targets": ["msi"]
   }
 }

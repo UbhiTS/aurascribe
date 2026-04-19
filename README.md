@@ -20,7 +20,7 @@ Two flavors per release, pick one:
 
 | Installer | When to pick it | Size |
 |---|---|---|
-| **AuraScribe-CUDA-setup.exe** | You have an NVIDIA GPU (any RTX card). Fastest transcription + GPU-accelerated diarization. | ~1.5–2 GB |
+| **AuraScribe-CUDA-setup.msi** | You have an NVIDIA GPU (any RTX card). Fastest transcription + GPU-accelerated diarization. Delivered as MSI because NSIS's 32-bit makensis can't package a 1.5 GB payload. | ~1.5–2 GB |
 | **AuraScribe-CPU-setup.exe** | No GPU, or you want the smaller install. Transcription is ~5–10× slower but still usable. | ~700–900 MB |
 
 Both install per-user to `%LOCALAPPDATA%\Programs\AuraScribe` — no admin rights needed. User data (DB, audio, logs, models) lives under `%APPDATA%\AuraScribe` and survives uninstall.
@@ -351,7 +351,7 @@ npm run package
 Push a tag: `git tag v0.2.0 && git push origin v0.2.0`. [.github/workflows/release.yml](.github/workflows/release.yml) then:
 
 1. Builds **both** variants in parallel on `windows-latest` (matrix `[cuda, cpu]`).
-2. Renames outputs to stable filenames — `AuraScribe-CUDA-setup.exe` / `AuraScribe-CPU-setup.exe`.
+2. Renames outputs to stable filenames — `AuraScribe-CUDA-setup.msi` (WiX, large-payload-safe) / `AuraScribe-CPU-setup.exe` (NSIS).
 3. Uploads each as a CI artifact.
 4. A follow-up `release` job (tag-only) drafts a GitHub Release with both installers attached + a picker table in the body.
 

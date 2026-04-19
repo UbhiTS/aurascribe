@@ -48,9 +48,16 @@ jobs:
             # cu121/cu124 were dropped for newer torch versions. Bump this
             # when PyTorch ships a newer CUDA major.
             torch_index: https://download.pytorch.org/whl/cu128
-            installer_name: AuraScribe-CUDA-setup.exe
+            # CUDA bundle is ~1.5 GB and NSIS (32-bit makensis) crashes
+            # while mmap'ing the datablock. We switch CUDA to MSI (WiX)
+            # which handles large payloads. CPU stays on NSIS (.exe).
+            bundle_subdir: msi
+            installer_ext: msi
+            installer_name: AuraScribe-CUDA-setup.msi
           - variant: cpu
             torch_index: https://download.pytorch.org/whl/cpu
+            bundle_subdir: nsis
+            installer_ext: exe
             installer_name: AuraScribe-CPU-setup.exe
 
     steps:
@@ -116,13 +123,13 @@ jobs:
           $sizeMB = [math]::Round(((Get-ChildItem -Recurse $bundleDir | Measure-Object Length -Sum).Sum / 1MB), 1)
           Write-Host "Sidecar bundle (${{ matrix.variant }}): $sizeMB MB"
 
-      # The CUDA sidecar is ~1.5 GB; NSIS's 32-bit memory-mapping crashes
-      # ("Internal compiler error #12345: error mmapping datablock") when
-      # asked to build a single compressed data block that large. The
-      # override config disables NSIS compression for the CUDA variant
-      # only — per-file storage keeps mmap regions small, at the cost of
-      # a ~2 GB installer instead of ~1.5 GB compressed. The CPU variant
-      # keeps the default LZMA compression (262 MB installer).
+      # The CUDA sidecar is ~1.5 GB; NSIS (32-bit makensis) crashes
+      # with "Internal compiler error #12345: error mmapping datablock"
+      # while memory-mapping the huge datablock into its <2 GB virtual
+      # address space. Disabling LZMA didn't help — the mmap usage comes
+      # from the source files themselves, not the compression stage.
+      # Fix: switch the CUDA variant to the MSI (WiX) bundler, which
+      # doesn't share NSIS's mmap limits. CPU stays on NSIS.
       - name: Build Tauri app (${{ matrix.variant }})
         shell: powershell
         run: |
@@ -132,14 +139,17 @@ jobs:
             npm run tauri:build
           }
 
-      # Tauri's default NSIS output name is versioned + arch-tagged
-      # (e.g. AuraScribe_0.1.0_x64-setup.exe). Rename to the stable
-      # variant-tagged filename the release expects.
+      # Tauri's default installer filename is versioned + arch-tagged
+      # (e.g. AuraScribe_0.1.0_x64-setup.exe or AuraScribe_0.1.0_x64_en-US.msi).
+      # Rename to the stable variant-tagged filename the release expects.
+      # bundle_subdir + installer_ext come from the matrix so we grab the
+      # right file out of the right folder per variant.
       - name: Rename installer to ${{ matrix.installer_name }}
         shell: powershell
         run: |
-          $src = Get-ChildItem -Path "src-tauri\target\release\bundle\nsis\*.exe" | Select-Object -First 1
-          if (-not $src) { throw "No NSIS installer produced" }
+          $pattern = "src-tauri\target\release\bundle\${{ matrix.bundle_subdir }}\*.${{ matrix.installer_ext }}"
+          $src = Get-ChildItem -Path $pattern | Select-Object -First 1
+          if (-not $src) { throw "No installer produced at $pattern" }
           $dst = Join-Path $src.DirectoryName "${{ matrix.installer_name }}"
           Copy-Item $src.FullName $dst -Force
           $sizeMB = [math]::Round((Get-Item $dst).Length / 1MB, 1)
@@ -149,7 +159,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.installer_name }}
-          path: src-tauri/target/release/bundle/nsis/${{ matrix.installer_name }}
+          path: src-tauri/target/release/bundle/${{ matrix.bundle_subdir }}/${{ matrix.installer_name }}
           if-no-files-found: error
           retention-days: 30
 
@@ -164,7 +174,7 @@ jobs:
       - name: Download both installers
         uses: actions/download-artifact@v4
         with:
-          pattern: AuraScribe-*-setup.exe
+          pattern: AuraScribe-*-setup.*
           path: ./installers
           merge-multiple: true
 
@@ -179,14 +189,14 @@ jobs:
           draft: true
           prerelease: false
           files: |
-            installers/AuraScribe-CUDA-setup.exe
+            installers/AuraScribe-CUDA-setup.msi
             installers/AuraScribe-CPU-setup.exe
           body: |
             Windows installers — two flavours:
 
             | Installer | When to pick it | Size |
             |---|---|---|
-            | **AuraScribe-CUDA-setup.exe** | You have an NVIDIA GPU (any RTX card). Fastest transcription. | ~1.5–2 GB |
+            | **AuraScribe-CUDA-setup.msi** | You have an NVIDIA GPU (any RTX card). Fastest transcription. Delivered as MSI because NSIS can't package a 1.5 GB payload on 32-bit. | ~1.5–2 GB |
             | **AuraScribe-CPU-setup.exe** | No GPU, or you want the smaller install. Transcription is 5–10× slower but still usable. | ~700–900 MB |
 
             Both installers:
