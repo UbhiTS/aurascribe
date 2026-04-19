@@ -1,9 +1,11 @@
-import { useMemo, useRef, useState } from "react";
+import { useCallback, useMemo, useRef, useState } from "react";
 import { ArrowLeft, Clock, Loader, Pencil, Sparkles, CheckSquare, Square, FileText, Trash2, Wand2 } from "lucide-react";
 import { api, tagsPending } from "../lib/api";
 import type { Meeting, Voice } from "../lib/api";
 import { TranscriptView } from "../components/TranscriptView";
 import { TitleSuggestPopover } from "../components/TitleSuggestPopover";
+import { Avatar } from "../components/Avatar";
+import { colorForSpeaker } from "../lib/speakerColors";
 
 interface Props {
   meeting: Meeting | null;
@@ -35,6 +37,11 @@ export function Review({
   // underneath it regardless of where the title is on screen.
   const [titleSuggestAnchor, setTitleSuggestAnchor] = useState<{ top: number; left: number } | null>(null);
   const suggestBtnRef = useRef<HTMLButtonElement | null>(null);
+  // Distinct tagged speakers in this meeting, reported by TranscriptView.
+  // Rendered as a chip row next to the title so the user can see the cast
+  // without scanning the transcript.
+  const [roster, setRoster] = useState<string[]>([]);
+  const handleRoster = useCallback((names: string[]) => setRoster(names), []);
 
   const selfSpeaker = voices.find((v) => v.name === "Me")?.name ?? "Me";
   const actionItems = meeting?.action_items ?? [];
@@ -262,6 +269,23 @@ export function Review({
                   </p>
                 )}
               </div>
+              {roster.length > 0 && (
+                <div className="flex-shrink-0 flex items-center gap-1.5 flex-wrap justify-end max-w-[55%]">
+                  {roster.map((name) => {
+                    const c = colorForSpeaker(name, voices);
+                    return (
+                      <span
+                        key={name}
+                        className={`inline-flex items-center gap-1.5 pl-1 pr-2 py-0.5 rounded-full border ${c.border} bg-gray-900/60 text-[11px] text-gray-200`}
+                        title={name}
+                      >
+                        <Avatar name={name} size="xs" gradient={c.avatar} />
+                        <span className={name === selfSpeaker ? "text-brand-400" : ""}>{name}</span>
+                      </span>
+                    );
+                  })}
+                </div>
+              )}
             </div>
 
             <div className="flex-1 min-h-0 bg-circuit">
@@ -273,6 +297,7 @@ export function Review({
                 selfSpeaker={selfSpeaker}
                 voices={voices}
                 onVoicesChanged={onVoicesChanged}
+                onRosterChange={handleRoster}
                 editable
                 onTrim={handleTrim}
                 onSplit={handleSplit}

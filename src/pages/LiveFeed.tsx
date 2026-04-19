@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Sparkles, Loader, Pencil, CheckSquare, Square, RefreshCw, Lightbulb } from "lucide-react";
 import type { AppStatus, LiveIntel, Meeting, Utterance, Voice } from "../lib/api";
 import { api } from "../lib/api";
@@ -6,6 +6,8 @@ import { useClockTick } from "../lib/useClockTick";
 import { RecordingBar } from "../components/RecordingBar";
 import { TranscriptView } from "../components/TranscriptView";
 import { TitleSuggestPopover } from "../components/TitleSuggestPopover";
+import { Avatar } from "../components/Avatar";
+import { colorForSpeaker } from "../lib/speakerColors";
 
 interface Props {
   appStatus: AppStatus | null;
@@ -36,6 +38,11 @@ export function LiveFeed({
   // Anchor + visibility for the AI title-suggestion popover.
   const [titleSuggestAnchor, setTitleSuggestAnchor] = useState<{ top: number; left: number } | null>(null);
   const suggestBtnRef = useRef<HTMLButtonElement | null>(null);
+  // Distinct speakers in this live meeting, reported by TranscriptView.
+  // Drives the chip row in the title header so the user can see the cast
+  // building up as the diarizer clusters voices.
+  const [roster, setRoster] = useState<string[]>([]);
+  const handleRoster = useCallback((names: string[]) => setRoster(names), []);
 
   const isRecording = appStatus?.is_recording ?? false;
   // Self speaker name — default "Me" unless a Voice has been tagged as such.
@@ -142,6 +149,24 @@ export function LiveFeed({
                 )}
               </div>
 
+              {roster.length > 0 && (
+                <div className="flex-shrink-0 flex items-center gap-1.5 flex-wrap justify-end max-w-[55%]">
+                  {roster.map((name) => {
+                    const c = colorForSpeaker(name, voices);
+                    return (
+                      <span
+                        key={name}
+                        className={`inline-flex items-center gap-1.5 pl-1 pr-2 py-0.5 rounded-full border ${c.border} bg-gray-900/60 text-[11px] text-gray-200`}
+                        title={name}
+                      >
+                        <Avatar name={name} size="xs" gradient={c.avatar} />
+                        <span className={name === selfSpeaker ? "text-brand-400" : ""}>{name}</span>
+                      </span>
+                    );
+                  })}
+                </div>
+              )}
+
               {meeting && meeting.status === "done" && (
                 <button
                   onClick={handleSummarize}
@@ -163,6 +188,7 @@ export function LiveFeed({
                 selfSpeaker={selfSpeaker}
                 voices={voices}
                 onVoicesChanged={onVoicesChanged}
+                onRosterChange={handleRoster}
               />
             </div>
           </div>

@@ -6,6 +6,7 @@ import {
 import { api } from "../lib/api";
 import type { Voice, VoiceDetail, VoiceSnippet } from "../lib/api";
 import { Avatar } from "../components/Avatar";
+import { colorForSpeaker } from "../lib/speakerColors";
 
 // Min embeddings before a Voice participates in auto-matching. Mirrors the
 // backend gate in whisper.py — keep in sync if that changes.
@@ -86,7 +87,7 @@ export function Voices({ voices, onVoicesChanged }: Props) {
                           : "hover:bg-gray-900/70"
                       }`}
                     >
-                      <Avatar name={v.name} size="sm" />
+                      <Avatar name={v.name} size="sm" gradient={colorForSpeaker(v.name, voices).avatar} />
                       <div className="flex-1 min-w-0">
                         <div className="text-sm text-gray-200 truncate">{v.name}</div>
                         <div className="flex items-center gap-1.5 text-[10px]">
@@ -253,7 +254,7 @@ function VoiceDetailPane({ detail, allVoices, onChanged, onDeleted }: DetailProp
 
       {/* Header */}
       <div className="flex items-start gap-3">
-        <Avatar name={detail.name} size="lg" />
+        <Avatar name={detail.name} size="lg" gradient={colorForSpeaker(detail.name, allVoices).avatar} />
         <div className="flex-1 min-w-0">
           {editingName ? (
             <input
@@ -453,7 +454,7 @@ function MergePopover({ currentId, voices, onClose, onPick }: MergePopoverProps)
           onClick={() => onPick(v.id)}
           className="w-full text-left px-2 py-1.5 text-sm rounded hover:bg-gray-800 flex items-center gap-2"
         >
-          <Avatar name={v.name} size="xs" />
+          <Avatar name={v.name} size="xs" gradient={colorForSpeaker(v.name, voices).avatar} />
           {v.name}
           <span className="ml-auto text-[10px] text-gray-500">{v.snippet_count}</span>
         </button>

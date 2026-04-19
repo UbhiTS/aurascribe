@@ -80,23 +80,79 @@ PROVISIONAL_LABEL_RE = re.compile(r"^Speaker \d+$")
 # Used by both the voices router (new-voice creation) and meetings router
 # (speaker rename/assign, which can create a voice on the fly).
 
-VOICE_COLORS: tuple[str, ...] = (
-    "#a78bfa",  # purple
-    "#34d399",  # emerald
-    "#22d3ee",  # cyan
-    "#fbbf24",  # amber
-    "#f472b6",  # pink
-    "#fb7185",  # rose
-    "#2dd4bf",  # teal
-    "#818cf8",  # indigo
+# Palette keys — ONE-TO-ONE with SPEAKER_PALETTE in src/lib/speakerColors.ts.
+# Hues spread ~40° apart on the color wheel so no two slots read as similar
+# at a glance. The key is stored on voices.color; the frontend looks it up
+# in its own table to resolve Tailwind class names. Never reorder existing
+# entries — doing so would re-assign colors on every stored voice. Append
+# only if the frontend table is extended in the same order.
+VOICE_PALETTE_KEYS: tuple[str, ...] = (
+    "rose",
+    "orange",
+    "yellow",
+    "lime",
+    "emerald",
+    "cyan",
+    "blue",
+    "violet",
+    "fuchsia",
 )
 
 
 async def next_voice_color(db: aiosqlite.Connection) -> str:
-    cursor = await db.execute("SELECT COUNT(*) FROM voices")
-    row = await cursor.fetchone()
-    n = int(row[0]) if row and row[0] is not None else 0
-    return VOICE_COLORS[n % len(VOICE_COLORS)]
+    """Pick the palette slot with the fewest existing voices, tie-breaking
+    by palette order. This guarantees:
+      * distinct colors for every voice up to 9 (palette size)
+      * stable assignment — a slot "freed" by a deletion is filled first
+        before doubling up on any other slot
+      * deterministic under concurrency-free access (the sidecar serializes
+        writes through aiosqlite).
+    """
+    cursor = await db.execute(
+        "SELECT color FROM voices WHERE color IS NOT NULL"
+    )
+    rows = await cursor.fetchall()
+    counts: dict[str, int] = {k: 0 for k in VOICE_PALETTE_KEYS}
+    for (c,) in rows:
+        if c in counts:
+            counts[c] += 1
+    return min(VOICE_PALETTE_KEYS, key=lambda k: (counts[k], VOICE_PALETTE_KEYS.index(k)))
+
+
+async def backfill_voice_colors(db: aiosqlite.Connection) -> None:
+    """Migrate voices whose `color` is NULL or a legacy hex string
+    (VOICE_COLORS from before the palette-key refactor) to the new key
+    scheme. Runs once on startup — cheap no-op when all voices are
+    already keyed correctly. Assignment honours created_at order so the
+    oldest voice gets the first available slot; newer voices fill the
+    remaining slots in order."""
+    cursor = await db.execute(
+        "SELECT id, color FROM voices ORDER BY created_at ASC"
+    )
+    rows = await cursor.fetchall()
+    if not rows:
+        return
+    counts: dict[str, int] = {k: 0 for k in VOICE_PALETTE_KEYS}
+    to_fix: list[str] = []
+    for voice_id, color in rows:
+        if color in counts:
+            counts[color] += 1
+        else:
+            to_fix.append(voice_id)
+    if not to_fix:
+        return
+    now = datetime.now().isoformat()
+    for voice_id in to_fix:
+        slot = min(
+            VOICE_PALETTE_KEYS,
+            key=lambda k: (counts[k], VOICE_PALETTE_KEYS.index(k)),
+        )
+        await db.execute(
+            "UPDATE voices SET color = ?, updated_at = ? WHERE id = ?",
+            (slot, now, voice_id),
+        )
+        counts[slot] += 1
+    await db.commit()
 
 
 async def get_or_create_voice(db: aiosqlite.Connection, name: str) -> str:

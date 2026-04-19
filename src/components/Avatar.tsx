@@ -1,26 +1,13 @@
 // Deterministic avatar generator. Turns a name into a circle with initials
-// and a stable background color drawn from a curated palette.
+// and a stable background color drawn from a shared palette.
 // No photos — we don't have them and don't want to fetch anything remote.
+//
+// Color assignment lives in lib/speakerColors.ts so the transcript
+// bubbles, the meeting header chips, and Voices page all render the
+// same person in the same color.
 
 import { memo } from "react";
-
-const PALETTE = [
-  "from-brand-500 to-brand-700",
-  "from-emerald-500 to-emerald-700",
-  "from-amber-500 to-amber-700",
-  "from-pink-500 to-pink-700",
-  "from-cyan-500 to-cyan-700",
-  "from-purple-500 to-purple-700",
-  "from-rose-500 to-rose-700",
-  "from-teal-500 to-teal-700",
-  "from-indigo-500 to-indigo-700",
-];
-
-function hash(s: string): number {
-  let h = 0;
-  for (const c of s) h = (h * 31 + c.charCodeAt(0)) & 0xffffffff;
-  return Math.abs(h);
-}
+import { colorForSpeaker } from "../lib/speakerColors";
 
 function initials(name: string): string {
   if (!name) return "?";
@@ -34,6 +21,10 @@ interface Props {
   name: string;
   size?: "xs" | "sm" | "md" | "lg";
   className?: string;
+  // Override the name-derived color. Used when the caller has already
+  // resolved a SpeakerColor (e.g. when rendering bubbles — they share
+  // the same object with the bubble tint).
+  gradient?: string;
 }
 
 const SIZE = {
@@ -46,11 +37,11 @@ const SIZE = {
 // Pure: rendered once per (name,size) tuple. TranscriptView renders many
 // avatars per WS push, and the parent list re-renders on each — memo skips
 // those re-renders since the props are stable.
-export const Avatar = memo(function Avatar({ name, size = "md", className = "" }: Props) {
-  const gradient = PALETTE[hash(name) % PALETTE.length];
+export const Avatar = memo(function Avatar({ name, size = "md", className = "", gradient }: Props) {
+  const resolved = gradient ?? colorForSpeaker(name).avatar;
   return (
     <div
-      className={`flex-shrink-0 rounded-full bg-gradient-to-br ${gradient} flex items-center justify-center font-semibold text-white shadow-inner ${SIZE[size]} ${className}`}
+      className={`flex-shrink-0 rounded-full bg-gradient-to-br ${resolved} flex items-center justify-center font-semibold text-white shadow-inner ${SIZE[size]} ${className}`}
       title={name}
     >
       {initials(name)}

@@ -369,6 +369,8 @@ Frontend console: DevTools in the Tauri webview (right-click → Inspect in dev;
 - **Backlog** — Multi-vault / per-meeting vault routing.
 - **Backlog** — Scheduled meeting pre-briefs (pull upcoming calendar entries + relevant prior meetings into a pre-meeting card).
 - **Backlog** — Structured telemetry (opt-in Sentry or local crash reporter upload).
+- **Backlog** — Speaker color picker in the Voices page (override the auto-assigned palette slot).
+- **Backlog** — Custom avatar upload per speaker (replaces the generated initials circle with a user-provided image).
 
 ---
 

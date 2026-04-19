@@ -12,6 +12,7 @@ import subprocess
 import sys
 from contextlib import asynccontextmanager
 
+import aiosqlite
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -28,6 +29,7 @@ from aurascribe.routes import (
     voices_router,
 )
 from aurascribe.routes._shared import (
+    backfill_voice_colors,
     broadcast,
     broadcast_lock,
     manager,
@@ -42,6 +44,11 @@ log = logging.getLogger("aurascribe")
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await init_db()
+    # One-time migration: legacy voices stored hex colors ("#a78bfa"); the
+    # new scheme stores palette keys ("rose") so the frontend can map to
+    # its Tailwind class table. Cheap no-op once every voice is keyed.
+    async with aiosqlite.connect(config.DB_PATH) as _db:
+        await backfill_voice_colors(_db)
     cleanup_vault_stragglers()
 
     async def on_utterance(meeting_id: str, utterances: list[Utterance]) -> None:
