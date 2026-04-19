@@ -26,8 +26,12 @@ from aurascribe.config import (
     DB_PATH,
     DIARIZATION_MODEL,
     HF_TOKEN,
+    MIN_VOICE_SAMPLES,
     MODELS_DIR,
     SAMPLE_RATE,
+    VOICE_MATCH_THRESHOLD_MULTI,
+    VOICE_MATCH_THRESHOLD_SOLO,
+    VOICE_RATIO_MARGIN,
     WHISPER_COMPUTE_TYPE,
     WHISPER_DEVICE,
     WHISPER_LANGUAGE,
@@ -67,17 +71,19 @@ def _is_whisper_cached(model_name: str) -> bool:
         return False
     return False
 
-# Cosine-distance thresholds. Edit here to retune speaker identification.
-_THRESH_MULTI = 0.55
-_THRESH_SOLO = 0.70
+# Cosine-distance thresholds. User-tunable via Settings → Advanced →
+# Speaker identification; defaults mirror the hard-coded values we shipped
+# before they became config keys.
+_THRESH_MULTI = VOICE_MATCH_THRESHOLD_MULTI
+_THRESH_SOLO = VOICE_MATCH_THRESHOLD_SOLO
 # Ratio test: best speaker must beat second-best by this margin. Rejects
 # ambiguous chunks where two voices are near-tied.
-_RATIO_MARGIN = 0.80
+_RATIO_MARGIN = VOICE_RATIO_MARGIN
 # Min embeddings a Voice needs before it participates in auto-matching. One
 # or two tagged snippets isn't enough signal — the k-NN match is unstable
 # and fires false-positives. Below the gate, a Voice only applies when the
 # user directly tags a line; live auto-ID stays silent until the pool grows.
-_MIN_VOICE_SAMPLES = 3
+_MIN_VOICE_SAMPLES = MIN_VOICE_SAMPLES
 
 
 def _valid_embedding(emb) -> bool:

@@ -150,6 +150,21 @@ _CONFIG_KEYS = {
     "rt_highlights_debounce_sec",
     "rt_highlights_max_interval_sec",
     "rt_highlights_window_sec",
+    # Advanced knobs — see the "Advanced Settings" section in the UI.
+    "chunk_duration",
+    "silence_duration",
+    "vad_threshold",
+    "aec_tail_ms",
+    "voice_match_threshold_multi",
+    "voice_match_threshold_solo",
+    "voice_ratio_margin",
+    "min_voice_samples",
+    "provisional_threshold",
+    "speculative_interval_sec",
+    "speculative_window_sec",
+    "obsidian_write_interval_sec",
+    "obsidian_write_chunks",
+    "daily_brief_auto_refresh",
 }
 
 # One-shot rename of the old LM-Studio-specific keys to provider-agnostic
@@ -259,6 +274,20 @@ def _cfg_float(cfg_key: str, default: float) -> float:
             return float(v)
         except ValueError:
             pass
+    return default
+
+
+def _cfg_bool(cfg_key: str, default: bool) -> bool:
+    """config.json value as a boolean. Accepts real JSON bools and common
+    string forms ('true', '1', 'yes', 'on') so the Settings UI can PATCH
+    either shape without the server caring."""
+    v = _user_config.get(cfg_key)
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, (int, float)):
+        return bool(v)
+    if isinstance(v, str):
+        return v.strip().lower() in ("true", "1", "yes", "on")
     return default
 
 
@@ -415,9 +444,65 @@ MY_SPEAKER_LABEL: str = _cfg_str("my_speaker_label", "Me")
 
 SAMPLE_RATE: int = 16_000
 CHANNELS: int = 1
-CHUNK_DURATION: float = 10.0      # seconds per transcription chunk
-SILENCE_DURATION: float = 0.6     # seconds of silence before ending an utterance
-VAD_THRESHOLD: float = 0.5
+# Seconds of audio per transcription chunk. Shorter = snappier partials,
+# more Whisper invocations; longer = fewer but more complete chunks.
+CHUNK_DURATION: float = _cfg_float("chunk_duration", 10.0)
+# Silence (seconds) needed before VAD considers an utterance finished.
+SILENCE_DURATION: float = _cfg_float("silence_duration", 0.6)
+# Silero VAD confidence threshold in [0.0, 1.0]. Raise for noisy rooms;
+# lower for quiet mics or whisperers.
+VAD_THRESHOLD: float = _cfg_float("vad_threshold", 0.5)
+
+# ── AEC (Speex acoustic echo canceller, pyaec) ───────────────────────────────
+#
+# Length of the linear filter tail the AEC keeps — effectively how far
+# back in time it can "remember" the loopback reference when cancelling
+# it out of the mic. Rooms with hard walls need a longer tail; headphone
+# users can go shorter. See capture.py for why 200ms was the sweet spot
+# on a typical desktop.
+AEC_TAIL_MS: int = _cfg_int("aec_tail_ms", 200)
+
+# ── Speaker identification thresholds ───────────────────────────────────────
+#
+# Cosine-distance gates for voice matching. Lower = stricter (fewer false
+# positives, more "Unknown"); higher = more permissive.
+VOICE_MATCH_THRESHOLD_MULTI: float = _cfg_float("voice_match_threshold_multi", 0.55)
+VOICE_MATCH_THRESHOLD_SOLO: float = _cfg_float("voice_match_threshold_solo", 0.70)
+# Ratio test — best candidate must beat runner-up by this factor.
+VOICE_RATIO_MARGIN: float = _cfg_float("voice_ratio_margin", 0.80)
+# Samples a Voice needs before it joins auto-matching. Below this, the
+# Voice only applies when the user tags a line directly.
+MIN_VOICE_SAMPLES: int = _cfg_int("min_voice_samples", 3)
+# Provisional-clustering threshold for in-meeting unknowns ("Speaker 1/2…").
+PROVISIONAL_THRESHOLD: float = _cfg_float("provisional_threshold", 0.50)
+
+# ── Live partials (speculative transcription loop) ──────────────────────────
+#
+# The partial bubble re-transcribes audio since the last committed chunk
+# boundary, capped at SPECULATIVE_WINDOW_SEC. That means the bubble
+# naturally accumulates your current sentence as you speak, instead of
+# sliding a fixed 4s window and appearing to "forget" the earlier words
+# before the real chunk lands. Cap is 30s by default; shorter values make
+# each partial pass cheaper at the cost of the bubble "forgetting" words
+# spoken more than N seconds ago.
+SPECULATIVE_INTERVAL_SEC: float = _cfg_float("speculative_interval_sec", 1.5)
+SPECULATIVE_WINDOW_SEC: float = _cfg_float("speculative_window_sec", 30.0)
+
+# ── Obsidian live-write throttle ────────────────────────────────────────────
+#
+# Write the live vault file when EITHER the interval OR the chunk count
+# gate trips — whichever fires first. Tuned to keep Obsidian Sync watchers
+# from thrashing during a long meeting.
+OBSIDIAN_WRITE_INTERVAL_SEC: float = _cfg_float("obsidian_write_interval_sec", 15.0)
+OBSIDIAN_WRITE_CHUNKS: int = _cfg_int("obsidian_write_chunks", 5)
+
+# ── Daily Brief auto-refresh ────────────────────────────────────────────────
+#
+# When True, finishing a meeting kicks off a background Daily Brief regen
+# for that meeting's date. Default is off — a regen is a long LLM call,
+# and most users would rather kick it off manually from the Daily Brief
+# page when they want it fresh.
+DAILY_BRIEF_AUTO_REFRESH: bool = _cfg_bool("daily_brief_auto_refresh", False)
 
 # ── Realtime intelligence (live highlights / action items / talking points) ──
 

@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import {
   Cpu, Mic, FolderCheck, FolderX, Sparkles, FileText, ExternalLink,
-  HardDrive, AlertTriangle, Languages, Users, Zap,
+  HardDrive, AlertTriangle, Languages, Users, Zap, SlidersHorizontal,
 } from "lucide-react";
 import { api } from "../lib/api";
 import type {
@@ -21,6 +21,18 @@ const SECTION_KEYS = {
   diarization: ["hf_token"] as ConfigKey[],
   obsidian: ["obsidian_vault"] as ConfigKey[],
   realtime: ["rt_highlights_debounce_sec", "rt_highlights_max_interval_sec", "rt_highlights_window_sec"] as ConfigKey[],
+  adv_chunking: ["chunk_duration", "silence_duration", "vad_threshold"] as ConfigKey[],
+  adv_aec: ["aec_tail_ms"] as ConfigKey[],
+  adv_speakers: [
+    "voice_match_threshold_multi",
+    "voice_match_threshold_solo",
+    "voice_ratio_margin",
+    "min_voice_samples",
+    "provisional_threshold",
+  ] as ConfigKey[],
+  adv_partials: ["speculative_interval_sec", "speculative_window_sec"] as ConfigKey[],
+  adv_obsidian: ["obsidian_write_interval_sec", "obsidian_write_chunks"] as ConfigKey[],
+  adv_daily_brief: ["daily_brief_auto_refresh"] as ConfigKey[],
 };
 
 // Per-field option lists for fields rendered as a <select>. Keys not listed
@@ -36,12 +48,34 @@ const NUMERIC_KEYS = new Set<ConfigKey>([
   "rt_highlights_debounce_sec",
   "rt_highlights_max_interval_sec",
   "rt_highlights_window_sec",
+  "chunk_duration",
+  "silence_duration",
+  "vad_threshold",
+  "aec_tail_ms",
+  "voice_match_threshold_multi",
+  "voice_match_threshold_solo",
+  "voice_ratio_margin",
+  "min_voice_samples",
+  "provisional_threshold",
+  "speculative_interval_sec",
+  "speculative_window_sec",
+  "obsidian_write_interval_sec",
+  "obsidian_write_chunks",
+]);
+
+// Boolean fields render as a three-way select (auto / on / off) and save
+// as real JSON booleans. "auto" clears the override so the built-in
+// default comes back on next restart.
+const BOOL_KEYS = new Set<ConfigKey>([
+  "daily_brief_auto_refresh",
 ]);
 
 // Stringifies a stored config value for display inside an <input>. Null /
-// undefined map to empty string (the "no override" signal on save).
-function valToDraft(v: string | number | null | undefined): string {
+// undefined map to empty string (the "no override" signal on save). Booleans
+// map to "on" / "off" so the select control can round-trip them cleanly.
+function valToDraft(v: string | number | boolean | null | undefined): string {
   if (v === null || v === undefined) return "";
+  if (typeof v === "boolean") return v ? "on" : "off";
   return String(v);
 }
 
@@ -121,6 +155,10 @@ export function Settings({ appStatus, obsidianConfigured }: Props) {
       const raw = (drafts[k] ?? "").trim();
       if (raw === "") {
         patch[k] = null;
+        continue;
+      }
+      if (BOOL_KEYS.has(k)) {
+        patch[k] = raw === "on" ? true : raw === "off" ? false : null;
         continue;
       }
       if (NUMERIC_KEYS.has(k)) {
@@ -210,8 +248,9 @@ export function Settings({ appStatus, obsidianConfigured }: Props) {
         <div>
           <h1 className="text-lg font-semibold text-gray-100">Settings &amp; System Status</h1>
           <p className="text-sm text-gray-400 mt-1">
-            All settings persist in <code className="text-gray-300">config.json</code> inside
-            the data directory — they move with your state folder across machines or reinstalls.
+            Everything you change here is saved to your data folder — copy that folder to a new
+            PC and all your settings come with you. Most changes take effect after restarting
+            AuraScribe.
           </p>
           {configNeedsRestart && (
             <div className="mt-3 flex items-start gap-2 px-3 py-2 rounded-lg border border-amber-700/50 bg-amber-900/20">
@@ -230,14 +269,13 @@ export function Settings({ appStatus, obsidianConfigured }: Props) {
             <h2 className="text-sm font-semibold text-gray-100">Data Directory</h2>
           </div>
           <p className="text-[11px] text-gray-500 mb-3">
-            One folder holds everything AuraScribe persists: transcript database,
-            per-meeting <code>.opus</code> recordings, and the local Whisper model
-            cache. Point a fresh install at the same folder on another machine — or
-            after reinstalling — to pick up right where you left off.
+            One folder holds all your AuraScribe data — the transcript database,
+            meeting audio recordings, and downloaded AI models. Point a new install at
+            the same folder to pick up right where you left off.
           </p>
 
           <PathField
-            label="State folder"
+            label="Data folder"
             value={dataDirDraft}
             onChange={setDataDirDraft}
             placeholder={dataDir?.default ?? ""}
@@ -288,8 +326,9 @@ export function Settings({ appStatus, obsidianConfigured }: Props) {
             <h2 className="text-sm font-semibold text-gray-100">Prompt Files</h2>
           </div>
           <p className="text-[11px] text-gray-500 mb-3">
-            User-editable templates that drive the live intelligence loop. Edits are picked
-            up on the next call — no restart needed.
+            Text files that tell the AI how to extract highlights, action items, and
+            talking points. Open them in any editor to tune the tone and style of
+            AuraScribe's AI — changes apply on the next request, no restart needed.
           </p>
           {prompts.length === 0 ? (
             <p className="text-xs text-gray-500 italic">No prompt files found.</p>
@@ -325,8 +364,8 @@ export function Settings({ appStatus, obsidianConfigured }: Props) {
         {/* ── LLM Provider ──────────────────────────────────────────── */}
         <ConfigSection
           icon={<Sparkles size={14} className="text-brand-400" />}
-          title="LLM Provider"
-          description="OpenAI-compatible endpoint used for summaries, live intelligence, and daily briefs. Works with LM Studio, OpenAI, OpenRouter, Gemini's OpenAI-compat endpoint, Anthropic via a compat proxy, etc."
+          title="AI Model (LLM)"
+          description="AuraScribe uses an AI chat model for meeting summaries, live coaching, and daily briefs. Point it at any OpenAI-compatible service — LM Studio or Ollama running on your PC, or a cloud provider like OpenAI, Gemini, OpenRouter, or Anthropic."
           sectionId="llm"
           keys={SECTION_KEYS.llm}
           isDirty={isDirty}
@@ -336,27 +375,27 @@ export function Settings({ appStatus, obsidianConfigured }: Props) {
           onSave={() => saveSection("llm", SECTION_KEYS.llm)}
         >
           <ConfigField cfg={cfg} drafts={drafts} onChange={setDraft}
-            k="llm_base_url" label="Base URL" hint="Root of the /v1/chat/completions endpoint. E.g. http://127.0.0.1:1234/v1 for LM Studio, https://api.openai.com/v1 for OpenAI." />
+            k="llm_base_url" label="Server address" hint="Where AuraScribe sends AI requests. Use http://127.0.0.1:1234/v1 for LM Studio on this PC, or https://api.openai.com/v1 for OpenAI." />
           <ConfigField cfg={cfg} drafts={drafts} onChange={setDraft}
-            k="llm_api_key" label="API key" type="password" hint="Provider's API key. LM Studio accepts any non-empty string." />
+            k="llm_api_key" label="API key" type="password" hint="Your provider's secret key. LM Studio and Ollama don't check it — any non-empty text works." />
           <ConfigField cfg={cfg} drafts={drafts} onChange={setDraft}
-            k="llm_model" label="Model id" hint="The exact id the provider expects (e.g. gpt-4o, gemini-2.0-flash, claude-sonnet-4-6, or the local model id)." />
+            k="llm_model" label="Model name" hint="The exact model name your provider uses — for example, gpt-4o, gemini-2.0-flash, or the name of a model you've loaded locally." />
           <TokenSlider cfg={cfg} drafts={drafts} onChange={setDraft}
             k="llm_context_tokens" label="Context window"
             stops={[4096, 8192, 16384, 32768, 65536, 131072, 262144, 524288, 1048576]}
-            hint="Total token budget of the chosen model. Used to size long-context calls like the Daily Brief." />
+            hint="How much text the model can read at once. Bigger models with larger windows let the Daily Brief cover more of your day in a single call." />
           <p className="text-[11px] text-gray-500 mt-1">
             Status: {lmModels.length > 0
-              ? `${lmModels.length} model(s) reachable — first is ${lmModels[0]}`
-              : "not reachable — check URL"}
+              ? `Connected — ${lmModels.length} model(s) available, first is ${lmModels[0]}`
+              : "Not reachable — check the server address above"}
           </p>
         </ConfigSection>
 
         {/* ── Speech & Transcription ───────────────────────────────── */}
         <ConfigSection
           icon={<Languages size={14} className="text-emerald-400" />}
-          title="Speech & Transcription"
-          description="faster-whisper model + device. Defaults auto-pick from your hardware; override anything below and restart to apply."
+          title="Speech Recognition"
+          description="Which Whisper model turns your audio into text, and whether it runs on your GPU or CPU. AuraScribe picks sensible defaults based on your hardware — only change these if you know what you're doing."
           sectionId="speech"
           keys={SECTION_KEYS.speech}
           isDirty={isDirty}
@@ -380,24 +419,24 @@ export function Settings({ appStatus, obsidianConfigured }: Props) {
             </div>
           )}
           <ConfigField cfg={cfg} drafts={drafts} onChange={setDraft}
-            k="whisper_model" label="Whisper model" hint="e.g. large-v3-turbo, large-v3, medium, small, base, tiny" />
+            k="whisper_model" label="Whisper model" hint="Bigger models are more accurate but need more GPU/CPU. Options: large-v3-turbo (best on GPU), large-v3, medium, small, base, tiny." />
           <ConfigField cfg={cfg} drafts={drafts} onChange={setDraft}
-            k="whisper_device" label="Device"
-            hint="cuda uses your NVIDIA GPU; cpu runs everywhere but is 5–10× slower." />
+            k="whisper_device" label="Runs on"
+            hint="cuda uses your NVIDIA GPU (fast). cpu works on any PC but is 5–10× slower." />
           <ConfigField cfg={cfg} drafts={drafts} onChange={setDraft}
-            k="whisper_compute_type" label="Compute precision"
-            hint="float16 = fast (GPU only). int8_float16 = half VRAM. int8 = smallest (CPU-friendly)." />
+            k="whisper_compute_type" label="Precision"
+            hint="Trade speed for memory. float16 is fastest (GPU only). int8 uses the least memory. int8_float16 is a middle ground for smaller GPUs." />
           <ConfigField cfg={cfg} drafts={drafts} onChange={setDraft}
-            k="whisper_language" label="Language" hint="ISO code. en, es, fr, de, …" />
+            k="whisper_language" label="Language" hint="Two-letter language code: en for English, es for Spanish, fr for French, de for German, etc. Leave blank to auto-detect." />
           <ConfigField cfg={cfg} drafts={drafts} onChange={setDraft}
-            k="my_speaker_label" label="Your speaker label" hint="How you appear in transcripts." />
+            k="my_speaker_label" label="Your name in transcripts" hint="The label that appears next to your lines (e.g. Me, Tarun, Alex)." />
         </ConfigSection>
 
         {/* ── Diarization (HuggingFace token) ──────────────────────── */}
         <ConfigSection
           icon={<Users size={14} className="text-purple-400" />}
-          title="Speaker Diarization"
-          description="HuggingFace access token for downloading the pyannote speaker-diarization model."
+          title="Speaker Identification"
+          description="AuraScribe uses a free HuggingFace model to tell speakers apart. Paste your access token here once, and remember to accept the model licence on the three pyannote pages on huggingface.co."
           sectionId="diarization"
           keys={SECTION_KEYS.diarization}
           isDirty={isDirty}
@@ -407,8 +446,8 @@ export function Settings({ appStatus, obsidianConfigured }: Props) {
           onSave={() => saveSection("diarization", SECTION_KEYS.diarization)}
         >
           <ConfigField cfg={cfg} drafts={drafts} onChange={setDraft}
-            k="hf_token" label="HF access token" type="password"
-            hint="Generate at huggingface.co/settings/tokens; needs read access to pyannote/* models." />
+            k="hf_token" label="HuggingFace token" type="password"
+            hint="Get a free token at huggingface.co/settings/tokens, then accept the licences on the pyannote/speaker-diarization-3.1, pyannote/segmentation-3.0, and pyannote/wespeaker-voxceleb-resnet34-LM pages." />
         </ConfigSection>
 
         {/* ── Obsidian (editable vault path) ───────────────────────── */}
@@ -417,7 +456,7 @@ export function Settings({ appStatus, obsidianConfigured }: Props) {
             ? <FolderCheck size={14} className="text-emerald-400" />
             : <FolderX size={14} className="text-gray-500" />}
           title="Obsidian Integration"
-          description="Optional: mirror meetings, people notes, and daily briefs into your vault as Markdown."
+          description="Optional — mirror your meetings, people notes, and daily briefs into an Obsidian vault as Markdown files so they show up alongside your other notes."
           sectionId="obsidian"
           keys={SECTION_KEYS.obsidian}
           isDirty={isDirty}
@@ -427,10 +466,10 @@ export function Settings({ appStatus, obsidianConfigured }: Props) {
           onSave={() => saveSection("obsidian", SECTION_KEYS.obsidian)}
         >
           <ConfigField cfg={cfg} drafts={drafts} onChange={setDraft}
-            k="obsidian_vault" label="Vault path"
-            hint="Absolute path to your Obsidian vault. Leave empty to disable." />
+            k="obsidian_vault" label="Vault folder"
+            hint="Full path to your Obsidian vault folder. Leave empty to skip writing Markdown files." />
           <p className="text-[11px] text-gray-500 mt-1">
-            Meetings land under <code>&lt;vault&gt;\AuraScribe\Meetings\</code>; people notes under <code>People\</code>.
+            Meetings are saved under <code>&lt;vault&gt;\AuraScribe\Meetings\</code>, people notes under <code>People\</code>, and daily briefs under <code>Daily\</code>.
           </p>
         </ConfigSection>
 
@@ -438,7 +477,7 @@ export function Settings({ appStatus, obsidianConfigured }: Props) {
         <ConfigSection
           icon={<Zap size={14} className="text-amber-400" />}
           title="Live Intelligence"
-          description="How often the live-intel loop refires against the local LLM. Lower debounce = snappier panel, more load."
+          description="Controls how often the AI re-reads the meeting during recording to extract highlights and suggest talking points. Lower values feel snappier; higher values go easier on the AI model."
           sectionId="realtime"
           keys={SECTION_KEYS.realtime}
           isDirty={isDirty}
@@ -448,14 +487,159 @@ export function Settings({ appStatus, obsidianConfigured }: Props) {
           onSave={() => saveSection("realtime", SECTION_KEYS.realtime)}
         >
           <ConfigField cfg={cfg} drafts={drafts} onChange={setDraft}
-            k="rt_highlights_debounce_sec" label="Debounce (sec)" type="number"
-            hint="Fire this many seconds after the last new utterance." />
+            k="rt_highlights_debounce_sec" label="Wait after pause (seconds)" type="number"
+            hint="How long to wait after someone stops talking before asking the AI for fresh highlights." />
           <ConfigField cfg={cfg} drafts={drafts} onChange={setDraft}
-            k="rt_highlights_max_interval_sec" label="Max interval (sec)" type="number"
-            hint="Hard cap between refreshes during nonstop speech." />
+            k="rt_highlights_max_interval_sec" label="Maximum wait (seconds)" type="number"
+            hint="Even if people keep talking nonstop, refresh at least this often so the panel doesn't go stale." />
           <ConfigField cfg={cfg} drafts={drafts} onChange={setDraft}
-            k="rt_highlights_window_sec" label="Context window (sec)" type="number"
-            hint="Recent transcript window the LLM sees each call." />
+            k="rt_highlights_window_sec" label="Conversation window (seconds)" type="number"
+            hint="How many seconds of recent conversation the AI sees each time it refreshes." />
+        </ConfigSection>
+
+        {/* ── Advanced Settings ────────────────────────────────────── */}
+        <section className="rounded-xl border border-amber-900/40 bg-amber-950/10 p-4">
+          <div className="flex items-center gap-2 mb-2">
+            <SlidersHorizontal size={14} className="text-amber-400" />
+            <h2 className="text-sm font-semibold text-gray-100">Advanced Settings</h2>
+          </div>
+          <p className="text-[11px] text-amber-200/80">
+            Expert-level knobs that control how AuraScribe listens, transcribes, and
+            identifies speakers. The defaults work well for most people — only touch
+            these if something specific feels off, and revert to <em>auto</em> if you're unsure.
+          </p>
+        </section>
+
+        {/* ── Advanced: Audio chunking ────────────────────────────── */}
+        <ConfigSection
+          icon={<Languages size={14} className="text-emerald-400/70" />}
+          title="Audio chunking & voice detection"
+          description="How AuraScribe slices continuous audio into sentences for transcription. Tweak these only if sentences are being cut in half, merged together, or if speech isn't being detected in your environment."
+          sectionId="adv_chunking"
+          keys={SECTION_KEYS.adv_chunking}
+          isDirty={isDirty}
+          savingSection={savingSection}
+          sectionErrors={sectionErrors}
+          sectionSavedAt={sectionSavedAt}
+          onSave={() => saveSection("adv_chunking", SECTION_KEYS.adv_chunking)}
+        >
+          <ConfigField cfg={cfg} drafts={drafts} onChange={setDraft}
+            k="chunk_duration" label="Chunk length (seconds)" type="number"
+            hint="How many seconds of audio AuraScribe transcribes at a time. Shorter = faster partial results; longer = fewer but more complete sentences." />
+          <ConfigField cfg={cfg} drafts={drafts} onChange={setDraft}
+            k="silence_duration" label="End-of-sentence pause (seconds)" type="number"
+            hint="How long a pause must be before AuraScribe treats it as the end of a sentence. Lower for fast talkers, higher for thoughtful speakers." />
+          <ConfigField cfg={cfg} drafts={drafts} onChange={setDraft}
+            k="vad_threshold" label="Speech detection sensitivity (0 – 1)" type="number"
+            hint="How confident AuraScribe needs to be that a sound is speech. Raise in noisy rooms; lower if a quiet mic or whispers are being missed." />
+        </ConfigSection>
+
+        {/* ── Advanced: Echo cancellation ─────────────────────────── */}
+        <ConfigSection
+          icon={<Zap size={14} className="text-amber-400/70" />}
+          title="Echo cancellation (Mix mode)"
+          description="Only matters in Mix mode, where AuraScribe captures both your mic and your speakers and has to cancel the speaker audio out of the mic signal."
+          sectionId="adv_aec"
+          keys={SECTION_KEYS.adv_aec}
+          isDirty={isDirty}
+          savingSection={savingSection}
+          sectionErrors={sectionErrors}
+          sectionSavedAt={sectionSavedAt}
+          onSave={() => saveSection("adv_aec", SECTION_KEYS.adv_aec)}
+        >
+          <ConfigField cfg={cfg} drafts={drafts} onChange={setDraft}
+            k="aec_tail_ms" label="Echo memory (milliseconds)" type="number"
+            hint="How long the echo canceller 'remembers' speaker audio when removing it from your mic. Raise this if Mix mode still sounds reverberant in a large room; lower it if your voice sounds muffled." />
+        </ConfigSection>
+
+        {/* ── Advanced: Speaker identification ────────────────────── */}
+        <ConfigSection
+          icon={<Users size={14} className="text-purple-400/70" />}
+          title="Speaker identification tuning"
+          description="How strict AuraScribe is when matching voices against people you've tagged. Tighten these if unknown speakers get labelled as someone they aren't; loosen them if tagged speakers keep coming back as 'Unknown'."
+          sectionId="adv_speakers"
+          keys={SECTION_KEYS.adv_speakers}
+          isDirty={isDirty}
+          savingSection={savingSection}
+          sectionErrors={sectionErrors}
+          sectionSavedAt={sectionSavedAt}
+          onSave={() => saveSection("adv_speakers", SECTION_KEYS.adv_speakers)}
+        >
+          <ConfigField cfg={cfg} drafts={drafts} onChange={setDraft}
+            k="voice_match_threshold_multi" label="Match strictness — group meetings (0 – 1)" type="number"
+            hint="How similar a voice must be to match a known speaker when there are multiple people in the room. Lower = stricter, fewer false matches." />
+          <ConfigField cfg={cfg} drafts={drafts} onChange={setDraft}
+            k="voice_match_threshold_solo" label="Match strictness — solo (0 – 1)" type="number"
+            hint="Same as above, but used when only one person has spoken so far. More forgiving because there's no one else to confuse with." />
+          <ConfigField cfg={cfg} drafts={drafts} onChange={setDraft}
+            k="voice_ratio_margin" label="Runner-up margin (0 – 1)" type="number"
+            hint="How much better the top match must be than the second-best. Lower values are pickier — useful when two of your tagged voices sound similar." />
+          <ConfigField cfg={cfg} drafts={drafts} onChange={setDraft}
+            k="min_voice_samples" label="Samples before auto-matching" type="number"
+            hint="How many tagged audio snippets a Voice needs before AuraScribe starts auto-assigning lines to it. Higher = more patient, fewer early mistakes." />
+          <ConfigField cfg={cfg} drafts={drafts} onChange={setDraft}
+            k="provisional_threshold" label="Split unknown speakers (0 – 1)" type="number"
+            hint="How aggressively unknown voices are split into 'Speaker 1', 'Speaker 2'… during a live meeting. Lower = eager to split; higher = likely to merge different people." />
+        </ConfigSection>
+
+        {/* ── Advanced: Live partials ─────────────────────────────── */}
+        <ConfigSection
+          icon={<Zap size={14} className="text-brand-400/70" />}
+          title="Live partial transcription"
+          description="AuraScribe shows a partial sentence bubble while you're still talking, updated a few times a second. These knobs control how often that bubble refreshes and how much audio it re-reads."
+          sectionId="adv_partials"
+          keys={SECTION_KEYS.adv_partials}
+          isDirty={isDirty}
+          savingSection={savingSection}
+          sectionErrors={sectionErrors}
+          sectionSavedAt={sectionSavedAt}
+          onSave={() => saveSection("adv_partials", SECTION_KEYS.adv_partials)}
+        >
+          <ConfigField cfg={cfg} drafts={drafts} onChange={setDraft}
+            k="speculative_interval_sec" label="Refresh every (seconds)" type="number"
+            hint="How often AuraScribe re-transcribes your current sentence. Lower = snappier updates, more GPU/CPU work." />
+          <ConfigField cfg={cfg} drafts={drafts} onChange={setDraft}
+            k="speculative_window_sec" label="Maximum bubble length (seconds)" type="number"
+            hint="How many seconds of audio the partial bubble can show at most. The bubble accumulates what you say since the last full line landed, up to this cap. Bigger = more peace of mind; smaller = cheaper per refresh." />
+        </ConfigSection>
+
+        {/* ── Advanced: Obsidian write cadence ────────────────────── */}
+        <ConfigSection
+          icon={<FolderCheck size={14} className="text-emerald-400/70" />}
+          title="Obsidian write cadence"
+          description="How often the Markdown file in your Obsidian vault gets updated during a live meeting. Higher values mean fewer file writes — easier on Obsidian Sync and cloud backups."
+          sectionId="adv_obsidian"
+          keys={SECTION_KEYS.adv_obsidian}
+          isDirty={isDirty}
+          savingSection={savingSection}
+          sectionErrors={sectionErrors}
+          sectionSavedAt={sectionSavedAt}
+          onSave={() => saveSection("adv_obsidian", SECTION_KEYS.adv_obsidian)}
+        >
+          <ConfigField cfg={cfg} drafts={drafts} onChange={setDraft}
+            k="obsidian_write_interval_sec" label="Update at least every (seconds)" type="number"
+            hint="Update the live meeting file in Obsidian after this many seconds…" />
+          <ConfigField cfg={cfg} drafts={drafts} onChange={setDraft}
+            k="obsidian_write_chunks" label="…or every N new chunks" type="number"
+            hint="…or after this many new transcript chunks have arrived — whichever comes first." />
+        </ConfigSection>
+
+        {/* ── Advanced: Daily Brief auto-refresh ──────────────────── */}
+        <ConfigSection
+          icon={<FileText size={14} className="text-amber-400/70" />}
+          title="Daily Brief auto-refresh"
+          description="The Daily Brief rolls up every meeting on a given date into one briefing — tl;dr, decisions, action items, and coaching notes."
+          sectionId="adv_daily_brief"
+          keys={SECTION_KEYS.adv_daily_brief}
+          isDirty={isDirty}
+          savingSection={savingSection}
+          sectionErrors={sectionErrors}
+          sectionSavedAt={sectionSavedAt}
+          onSave={() => saveSection("adv_daily_brief", SECTION_KEYS.adv_daily_brief)}
+        >
+          <ConfigField cfg={cfg} drafts={drafts} onChange={setDraft}
+            k="daily_brief_auto_refresh" label="Rebuild after every meeting"
+            hint="When on, the Daily Brief regenerates in the background each time a meeting ends. Turn off to save AI calls and rebuild it manually from the Daily Briefs page." />
         </ConfigSection>
 
         {cfg?.config_file && (
@@ -467,10 +651,10 @@ export function Settings({ appStatus, obsidianConfigured }: Props) {
         <section className="rounded-xl border border-gray-800 bg-gray-900/40 p-4">
           <div className="flex items-center gap-2 mb-3">
             <Mic size={14} className="text-gray-400" />
-            <h2 className="text-sm font-semibold text-gray-100">Audio</h2>
+            <h2 className="text-sm font-semibold text-gray-100">Audio (read-only)</h2>
           </div>
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-            <Field label="Input devices detected">
+            <Field label="Microphones detected">
               <span className="text-sm text-gray-200">{appStatus?.audio_devices.length ?? 0} device(s)</span>
               <ul className="text-[11px] text-gray-500 mt-1 space-y-0.5 max-h-24 overflow-y-auto scrollbar-thin">
                 {(appStatus?.audio_devices ?? []).slice(0, 6).map((d) => (
@@ -482,22 +666,9 @@ export function Settings({ appStatus, obsidianConfigured }: Props) {
               </ul>
             </Field>
             <Field label="Sample rate">
-              <span className="text-sm text-gray-200 font-mono">16 kHz (auto-resampled via soxr)</span>
+              <span className="text-sm text-gray-200 font-mono">16 kHz (auto-resampled)</span>
             </Field>
           </div>
-        </section>
-
-        <section className="rounded-xl border border-gray-800 bg-gray-900/40 p-4">
-          <div className="flex items-center gap-2 mb-3">
-            <Cpu size={14} className="text-gray-400" />
-            <h2 className="text-sm font-semibold text-gray-100">GPU</h2>
-          </div>
-          <Field label="Compute">
-            <span className="text-sm text-gray-200 font-mono">CUDA 13 · RTX 5090 (Blackwell)</span>
-            <span className="text-[11px] text-gray-500 block mt-1">
-              Live VRAM/latency monitoring comes in Phase 2 (needs nvidia-smi poller).
-            </span>
-          </Field>
         </section>
       </div>
     </div>
@@ -600,14 +771,27 @@ function ConfigField({ cfg, drafts, onChange, k, label, type = "text", hint, opt
   const overridden = field?.override !== null && field?.override !== undefined;
   const effective = field?.effective;
   const defaultVal = field?.default;
-  const placeholder = defaultVal !== null && defaultVal !== undefined ? String(defaultVal) : "";
+  const isBool = BOOL_KEYS.has(k);
+  const placeholder = defaultVal !== null && defaultVal !== undefined
+    ? (isBool && typeof defaultVal === "boolean" ? (defaultVal ? "on" : "off") : String(defaultVal))
+    : "";
   // "currently using" only adds signal when it differs from the draft.
   // Secrets stay redacted so screenshots of the settings page don't leak.
+  // Booleans render as on/off rather than JSON true/false.
   const effectiveDisplay = type === "password"
     ? (effective ? "••••••" : "(empty)")
-    : (effective !== null && effective !== undefined ? String(effective) : "(empty)");
-  const showEffective = effective != null && String(effective) !== value;
-  const resolvedOptions = options ?? ENUM_OPTIONS[k];
+    : effective === null || effective === undefined
+    ? "(empty)"
+    : typeof effective === "boolean"
+    ? (effective ? "on" : "off")
+    : String(effective);
+  const effectiveDraftForm = effective === null || effective === undefined
+    ? ""
+    : typeof effective === "boolean"
+    ? (effective ? "on" : "off")
+    : String(effective);
+  const showEffective = effective != null && effectiveDraftForm !== value;
+  const resolvedOptions = options ?? (isBool ? (["on", "off"] as const) : ENUM_OPTIONS[k]);
 
   return (
     <div>

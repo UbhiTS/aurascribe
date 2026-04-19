@@ -93,6 +93,26 @@ _CONFIG_FIELDS: list[tuple[str, object]] = [
     ("rt_highlights_debounce_sec",     20.0),
     ("rt_highlights_max_interval_sec", 60.0),
     ("rt_highlights_window_sec",       180.0),
+    # Advanced — chunking + VAD
+    ("chunk_duration",                 10.0),
+    ("silence_duration",               0.6),
+    ("vad_threshold",                  0.5),
+    # Advanced — echo cancellation
+    ("aec_tail_ms",                    200),
+    # Advanced — speaker identification
+    ("voice_match_threshold_multi",    0.55),
+    ("voice_match_threshold_solo",     0.70),
+    ("voice_ratio_margin",             0.80),
+    ("min_voice_samples",              3),
+    ("provisional_threshold",          0.50),
+    # Advanced — live partials
+    ("speculative_interval_sec",       1.5),
+    ("speculative_window_sec",         30.0),
+    # Advanced — Obsidian write cadence
+    ("obsidian_write_interval_sec",    15.0),
+    ("obsidian_write_chunks",          5),
+    # Advanced — Daily Brief
+    ("daily_brief_auto_refresh",       False),
 ]
 
 
@@ -115,6 +135,20 @@ def _effective_for(key: str) -> object:
         "rt_highlights_debounce_sec":     config.RT_HIGHLIGHTS_DEBOUNCE_SEC,
         "rt_highlights_max_interval_sec": config.RT_HIGHLIGHTS_MAX_INTERVAL_SEC,
         "rt_highlights_window_sec":       config.RT_HIGHLIGHTS_WINDOW_SEC,
+        "chunk_duration":                 config.CHUNK_DURATION,
+        "silence_duration":               config.SILENCE_DURATION,
+        "vad_threshold":                  config.VAD_THRESHOLD,
+        "aec_tail_ms":                    config.AEC_TAIL_MS,
+        "voice_match_threshold_multi":    config.VOICE_MATCH_THRESHOLD_MULTI,
+        "voice_match_threshold_solo":     config.VOICE_MATCH_THRESHOLD_SOLO,
+        "voice_ratio_margin":             config.VOICE_RATIO_MARGIN,
+        "min_voice_samples":              config.MIN_VOICE_SAMPLES,
+        "provisional_threshold":          config.PROVISIONAL_THRESHOLD,
+        "speculative_interval_sec":       config.SPECULATIVE_INTERVAL_SEC,
+        "speculative_window_sec":         config.SPECULATIVE_WINDOW_SEC,
+        "obsidian_write_interval_sec":    config.OBSIDIAN_WRITE_INTERVAL_SEC,
+        "obsidian_write_chunks":          config.OBSIDIAN_WRITE_CHUNKS,
+        "daily_brief_auto_refresh":       config.DAILY_BRIEF_AUTO_REFRESH,
     }
     return readers[key]
 
@@ -136,6 +170,21 @@ class UserConfigUpdate(BaseModel):
     rt_highlights_debounce_sec: float | None = None
     rt_highlights_max_interval_sec: float | None = None
     rt_highlights_window_sec: float | None = None
+    # Advanced knobs.
+    chunk_duration: float | None = None
+    silence_duration: float | None = None
+    vad_threshold: float | None = None
+    aec_tail_ms: int | None = None
+    voice_match_threshold_multi: float | None = None
+    voice_match_threshold_solo: float | None = None
+    voice_ratio_margin: float | None = None
+    min_voice_samples: int | None = None
+    provisional_threshold: float | None = None
+    speculative_interval_sec: float | None = None
+    speculative_window_sec: float | None = None
+    obsidian_write_interval_sec: float | None = None
+    obsidian_write_chunks: int | None = None
+    daily_brief_auto_refresh: bool | None = None
 
 
 def _config_response() -> dict:

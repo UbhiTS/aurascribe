@@ -20,7 +20,16 @@ import aiosqlite
 import numpy as np
 
 from aurascribe.audio.capture import AudioCapture
-from aurascribe.config import AUDIO_DIR, DB_PATH, SAMPLE_RATE
+from aurascribe.config import (
+    AUDIO_DIR,
+    DB_PATH,
+    OBSIDIAN_WRITE_CHUNKS,
+    OBSIDIAN_WRITE_INTERVAL_SEC,
+    PROVISIONAL_THRESHOLD,
+    SAMPLE_RATE,
+    SPECULATIVE_INTERVAL_SEC,
+    SPECULATIVE_WINDOW_SEC,
+)
 from aurascribe.llm.client import chat
 from aurascribe.llm.prompts import (
     MEETING_SUMMARY_SYSTEM,
@@ -46,16 +55,17 @@ log = logging.getLogger("aurascribe")
 # for enrolled speakers — centroids stay stable as the meeting grows instead of
 # drifting more permissive with every added embedding. Edit here if speakers
 # merge too eagerly (lower) or split across many labels (raise).
-_PROVISIONAL_THRESH = 0.50
+_PROVISIONAL_THRESH = PROVISIONAL_THRESHOLD
 _PROVISIONAL_LABEL_RE = re.compile(r"^Speaker \d+$")
 
 # Vault-write throttle for the live recording loop. We want the file to look
 # alive, but writing on every ~10s chunk thrashes Obsidian sync watchers.
 # Write only when EITHER the time gate OR the chunk gate trips — whichever
 # fires first. The intel loop's writes naturally reset both via the writer
-# module's shared throttle state.
-_VAULT_WRITE_INTERVAL_SEC = 15.0
-_VAULT_WRITE_CHUNKS = 5
+# module's shared throttle state. Both gates are user-tunable via
+# Settings → Advanced → Obsidian Write Cadence.
+_VAULT_WRITE_INTERVAL_SEC = OBSIDIAN_WRITE_INTERVAL_SEC
+_VAULT_WRITE_CHUNKS = OBSIDIAN_WRITE_CHUNKS
 
 UtteranceCallback = Callable[[str, list[Utterance]], Awaitable[None]]
 PartialCallback = Callable[[str, str, str], Awaitable[None]]
@@ -108,6 +118,14 @@ class MeetingManager:
         self._task: asyncio.Task | None = None
         self._spec_task: asyncio.Task | None = None
         self._transcribe_sem = asyncio.Semaphore(1)
+        # Capture wall-clock (seconds since recording started) of the end
+        # of the last committed VAD chunk. Drives the speculative-partial
+        # window: each partial pass transcribes audio SINCE this anchor
+        # (capped at SPECULATIVE_WINDOW_SEC) so the partial bubble shows
+        # everything the user's said since the last real utterance landed,
+        # instead of a sliding fixed-width window that appears to forget
+        # earlier words.
+        self._partial_anchor_wall: float = 0.0
         # Captured at `initialize()` time (always called from the sidecar
         # event loop during FastAPI lifespan). Reused by the audio-thread
         # level shim to schedule async broadcasts without importing
@@ -226,6 +244,11 @@ class MeetingManager:
             log.warning("Opus recording unavailable for %s: %s", meeting_id, e)
 
         await self.intel.prepare_meeting(meeting_id)
+        # Seed the partial anchor to the current capture wall-clock so the
+        # first partial only covers audio captured FROM THIS POINT ON —
+        # monitor-mode audio that preceded the Start button shouldn't bleed
+        # into the partial bubble.
+        self._partial_anchor_wall = self.capture.wall_clock_seconds()
         self._task = asyncio.create_task(self._record_loop(meeting_id))
         self._spec_task = asyncio.create_task(self._speculative_loop(meeting_id))
         await self._emit_status("recording", {"meeting_id": meeting_id, "title": title})
@@ -302,6 +325,11 @@ class MeetingManager:
             # walks back to the first sample of this chunk.
             chunk_wall_end = self.capture.wall_clock_seconds()
             chunk_wall_start = max(0.0, chunk_wall_end - chunk_duration)
+            # Advance the partial anchor so the speculative loop's next
+            # pass looks at audio AFTER this chunk, not audio this chunk
+            # already consumed. Set before the await so a slow transcribe
+            # doesn't leave the partial window straddling the chunk.
+            self._partial_anchor_wall = chunk_wall_end
             log.info(f"Transcribing chunk: {chunk_duration:.1f}s of audio")
             try:
                 async with self._transcribe_sem:
@@ -384,16 +412,30 @@ class MeetingManager:
             log.warning("Could not delete stale vault file %s: %s", path, e)
 
     async def _speculative_loop(self, meeting_id: str) -> None:
-        """Every 1.5s, transcribe the last 4s of audio for live partial display."""
-        await asyncio.sleep(1.5)
+        """Periodically re-transcribe everything since the last committed
+        chunk so the partial bubble accumulates the user's current sentence
+        rather than sliding a fixed-width tail window. Capped at
+        SPECULATIVE_WINDOW_SEC to keep per-pass cost bounded (and below the
+        capture ring's 30s maxlen). Interval + cap are user-tunable via
+        Settings → Advanced → Live partial transcription."""
+        interval = max(0.25, float(SPECULATIVE_INTERVAL_SEC))
+        max_window = max(1.0, float(SPECULATIVE_WINDOW_SEC))
+        await asyncio.sleep(interval)
         while self._running:
             try:
-                await asyncio.sleep(1.5)
+                await asyncio.sleep(interval)
                 if not self._running:
                     break
                 if self._transcribe_sem.locked():
                     continue
-                audio = self.capture.get_recent_audio(seconds=4.0)
+                # Grow the partial window from the last committed chunk
+                # boundary. Clamps: at least 1s (can't transcribe shorter
+                # reliably); at most SPECULATIVE_WINDOW_SEC (stays below
+                # the ring's 30s maxlen and bounds per-pass work).
+                now_wall = self.capture.wall_clock_seconds()
+                elapsed = max(0.0, now_wall - self._partial_anchor_wall)
+                window = min(max_window, max(1.0, elapsed))
+                audio = self.capture.get_recent_audio(seconds=window)
                 if audio is None or len(audio) < int(SAMPLE_RATE * 1.0):
                     continue
                 async with self._transcribe_sem:
@@ -412,7 +454,13 @@ class MeetingManager:
                             speaker = self._match_provisional(meeting_id, emb)
                         except Exception:
                             pass
-                    await self._emit_partial(meeting_id, speaker, first.text)
+                    # Concat all utterances from the window so the partial
+                    # shows the entire current sentence, not just the first
+                    # Whisper segment. Speaker attribution on the partial
+                    # is best-effort — the real chunk will re-diarize.
+                    text = " ".join(u.text.strip() for u in utterances if u.text.strip())
+                    if text:
+                        await self._emit_partial(meeting_id, speaker, text)
             except asyncio.CancelledError:
                 raise
             except Exception as e:

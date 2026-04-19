@@ -71,6 +71,11 @@ On first launch you'll see a welcome dialog describing what hardware was detecte
 - **Header chips** show exactly where each pipeline is running — `Whisper · large-v3-turbo · GPU` and `Diarize · GPU` (emerald) or `CPU` (amber). You always know where the compute is happening.
 - **Override anything** — Settings → Speech & Transcription has dropdowns for `whisper_device`, `whisper_compute_type`, and a free-text model field. Auto-detect comes back when you clear the override.
 
+### Audio capture
+- **Three source modes** — **Microphone**, **System Audio** (WASAPI loopback off your speakers, captures remote participants in Zoom/Teams/Meet), or **Mix (Mic + System Audio)** with Speex-AEC cancelling the loopback echo out of the mic signal so you don't get doubled transcripts when running speakers-in-room. Last-used mode + mic + speaker are remembered by device name across restarts, with graceful fallback to the OS defaults when a device disappears.
+- **Pre-recording monitor** — the VU meter and live waveform animate against the *selected* source before you hit Start, so you can verify the right mic/speaker is picked and that the signal looks healthy. The sidecar broadcasts `audio_level` frames at ~30Hz over the WebSocket; the renderer uses them directly when fresh, falling back to the browser `AnalyserNode` when the sidecar is idle.
+- **Mic-permission detection** — `PortAudioError` on stream-open is translated to a structured 403 with `kind=permission`. The frontend shows a modal with a one-click "Open Windows mic settings" button that launches `ms-settings:privacy-microphone`.
+
 ### Transcription
 - **Live transcription** — ~10s VAD-gated chunks through faster-whisper. Silence between utterances is skipped.
 - **Speculative partials** — a 1.5s speculative loop transcribes the tail of the audio buffer so a partial line appears while you speak, updated until the next chunk finalizes.
@@ -110,7 +115,6 @@ On first launch you'll see a welcome dialog describing what hardware was detecte
 - **CPU-mode chip** — amber `CPU mode` badge + tooltip with the fix hint if Whisper is stuck on CPU despite the app expecting a GPU.
 
 ### Error handling / diagnostics
-- **Mic permission detection** — `PortAudioError` on stream-open is translated to a structured 403 with `kind=permission`. The frontend shows a modal with a one-click "Open Windows mic settings" button that launches `ms-settings:privacy-microphone`.
 - **React error boundary** — a blank-screen render error becomes a recoverable card with the message, component stack, and a Reload button. Your recording keeps running in the sidecar.
 - **Sidecar crash dumps** — `sys.excepthook` writes `crash-YYYYMMDD-HHMMSS.log` under `APP_DATA/logs/` with full traceback before exit.
 - **Rust panic hook** — panics during Tauri startup write `crash-<unix-secs>-rust.log` to `%APPDATA%\AuraScribe\logs\` alongside the Python crashes.
@@ -148,6 +152,27 @@ User-editable knobs (all in Settings UI, persisted to `config.json`):
 | `rt_highlights_debounce_sec` | `20` | Seconds after last utterance before an intel call fires |
 | `rt_highlights_max_interval_sec` | `60` | Hard cap between intel calls during continuous speech |
 | `rt_highlights_window_sec` | `180` | Transcript window the intel LLM sees |
+
+### Advanced Settings
+
+Expert-level knobs exposed via the **Advanced Settings** block at the bottom of the Settings page. Defaults match the values that shipped hard-coded before these became user-tunable — you shouldn't need to touch any of them unless you hit a specific behavior you want to tune.
+
+| Key | Default | Purpose |
+|---|---|---|
+| `chunk_duration` | `10.0` | Seconds of audio per transcription chunk. Shorter = faster partials, more Whisper calls. |
+| `silence_duration` | `0.6` | Seconds of silence before VAD ends an utterance. Lower for fast talkers. |
+| `vad_threshold` | `0.5` | Silero VAD confidence gate [0–1]. Raise in noisy rooms; lower for quiet mics. |
+| `aec_tail_ms` | `200` | Echo-canceller tail length (ms) in Mix mode. Longer handles more room reverb; shorter converges faster. |
+| `voice_match_threshold_multi` | `0.55` | Cosine-distance gate for speaker match in group meetings. Lower = stricter. |
+| `voice_match_threshold_solo` | `0.70` | Same, but used when only one speaker has been heard so far. |
+| `voice_ratio_margin` | `0.80` | Best match must beat runner-up by this factor. Lower = pickier. |
+| `min_voice_samples` | `3` | Samples a Voice needs before it joins auto-matching. |
+| `provisional_threshold` | `0.50` | Cosine gate for clustering in-meeting unknowns into `Speaker 1/2/…`. |
+| `speculative_interval_sec` | `1.5` | How often the live-partial loop re-transcribes the current sentence. |
+| `speculative_window_sec` | `30.0` | Max seconds the partial bubble can show. It grows from the last committed chunk boundary up to this cap, so the bubble accumulates what's been said since the last full line — giving the user visible confirmation that nothing's been lost. |
+| `obsidian_write_interval_sec` | `15.0` | Update the live vault file at least this often during a meeting. |
+| `obsidian_write_chunks` | `5` | Or every N new chunks — whichever fires first. |
+| `daily_brief_auto_refresh` | `false` | When `true`, every finished meeting kicks off a Daily Brief regen in the background. Off by default — regen is a long LLM call; use the Refresh button on the Daily Brief page when you want it fresh. |
 
 Settings UI shows the detected hardware next to the Speech section (e.g. `Detected: cuda · NVIDIA GeForce RTX 4090 · 24 GB VRAM`) and marks each override with a `custom` or `default` chip so you can see at a glance which values came from you vs the auto-detect.
 

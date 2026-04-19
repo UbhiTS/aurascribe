@@ -80,8 +80,14 @@ async def lifespan(app: FastAPI):
         await broadcast({"type": "status", "event": event, **data})
         # Meeting finished → the Daily Brief for that meeting's date is now
         # stale. Mark + regenerate in the background so the user's next
-        # visit to the Daily Briefs page is already fresh.
-        if event == "done" and data.get("meeting_id"):
+        # visit to the Daily Briefs page is already fresh. Skipped when the
+        # user has turned off auto-refresh (Settings → Advanced → Daily
+        # Brief) — the page can still be regenerated manually.
+        if (
+            event == "done"
+            and data.get("meeting_id")
+            and config.DAILY_BRIEF_AUTO_REFRESH
+        ):
             asyncio.create_task(regen_brief_for_meeting(data["meeting_id"]))
 
     async def on_level(rms: float, peak: float) -> None:

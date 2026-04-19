@@ -229,16 +229,31 @@ export type ConfigKey =
   | "obsidian_vault"
   | "rt_highlights_debounce_sec"
   | "rt_highlights_max_interval_sec"
-  | "rt_highlights_window_sec";
+  | "rt_highlights_window_sec"
+  // Advanced knobs.
+  | "chunk_duration"
+  | "silence_duration"
+  | "vad_threshold"
+  | "aec_tail_ms"
+  | "voice_match_threshold_multi"
+  | "voice_match_threshold_solo"
+  | "voice_ratio_margin"
+  | "min_voice_samples"
+  | "provisional_threshold"
+  | "speculative_interval_sec"
+  | "speculative_window_sec"
+  | "obsidian_write_interval_sec"
+  | "obsidian_write_chunks"
+  | "daily_brief_auto_refresh";
 
 export interface ConfigFieldState {
   // What the running process is actually using. Frozen at sidecar import
   // time — differs from `override` after a save, until restart.
-  effective: string | number | null;
+  effective: string | number | boolean | null;
   // What's persisted in config.json. null = using the default.
-  override: string | number | null;
+  override: string | number | boolean | null;
   // Built-in fallback when nothing is set.
-  default: string | number | null;
+  default: string | number | boolean | null;
 }
 
 export interface AppConfig {
@@ -249,7 +264,7 @@ export interface AppConfig {
   requires_restart?: boolean;
 }
 
-export type AppConfigPatch = Partial<Record<ConfigKey, string | number | null>>;
+export type AppConfigPatch = Partial<Record<ConfigKey, string | number | boolean | null>>;
 
 export interface DataDirSettings {
   // Path currently in use by the running sidecar (resolved at import time).

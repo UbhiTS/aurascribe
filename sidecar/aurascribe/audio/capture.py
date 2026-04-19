@@ -29,6 +29,7 @@ from typing import AsyncGenerator
 import numpy as np
 
 from aurascribe.config import (
+    AEC_TAIL_MS,
     CHANNELS,
     CHUNK_DURATION,
     SAMPLE_RATE,
@@ -41,14 +42,16 @@ log = logging.getLogger("aurascribe")
 _STOP_SENTINEL: object = object()
 _RING_MAXLEN = int(30 * SAMPLE_RATE / 512)  # 30s of 512-sample blocks
 
-# AEC frame size (10ms @ 16kHz) and tail length (200ms @ 16kHz). Tail
-# covers the full speaker-DAC + air-travel + room-reflection path; 100ms
-# wasn't enough for a speakers-in-room setup and users reported a "large
-# hall" reverb because the linear filter ran out of length before room
-# reflections had fully decayed. 200ms converges a bit slower but catches
-# multi-bounce reverb tails that a typical desktop has.
+# AEC frame size (10ms @ 16kHz); tail length is ms × 16 samples/ms.
+# Tail covers the full speaker-DAC + air-travel + room-reflection path;
+# 100ms wasn't enough for a speakers-in-room setup and users reported a
+# "large hall" reverb because the linear filter ran out of length before
+# room reflections had fully decayed. 200ms converges a bit slower but
+# catches multi-bounce reverb tails that a typical desktop has. Tunable
+# via the `aec_tail_ms` config key (Settings → Advanced → Echo
+# cancellation).
 _AEC_FRAME = 160
-_AEC_TAIL = 3200
+_AEC_TAIL = max(_AEC_FRAME, int(AEC_TAIL_MS * 16))
 # Max allowed drift between mic and loopback FIFOs before we drop samples
 # on the leading side. 80ms is well within pyaec's tail window so small
 # skew is absorbed by the filter; anything larger means a clock glitch
