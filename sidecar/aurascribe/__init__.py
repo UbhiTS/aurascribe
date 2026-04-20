@@ -23,6 +23,16 @@ _warnings.filterwarnings(
 )
 
 
+# Hydrate the CUDA runtime bundle if this is the CUDA variant and
+# first launch. Must run before `_wire_windows_cuda_dlls` (which
+# registers the nvidia/*/bin dirs with Python's DLL search path)
+# and before anything else pulls in torch. No-op on CPU variant
+# builds or when running from source. See cuda_runtime.py.
+from aurascribe import cuda_runtime as _cuda_runtime  # noqa: E402
+
+_cuda_runtime.ensure()
+
+
 def _wire_windows_cuda_dlls() -> None:
     """Make CUDA 12 cuBLAS/cuDNN DLLs discoverable on Windows.
 

@@ -48,16 +48,9 @@ jobs:
             # cu121/cu124 were dropped for newer torch versions. Bump this
             # when PyTorch ships a newer CUDA major.
             torch_index: https://download.pytorch.org/whl/cu128
-            # CUDA bundle is ~1.5 GB and NSIS (32-bit makensis) crashes
-            # while mmap'ing the datablock. We switch CUDA to MSI (WiX)
-            # which handles large payloads. CPU stays on NSIS (.exe).
-            bundle_subdir: msi
-            installer_ext: msi
-            installer_name: AuraScribe-CUDA-setup.msi
+            installer_name: AuraScribe-CUDA-setup.exe
           - variant: cpu
             torch_index: https://download.pytorch.org/whl/cpu
-            bundle_subdir: nsis
-            installer_ext: exe
             installer_name: AuraScribe-CPU-setup.exe
 
     steps:
@@ -123,33 +116,98 @@ jobs:
           $sizeMB = [math]::Round(((Get-ChildItem -Recurse $bundleDir | Measure-Object Length -Sum).Sum / 1MB), 1)
           Write-Host "Sidecar bundle (${{ matrix.variant }}): $sizeMB MB"
 
-      # The CUDA sidecar is ~1.5 GB; NSIS (32-bit makensis) crashes
-      # with "Internal compiler error #12345: error mmapping datablock"
-      # while memory-mapping the huge datablock into its <2 GB virtual
-      # address space. Disabling LZMA didn't help — the mmap usage comes
-      # from the source files themselves, not the compression stage.
-      # Fix: switch the CUDA variant to the MSI (WiX) bundler, which
-      # doesn't share NSIS's mmap limits. CPU stays on NSIS.
-      - name: Build Tauri app (${{ matrix.variant }})
+      # NSIS (32-bit makensis) crashes with "Internal compiler error
+      # #12345: error mmapping datablock" on the full ~1.5 GB CUDA
+      # sidecar. WiX's light.exe is also 32-bit and OOMs similarly.
+      # Workaround: move the big CUDA DLLs out of the sidecar bundle
+      # into a separate zip that gets shipped as a release asset and
+      # downloaded by the sidecar on first launch. The installer then
+      # carries only the slim "CUDA-less" bundle, which NSIS handles
+      # just fine.
+      #
+      # The marker file tells the running sidecar (see
+      # aurascribe/cuda_runtime.py) that the runtime needs hydrating.
+      # The ready-marker file is written only after a successful
+      # extract on the user's machine, so crashed/interrupted downloads
+      # are retried automatically.
+      - name: Split CUDA runtime bundle (cuda variant only)
+        if: matrix.variant == 'cuda'
         shell: powershell
+        env:
+          VERSION: ${{ github.ref_name }}
         run: |
-          if ("${{ matrix.variant }}" -eq "cuda") {
-            npm run tauri:build -- --config src-tauri/tauri.cuda.conf.json
-          } else {
-            npm run tauri:build
+          $version = $env:VERSION.TrimStart('v')
+          $bundleDir = Resolve-Path "sidecar\dist\aurascribe-sidecar"
+          $runtimeDir = "sidecar\dist\cuda-runtime"
+          New-Item -ItemType Directory -Force -Path $runtimeDir | Out-Null
+
+          # Plant the marker inside the sidecar bundle so that at
+          # runtime the sidecar knows to fetch the runtime zip before
+          # importing anything CUDA-backed.
+          $markerDir = Join-Path $bundleDir "_internal\aurascribe"
+          New-Item -ItemType Directory -Force -Path $markerDir | Out-Null
+          $version | Out-File -FilePath (Join-Path $markerDir "requires_cuda_runtime.txt") `
+            -Encoding ASCII -NoNewline
+
+          # Move anything >=50 MB (the big CUDA kernel DLLs —
+          # torch_cuda.dll, cudnn_*, cublas_*, etc.) plus everything
+          # under _internal/nvidia/ (nvidia-cu12 wheel contents). The
+          # resulting bundle is comfortably under 1 GB so NSIS handles
+          # it without blowing through its mmap limit.
+          $threshold = 50MB
+          $bundleRoot = $bundleDir.Path
+          $big = Get-ChildItem -Path $bundleRoot -Recurse -File | Where-Object { $_.Length -ge $threshold }
+          foreach ($f in $big) {
+            $rel = $f.FullName.Substring($bundleRoot.Length + 1)
+            $dest = Join-Path $runtimeDir $rel
+            New-Item -ItemType Directory -Force -Path (Split-Path $dest) | Out-Null
+            Move-Item -Force $f.FullName $dest
           }
 
-      # Tauri's default installer filename is versioned + arch-tagged
-      # (e.g. AuraScribe_0.1.0_x64-setup.exe or AuraScribe_0.1.0_x64_en-US.msi).
-      # Rename to the stable variant-tagged filename the release expects.
-      # bundle_subdir + installer_ext come from the matrix so we grab the
-      # right file out of the right folder per variant.
+          $nvidiaSrc = Join-Path $bundleRoot "_internal\nvidia"
+          if (Test-Path $nvidiaSrc) {
+            $nvidiaDst = Join-Path $runtimeDir "_internal\nvidia"
+            New-Item -ItemType Directory -Force -Path (Split-Path $nvidiaDst) | Out-Null
+            if (Test-Path $nvidiaDst) { Remove-Item -Recurse -Force $nvidiaDst }
+            Move-Item -Force $nvidiaSrc $nvidiaDst
+          }
+
+          $runtimeBytes = (Get-ChildItem -Recurse $runtimeDir | Measure-Object Length -Sum).Sum
+          $remainBytes = (Get-ChildItem -Recurse $bundleRoot | Measure-Object Length -Sum).Sum
+          Write-Host ("Split: runtime={0:N1} MB, remaining bundle={1:N1} MB" -f `
+            ($runtimeBytes / 1MB), ($remainBytes / 1MB))
+
+          # Use 7-Zip for speed + to avoid Compress-Archive's 2 GB
+          # output limit. Store-only (-mx=0) — CUDA kernel DLLs don't
+          # compress (already compressed internally), and skipping
+          # compression cuts build + extract time.
+          $zipName = "AuraScribe-CUDA-runtime-v$version.zip"
+          $sevenZip = "C:\Program Files\7-Zip\7z.exe"
+          & $sevenZip a -tzip -mx=0 $zipName "$runtimeDir\*" | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "7z failed with exit $LASTEXITCODE" }
+          $zipMB = [math]::Round((Get-Item $zipName).Length / 1MB, 1)
+          Write-Host "CUDA runtime zip: $zipName ($zipMB MB)"
+
+      - name: Upload CUDA runtime bundle (cuda variant only)
+        if: matrix.variant == 'cuda'
+        uses: actions/upload-artifact@v4
+        with:
+          name: AuraScribe-CUDA-runtime-${{ github.ref_name }}.zip
+          path: AuraScribe-CUDA-runtime-${{ github.ref_name }}.zip
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Build Tauri app (${{ matrix.variant }})
+        run: npm run tauri:build
+
+      # Tauri's default NSIS output name is versioned + arch-tagged
+      # (e.g. AuraScribe_0.1.0_x64-setup.exe). Rename to the stable
+      # variant-tagged filename the release expects.
       - name: Rename installer to ${{ matrix.installer_name }}
         shell: powershell
         run: |
-          $pattern = "src-tauri\target\release\bundle\${{ matrix.bundle_subdir }}\*.${{ matrix.installer_ext }}"
-          $src = Get-ChildItem -Path $pattern | Select-Object -First 1
-          if (-not $src) { throw "No installer produced at $pattern" }
+          $src = Get-ChildItem -Path "src-tauri\target\release\bundle\nsis\*.exe" | Select-Object -First 1
+          if (-not $src) { throw "No NSIS installer produced" }
           $dst = Join-Path $src.DirectoryName "${{ matrix.installer_name }}"
           Copy-Item $src.FullName $dst -Force
           $sizeMB = [math]::Round((Get-Item $dst).Length / 1MB, 1)
@@ -159,7 +217,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.installer_name }}
-          path: src-tauri/target/release/bundle/${{ matrix.bundle_subdir }}/${{ matrix.installer_name }}
+          path: src-tauri/target/release/bundle/nsis/${{ matrix.installer_name }}
           if-no-files-found: error
           retention-days: 30
 
@@ -171,10 +229,10 @@ jobs:
     # runs stop at the build stage with the installers as artifacts.
     if: startsWith(github.ref, 'refs/tags/')
     steps:
-      - name: Download both installers
+      - name: Download installers + CUDA runtime
         uses: actions/download-artifact@v4
         with:
-          pattern: AuraScribe-*-setup.*
+          pattern: AuraScribe-*
           path: ./installers
           merge-multiple: true
 
@@ -189,19 +247,23 @@ jobs:
           draft: true
           prerelease: false
           files: |
-            installers/AuraScribe-CUDA-setup.msi
+            installers/AuraScribe-CUDA-setup.exe
             installers/AuraScribe-CPU-setup.exe
+            installers/AuraScribe-CUDA-runtime-${{ github.ref_name }}.zip
           body: |
             Windows installers — two flavours:
 
-            | Installer | When to pick it | Size |
-            |---|---|---|
-            | **AuraScribe-CUDA-setup.msi** | You have an NVIDIA GPU (any RTX card). Fastest transcription. Delivered as MSI because NSIS can't package a 1.5 GB payload on 32-bit. | ~1.5–2 GB |
-            | **AuraScribe-CPU-setup.exe** | No GPU, or you want the smaller install. Transcription is 5–10× slower but still usable. | ~700–900 MB |
+            | Installer | When to pick it | Installer size | Disk after first launch |
+            |---|---|---|---|
+            | **AuraScribe-CUDA-setup.exe** | You have an NVIDIA GPU (any RTX card). Fastest transcription + GPU diarization. On first launch it downloads the CUDA DLL bundle (~1 GB) next to itself — that's the `AuraScribe-CUDA-runtime-*.zip` asset below. | ~400–600 MB | ~1.5–2 GB |
+            | **AuraScribe-CPU-setup.exe** | No GPU, or you want the smaller install. Transcription is 5–10× slower but still usable. | ~260 MB | ~700–900 MB |
 
             Both installers:
             - Install per-user to `%LOCALAPPDATA%\Programs\AuraScribe` — no admin rights needed.
             - Store app data (DB, audio, logs, models) under `%APPDATA%\AuraScribe`. Uninstalling leaves that tree untouched.
             - Download the Whisper + pyannote models (~2 GB) on first launch; subsequent launches are instant.
 
-            Not sure which to pick? Install CUDA. It works with or without an NVIDIA GPU — it just wastes ~1 GB of disk if you don't have one.
+            Not sure which to pick? Install CUDA. It works with or without an NVIDIA GPU — the CUDA DLL download runs regardless, but if there's no GPU the CPU fallback kicks in at runtime.
+
+            ---
+            **Why the CUDA runtime is a separate download:** NSIS (32-bit makensis) crashes with "Internal compiler error #12345" when asked to pack a >1 GB data block; WiX's 32-bit light.exe OOMs too. So the big CUDA DLLs ship as a separate zip that the sidecar fetches on first launch. The zip below (`AuraScribe-CUDA-runtime-*.zip`) is what the installer pulls — you don't need to download it by hand.
