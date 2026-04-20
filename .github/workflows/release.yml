@@ -215,21 +215,27 @@ jobs:
           $manifestLines.Add("version=$version") | Out-Null
           $manifestLines.Add("parts=$($bins.Count)") | Out-Null
 
+          # Capture the absolute paths BEFORE the push — inside the
+          # pushed location, relative references like $runtimeDir
+          # resolve against the new cwd (creating a doubled path).
+          $runtimeDirAbs = (Resolve-Path $runtimeDir).Path
+          $workspaceDir = (Get-Location).Path
+
           Push-Location $runtimeDir
           try {
             for ($i = 0; $i -lt $bins.Count; $i++) {
               $partIndex = $i + 1
               $partName = "$baseName.part$partIndex.zip"
               $listFile = Join-Path $env:RUNNER_TEMP "part$partIndex.lst"
+              $partAbs = Join-Path $workspaceDir $partName
 
               # Write relative paths so 7z zips with paths preserved.
-              $runtimeDirAbs = (Resolve-Path $runtimeDir).Path
               $relPaths = foreach ($bf in $bins[$i].Files) {
                 $bf.FullName.Substring($runtimeDirAbs.Length + 1)
               }
               Set-Content -Path $listFile -Value $relPaths -Encoding ASCII
 
-              & $sevenZip a -tzip -mx=0 "..\..\..\$partName" "@$listFile" | Out-Null
+              & $sevenZip a -tzip -mx=0 $partAbs "@$listFile" | Out-Null
               if ($LASTEXITCODE -ne 0) { throw "7z failed on part $partIndex with exit $LASTEXITCODE" }
             }
           } finally {
