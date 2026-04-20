@@ -20,14 +20,14 @@ Two flavors per release, pick one:
 
 | Installer | When to pick it | Installer size | On disk after first launch |
 |---|---|---|---|
-| **AuraScribe-CUDA-setup.exe** | You have an NVIDIA GPU (any RTX card). Fastest transcription + GPU-accelerated diarization. On first launch it streams a ~1 GB CUDA DLL bundle from the GitHub Release next to the installer. | ~400–600 MB | ~1.5–2 GB |
+| **AuraScribe-CUDA-setup.exe** | You have an NVIDIA GPU (any RTX card). Fastest transcription + GPU-accelerated diarization. On first launch the sidecar streams a ~6 GB CUDA DLL bundle (four zip parts + a manifest) from the GitHub Release into its install dir. Plan ~10–20 min on typical broadband before the app is usable. | ~140 MB | ~6 GB |
 | **AuraScribe-CPU-setup.exe** | No GPU, or you want the smaller install. Transcription is ~5–10× slower but still usable. | ~260 MB | ~700–900 MB |
 
 Both install per-user to `%LOCALAPPDATA%\Programs\AuraScribe` — no admin rights needed. User data (DB, audio, logs, models) lives under `%APPDATA%\AuraScribe` and survives uninstall.
 
-Not sure? Install CUDA — it works on machines without a GPU too, but you'll also pay for the ~1 GB DLL download on first launch.
+Not sure? Install CUDA — it works on machines without a GPU too, but you'll still pay for the ~6 GB DLL download on first launch.
 
-**Why the CUDA variant streams its DLLs on first launch instead of shipping them in the installer**: NSIS's 32-bit makensis (and WiX's light.exe) both crash/OOM when asked to mmap a >1 GB data block on the GitHub runner. Splitting the big CUDA DLLs into release assets (`AuraScribe-CUDA-runtime-v<version>.manifest.txt` + one or more `.partN.zip` files, each <2 GB to stay under GitHub's per-asset limit) keeps the installer small enough for NSIS while the sidecar hydrates the runtime from the Release on first launch.
+**Why the CUDA variant streams its DLLs on first launch instead of shipping them in the installer**: the full CUDA payload (PyTorch cu128 + cuBLAS/cuDNN wheels + CUDA kernel DLLs) is ~6 GB. NSIS's 32-bit makensis (and WiX's light.exe) both crash / OOM when asked to mmap >1 GB of data on the GitHub runner, and GitHub release assets are capped at 2 GB per file. The split step in CI bin-packs every file ≥ 50 MB plus the `_internal/nvidia/` tree into multiple `<version>.partN.zip` files (each <1.8 GB) listed in `<version>.manifest.txt`. The sidecar reads the manifest on first launch, downloads + extracts each part, and restores the original PyInstaller layout.
 
 ### As a developer — from source
 

@@ -329,7 +329,7 @@ jobs:
 
             | Installer | When to pick it | Installer size | Disk after first launch |
             |---|---|---|---|
-            | **AuraScribe-CUDA-setup.exe** | You have an NVIDIA GPU (any RTX card). Fastest transcription + GPU diarization. On first launch it downloads the CUDA DLL bundle (~1 GB) next to itself — that's the `AuraScribe-CUDA-runtime-*.zip` asset below. | ~400–600 MB | ~1.5–2 GB |
+            | **AuraScribe-CUDA-setup.exe** | You have an NVIDIA GPU (any RTX card). Fastest transcription + GPU diarization. On first launch the sidecar streams a ~6 GB CUDA DLL bundle from this release (four `.partN.zip` files + a manifest) into the install dir. Plan ~10–20 min on typical broadband before the app is usable. | ~140 MB | ~6 GB |
             | **AuraScribe-CPU-setup.exe** | No GPU, or you want the smaller install. Transcription is 5–10× slower but still usable. | ~260 MB | ~700–900 MB |
 
             Both installers:
@@ -340,4 +340,4 @@ jobs:
             Not sure which to pick? Install CUDA. It works with or without an NVIDIA GPU — the CUDA DLL download runs regardless, but if there's no GPU the CPU fallback kicks in at runtime.
 
             ---
-            **Why the CUDA runtime is a separate download:** NSIS (32-bit makensis) crashes with "Internal compiler error #12345" when asked to pack a >1 GB data block; WiX's 32-bit light.exe OOMs too. So the big CUDA DLLs ship as a separate zip that the sidecar fetches on first launch. The zip below (`AuraScribe-CUDA-runtime-*.zip`) is what the installer pulls — you don't need to download it by hand.
+            **Why the CUDA runtime is a separate download:** the full CUDA payload is ~6 GB. NSIS (32-bit makensis) crashes with "Internal compiler error #12345" when asked to pack >1 GB of data, and GitHub release assets cap at 2 GB per file. The runtime ships as four bin-packed `.partN.zip` files plus a small `.manifest.txt`; the sidecar reads the manifest, downloads + extracts each part on first launch, and restores the full PyInstaller layout.
