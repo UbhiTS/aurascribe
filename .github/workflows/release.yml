@@ -177,23 +177,88 @@ jobs:
           Write-Host ("Split: runtime={0:N1} MB, remaining bundle={1:N1} MB" -f `
             ($runtimeBytes / 1MB), ($remainBytes / 1MB))
 
-          # Use 7-Zip for speed + to avoid Compress-Archive's 2 GB
-          # output limit. Store-only (-mx=0) — CUDA kernel DLLs don't
-          # compress (already compressed internally), and skipping
-          # compression cuts build + extract time.
-          $zipName = "AuraScribe-CUDA-runtime-v$version.zip"
-          $sevenZip = "C:\Program Files\7-Zip\7z.exe"
-          & $sevenZip a -tzip -mx=0 $zipName "$runtimeDir\*" | Out-Null
-          if ($LASTEXITCODE -ne 0) { throw "7z failed with exit $LASTEXITCODE" }
-          $zipMB = [math]::Round((Get-Item $zipName).Length / 1MB, 1)
-          Write-Host "CUDA runtime zip: $zipName ($zipMB MB)"
+          # The full runtime is ~3.9 GB — GitHub Release assets are
+          # capped at 2 GB per file, so we bin-pack files into multiple
+          # < 1800 MB zips and publish a small manifest next to them.
+          # First-fit-decreasing: sort files by size descending, drop
+          # each into the first bin with room, else open a new bin.
+          # CUDA kernel DLLs don't compress (they're already compressed
+          # internally) so we store (-mx=0) to keep CI + client-side
+          # extract fast.
+          $maxBinSize = 1800MB
+          $files = Get-ChildItem -Path $runtimeDir -Recurse -File | Sort-Object Length -Descending
+          $bins = New-Object System.Collections.ArrayList
+          foreach ($f in $files) {
+            $placed = $false
+            for ($i = 0; $i -lt $bins.Count; $i++) {
+              if ($bins[$i].Size + $f.Length -le $maxBinSize) {
+                $bins[$i].Files.Add($f) | Out-Null
+                $bins[$i].Size += $f.Length
+                $placed = $true
+                break
+              }
+            }
+            if (-not $placed) {
+              $bin = [pscustomobject]@{
+                Files = New-Object System.Collections.ArrayList
+                Size  = 0L
+              }
+              $bin.Files.Add($f) | Out-Null
+              $bin.Size = $f.Length
+              $bins.Add($bin) | Out-Null
+            }
+          }
 
-      - name: Upload CUDA runtime bundle (cuda variant only)
+          $sevenZip = "C:\Program Files\7-Zip\7z.exe"
+          $baseName = "AuraScribe-CUDA-runtime-v$version"
+          $manifestLines = New-Object System.Collections.ArrayList
+          $manifestLines.Add("version=$version") | Out-Null
+          $manifestLines.Add("parts=$($bins.Count)") | Out-Null
+
+          Push-Location $runtimeDir
+          try {
+            for ($i = 0; $i -lt $bins.Count; $i++) {
+              $partIndex = $i + 1
+              $partName = "$baseName.part$partIndex.zip"
+              $listFile = Join-Path $env:RUNNER_TEMP "part$partIndex.lst"
+
+              # Write relative paths so 7z zips with paths preserved.
+              $runtimeDirAbs = (Resolve-Path $runtimeDir).Path
+              $relPaths = foreach ($bf in $bins[$i].Files) {
+                $bf.FullName.Substring($runtimeDirAbs.Length + 1)
+              }
+              Set-Content -Path $listFile -Value $relPaths -Encoding ASCII
+
+              & $sevenZip a -tzip -mx=0 "..\..\..\$partName" "@$listFile" | Out-Null
+              if ($LASTEXITCODE -ne 0) { throw "7z failed on part $partIndex with exit $LASTEXITCODE" }
+            }
+          } finally {
+            Pop-Location
+          }
+
+          for ($i = 0; $i -lt $bins.Count; $i++) {
+            $partIndex = $i + 1
+            $partName = "$baseName.part$partIndex.zip"
+            $partSizeMB = [math]::Round((Get-Item $partName).Length / 1MB, 1)
+            $manifestLines.Add("part$partIndex=$partName") | Out-Null
+            Write-Host "Part ${partIndex}: $partName ($partSizeMB MB)"
+          }
+
+          $manifestName = "$baseName.manifest.txt"
+          $manifestLines | Out-File -FilePath $manifestName -Encoding ASCII
+          Write-Host "Manifest: $manifestName"
+          Get-Content $manifestName | ForEach-Object { Write-Host "  $_" }
+
+      # Upload one artifact per runtime part + the manifest. The release
+      # job globs `AuraScribe-CUDA-runtime-*` to pick them all up.
+      - name: Upload CUDA runtime parts (cuda variant only)
         if: matrix.variant == 'cuda'
         uses: actions/upload-artifact@v4
         with:
-          name: AuraScribe-CUDA-runtime-${{ github.ref_name }}.zip
-          path: AuraScribe-CUDA-runtime-${{ github.ref_name }}.zip
+          name: AuraScribe-CUDA-runtime-parts-${{ github.ref_name }}
+          path: |
+            AuraScribe-CUDA-runtime-${{ github.ref_name }}.part*.zip
+            AuraScribe-CUDA-runtime-${{ github.ref_name }}.manifest.txt
           if-no-files-found: error
           retention-days: 30
 
@@ -229,7 +294,7 @@ jobs:
     # runs stop at the build stage with the installers as artifacts.
     if: startsWith(github.ref, 'refs/tags/')
     steps:
-      - name: Download installers + CUDA runtime
+      - name: Download installers + CUDA runtime parts
         uses: actions/download-artifact@v4
         with:
           pattern: AuraScribe-*
@@ -246,10 +311,13 @@ jobs:
           name: AuraScribe ${{ github.ref_name }}
           draft: true
           prerelease: false
+          # Glob picks up all the runtime parts + manifest automatically.
+          # Each part is < 2 GB (GitHub's per-file release asset limit).
           files: |
             installers/AuraScribe-CUDA-setup.exe
             installers/AuraScribe-CPU-setup.exe
-            installers/AuraScribe-CUDA-runtime-${{ github.ref_name }}.zip
+            installers/AuraScribe-CUDA-runtime-${{ github.ref_name }}.manifest.txt
+            installers/AuraScribe-CUDA-runtime-${{ github.ref_name }}.part*.zip
           body: |
             Windows installers — two flavours:
 

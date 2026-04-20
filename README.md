@@ -27,7 +27,7 @@ Both install per-user to `%LOCALAPPDATA%\Programs\AuraScribe` — no admin right
 
 Not sure? Install CUDA — it works on machines without a GPU too, but you'll also pay for the ~1 GB DLL download on first launch.
 
-**Why the CUDA variant streams its DLLs on first launch instead of shipping them in the installer**: NSIS's 32-bit makensis (and WiX's light.exe) both crash/OOM when asked to mmap a >1 GB data block on the GitHub runner. Splitting the big CUDA DLLs into a separate release asset (`AuraScribe-CUDA-runtime-v<version>.zip`) keeps the installer small enough for NSIS while the sidecar hydrates the runtime from the Release on first launch.
+**Why the CUDA variant streams its DLLs on first launch instead of shipping them in the installer**: NSIS's 32-bit makensis (and WiX's light.exe) both crash/OOM when asked to mmap a >1 GB data block on the GitHub runner. Splitting the big CUDA DLLs into release assets (`AuraScribe-CUDA-runtime-v<version>.manifest.txt` + one or more `.partN.zip` files, each <2 GB to stay under GitHub's per-asset limit) keeps the installer small enough for NSIS while the sidecar hydrates the runtime from the Release on first launch.
 
 ### As a developer — from source
 
