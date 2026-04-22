@@ -24,13 +24,31 @@ name: Release
 
 on:
   push:
+    # Main-branch pushes produce installers as build artifacts (no release
+    # is created — see the `if: startsWith(github.ref, 'refs/tags/')` gate
+    # on the release job). Tag pushes additionally cut a draft Release.
+    branches:
+      - main
     tags:
       - 'v*'
+    # Docs-only commits skip CI. Anything under src/, sidecar/, scripts/,
+    # src-tauri/, .github/, or package.json still triggers — those are
+    # the only paths that can change what gets bundled.
+    paths-ignore:
+      - '**/*.md'
+      - 'LICENSE'
+      - '.gitignore'
+      - '.editorconfig'
   workflow_dispatch:
 
 concurrency:
+  # Group by ref so main pushes collapse onto each other but a tag push
+  # (different ref → different group) is never cancelled by a later main
+  # push, and vice versa. `cancel-in-progress: true` is now safe because
+  # same-ref conflicts only happen on rapid-fire main pushes (exactly the
+  # case where we *want* the older build cancelled).
   group: release-${{ github.ref }}
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 permissions:
   contents: write  # required for the release job to create/upload to the draft
