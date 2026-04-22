@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<!--
+  macOS Info.plist keys merged into AuraScribe's final bundle Info.plist.
+
+  NSMicrophoneUsageDescription is required by macOS to show a human-readable
+  reason in the Privacy & Security microphone permission dialog on first
+  capture. Without it, the OS silently denies access and sounddevice / the
+  loopback path will return empty buffers.
+
+  Tauri merges these keys into the generated Info.plist at bundle time
+  (via `bundle.macOS.infoPlist` in tauri.conf.json pointing at this file).
+-->
+<dict>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>AuraScribe needs microphone access to transcribe your meetings.</string>
+</dict>
+</plist>

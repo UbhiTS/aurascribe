@@ -50,9 +50,7 @@
     "macOS": {
       "minimumSystemVersion": "12.0",
       "entitlements": "entitlements.plist",
-      "infoPlist": {
-        "NSMicrophoneUsageDescription": "AuraScribe needs microphone access to transcribe your meetings."
-      }
+      "infoPlist": "Info.plist"
     }
   }
 }

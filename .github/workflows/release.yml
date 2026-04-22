@@ -165,9 +165,13 @@ jobs:
         if: matrix.label == 'windows-cuda'
         shell: powershell
         env:
-          VERSION: ${{ github.ref_name }}
+          REF_NAME: ${{ github.ref_name }}
         run: |
-          $version = $env:VERSION.TrimStart('v')
+          # $refName is the full ref (e.g. "v0.2.0" on tag push, "main" on
+          # workflow_dispatch). $version is the semver-only form used inside
+          # the marker file + sidecar URL builder (which re-prepends 'v').
+          $refName = $env:REF_NAME
+          $version = $refName.TrimStart('v')
           $bundleDir = Resolve-Path "sidecar\dist\aurascribe-sidecar"
           $runtimeDir = "sidecar\dist\cuda-runtime"
           New-Item -ItemType Directory -Force -Path $runtimeDir | Out-Null
@@ -222,7 +226,10 @@ jobs:
           }
 
           $sevenZip = "C:\Program Files\7-Zip\7z.exe"
-          $baseName = "AuraScribe-CUDA-runtime-v$version"
+          # Filenames match the Upload step + Draft Release glob, both of
+          # which use ${{ github.ref_name }} directly (so "v0.2.0" on tag
+          # push, "main" on workflow_dispatch — same either way).
+          $baseName = "AuraScribe-CUDA-runtime-$refName"
           $manifestLines = New-Object System.Collections.ArrayList
           $manifestLines.Add("version=$version") | Out-Null
           $manifestLines.Add("parts=$($bins.Count)") | Out-Null
