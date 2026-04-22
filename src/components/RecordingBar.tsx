@@ -233,7 +233,7 @@ export function RecordingBar({
 
   return (
     <MicAudioProvider deviceName={selectedDeviceName}>
-    <div className={`flex items-center gap-3 px-4 py-3 rounded-xl border transition-all min-h-[72px] ${
+    <div className={`flex flex-wrap items-center gap-y-2 gap-x-3 px-4 py-3 rounded-xl border transition-all min-h-[72px] ${
       isRecording ? "bg-red-950/40 border-red-800/50" : "bg-gray-900 border-gray-800"
     }`}>
       <div className={`flex-shrink-0 w-3 h-3 rounded-full ${
@@ -243,7 +243,7 @@ export function RecordingBar({
       <Waveform />
 
       {isRecording && (
-        <span className="flex items-center gap-1 text-sm text-red-400 font-mono">
+        <span className="flex items-center gap-1 text-sm text-red-400 font-mono flex-shrink-0">
           <Clock size={13} />
           {fmt(elapsed)}
         </span>
@@ -252,10 +252,14 @@ export function RecordingBar({
       {/* Source controls — always rendered, disabled during recording so
           the user can see what they're capturing from without being
           tempted to hot-swap mid-meeting (capture-pipeline switches
-          mid-record aren't supported and the locking would fight HMR). */}
-      <div className="ml-auto flex items-center gap-3">
-        <label className="flex items-center gap-1.5 text-xs text-gray-500" title="What to record">
-          <span className="text-gray-400">Source:</span>
+          mid-record aren't supported and the locking would fight HMR).
+          The whole row is `flex-wrap` so at narrow widths the Start /
+          Stop button wraps to a second line rather than getting pushed
+          off-screen — and the device dropdowns shrink before that
+          happens so the common case stays on one line. */}
+      <div className="ml-auto flex flex-wrap items-center gap-y-2 gap-x-3 min-w-0">
+        <label className="flex items-center gap-1.5 text-xs text-gray-500 flex-shrink-0" title="What to record">
+          <span className="text-gray-400 hidden sm:inline">Source:</span>
           <select
             value={mode}
             onChange={(e) => setMode(e.target.value as SourceMode)}
@@ -274,19 +278,18 @@ export function RecordingBar({
 
         {/* Device pickers. In "mix" mode both render stacked in a single
             column so they don't steal horizontal space from Start / Stop.
-            The bar's min-h-[72px] is sized for this stacked case, so
-            switching between 1-picker and 2-picker modes never shifts
-            the bar's height — items-center on the row + column keeps
-            everything visually centered regardless. */}
-        <div className={`flex gap-1.5 ${mode === "mix" ? "flex-col" : "flex-row items-center gap-3"}`}>
+            Widths are responsive (`max-w` ceiling that shrinks at narrow
+            breakpoints) so a narrow window doesn't push the Record
+            button off-screen. */}
+        <div className={`flex gap-1.5 min-w-0 ${mode === "mix" ? "flex-col" : "flex-row items-center gap-3"}`}>
           {mode !== "system" && devices.length > 1 && (
-            <label className="flex items-center gap-1.5 text-xs text-gray-500" title="Microphone">
-              <Mic size={12} className="text-gray-500" />
+            <label className="flex items-center gap-1.5 text-xs text-gray-500 min-w-0" title="Microphone">
+              <Mic size={12} className="text-gray-500 flex-shrink-0" />
               <select
                 value={deviceIndex ?? ""}
                 onChange={(e) => persistMic(e.target.value ? parseInt(e.target.value) : undefined)}
                 disabled={isRecording}
-                className="text-xs text-gray-400 bg-gray-800 border border-gray-700 rounded px-2 py-1 outline-none w-[330px] disabled:opacity-60 disabled:cursor-not-allowed"
+                className="text-xs text-gray-400 bg-gray-800 border border-gray-700 rounded px-2 py-1 outline-none min-w-0 w-full sm:w-[180px] lg:w-[260px] 2xl:w-[330px] disabled:opacity-60 disabled:cursor-not-allowed"
               >
                 <option value="">Default mic</option>
                 {devices.map((d) => (
@@ -298,18 +301,18 @@ export function RecordingBar({
 
           {mode !== "mic" && outputDevices.length > 0 && (
             <label
-              className="flex items-center gap-1.5 text-xs text-gray-500"
+              className="flex items-center gap-1.5 text-xs text-gray-500 min-w-0"
               title={platform === "darwin"
               ? "System-audio source (BlackHole / virtual device). Captures whatever's playing — use this for Zoom/Teams/Meet participants, video playback, etc."
               : "System-audio source (WASAPI loopback). Captures whatever's playing through the selected speaker — use this for Zoom/Teams/Meet participants, video playback, etc."
             }
             >
-              <Volume2 size={12} className="text-gray-500" />
+              <Volume2 size={12} className="text-gray-500 flex-shrink-0" />
               <select
                 value={loopbackIndex ?? ""}
                 onChange={(e) => persistLoopback(e.target.value ? parseInt(e.target.value) : undefined)}
                 disabled={isRecording}
-                className="text-xs text-gray-400 bg-gray-800 border border-gray-700 rounded px-2 py-1 outline-none w-[330px] disabled:opacity-60 disabled:cursor-not-allowed"
+                className="text-xs text-gray-400 bg-gray-800 border border-gray-700 rounded px-2 py-1 outline-none min-w-0 w-full sm:w-[180px] lg:w-[260px] 2xl:w-[330px] disabled:opacity-60 disabled:cursor-not-allowed"
               >
                 <option value="">Default speaker</option>
                 {outputDevices.map((d) => (
@@ -324,19 +327,21 @@ export function RecordingBar({
           <button
             onClick={handleStop}
             disabled={loading}
-            className="flex items-center gap-2 px-3 py-1.5 bg-red-600 hover:bg-red-700 disabled:opacity-50 text-white text-sm rounded-lg transition-colors"
+            className="flex items-center gap-2 px-3 py-1.5 bg-red-600 hover:bg-red-700 disabled:opacity-50 text-white text-sm rounded-lg transition-colors flex-shrink-0"
           >
             <Square size={14} />
-            Stop Recording
+            <span className="hidden sm:inline">Stop Recording</span>
+            <span className="sm:hidden">Stop</span>
           </button>
         ) : (
           <button
             onClick={handleStart}
             disabled={loading}
-            className="flex items-center gap-2 px-3 py-1.5 bg-brand-600 hover:bg-brand-700 disabled:opacity-50 text-white text-sm rounded-lg transition-colors"
+            className="flex items-center gap-2 px-3 py-1.5 bg-brand-600 hover:bg-brand-700 disabled:opacity-50 text-white text-sm rounded-lg transition-colors flex-shrink-0"
           >
             <Mic size={14} />
-            Start Recording
+            <span className="hidden sm:inline">Start Recording</span>
+            <span className="sm:hidden">Start</span>
           </button>
         )}
       </div>

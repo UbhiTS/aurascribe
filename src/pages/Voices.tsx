@@ -66,7 +66,10 @@ export function Voices({ voices, onVoicesChanged }: Props) {
         </p>
       </div>
 
-      <div className="flex-1 min-h-0 grid grid-cols-[280px_minmax(0,1fr)] gap-4 p-4">
+      {/* Stacked on narrow screens (<md) so the 280px sidebar doesn't
+          crush the detail pane; side-by-side from md+ where there's
+          room for both. */}
+      <div className="flex-1 min-h-0 grid grid-cols-1 md:grid-cols-[240px_minmax(0,1fr)] lg:grid-cols-[280px_minmax(0,1fr)] gap-4 p-4">
         <aside className="min-h-0 rounded-xl border border-gray-800 bg-gray-900/40 overflow-y-auto scrollbar-thin">
           {voices.length === 0 ? (
             <div className="p-6 text-xs text-gray-500 italic text-center">
@@ -288,8 +291,9 @@ function VoiceDetailPane({ detail, allVoices, onChanged, onDeleted }: DetailProp
     <div className="p-5 space-y-4">
       <audio ref={audioRef} preload="none" style={{ display: "none" }} />
 
-      {/* Header */}
-      <div className="flex items-start gap-3">
+      {/* Header — wraps the Merge / Delete row under the name block
+          on narrow widths so they don't get pushed off-screen. */}
+      <div className="flex flex-wrap items-start gap-3">
         <div className="relative group/avatar flex-shrink-0">
           <button
             onClick={() => avatarInputRef.current?.click()}

@@ -95,12 +95,19 @@ export function LiveFeed({
         />
       </div>
 
-      {/* Main 2-column: transcript + live intelligence */}
-      <div className="flex-1 min-h-0 grid grid-cols-[minmax(0,1fr)_360px] gap-4 p-4">
+      {/* Main layout: stacked on narrow screens (<xl, <1280px) so the
+          transcript gets the full width — the 360px aside would otherwise
+          crush the transcript pane below ~960px. At xl+ they sit
+          side-by-side as before. */}
+      <div className="flex-1 min-h-0 grid grid-cols-1 xl:grid-cols-[minmax(0,1fr)_360px] gap-4 p-4">
         {/* Transcript — circuit-pattern card with gradient glow border */}
         <section className="min-h-0 relative rounded-2xl overflow-hidden glow-border glow-shadow bg-gray-950">
           <div className="relative z-10 h-full flex flex-col">
-            <div className="flex items-center gap-3 px-5 pt-4 pb-3">
+            {/* flex-wrap so the title block + roster + summary button can
+                wrap to a second row instead of squeezing the title into an
+                unreadable "Auto-..." — narrow windows get a stacked
+                layout; wide windows still render on one row. */}
+            <div className="flex flex-wrap items-center gap-y-2 gap-x-3 px-5 pt-4 pb-3">
               <div className="flex-1 min-w-0">
                 {editingTitle ? (
                   <input
@@ -113,7 +120,7 @@ export function LiveFeed({
                   />
                 ) : (
                   <div className="flex items-center gap-2 min-w-0">
-                    <h1 className="text-xl font-bold text-gray-100 tracking-tight truncate">
+                    <h1 className="text-xl font-bold text-gray-100 tracking-tight truncate min-w-0">
                       {meeting?.title ?? (isRecording ? "Recording..." : "Ready to AuraScribe!")}
                     </h1>
                     {meeting && (
@@ -152,7 +159,12 @@ export function LiveFeed({
               </div>
 
               {roster.length > 0 && (
-                <div className="flex-shrink-0 flex items-center gap-1.5 flex-wrap justify-end max-w-[55%]">
+                // Roster: at wide widths sits to the right of the title
+                // (max-w-[55%]), at narrow widths wraps below and can use
+                // the full row. `min-w-0` + no flex-shrink-0 lets the
+                // container compress naturally — the pills themselves
+                // still wrap internally with gap-y-1 when the row is tight.
+                <div className="flex items-center gap-1.5 flex-wrap justify-start xl:justify-end min-w-0 xl:max-w-[55%]">
                   {roster.map((name) => {
                     const c = colorForSpeaker(name, voices);
                     return (
@@ -173,7 +185,7 @@ export function LiveFeed({
                 <button
                   onClick={handleSummarize}
                   disabled={summarizing}
-                  className="flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-medium rounded-lg border transition-colors disabled:opacity-50 border-brand-700 text-brand-400 bg-brand-600/10 hover:bg-brand-600/20"
+                  className="flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-medium rounded-lg border transition-colors disabled:opacity-50 border-brand-700 text-brand-400 bg-brand-600/10 hover:bg-brand-600/20 flex-shrink-0"
                 >
                   {summarizing ? <Loader size={12} className="animate-spin" /> : <Sparkles size={12} />}
                   AI Summary

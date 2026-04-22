@@ -143,29 +143,32 @@ export function Review({
 
   return (
     <div className="h-full flex flex-col min-h-0">
-      {/* Review bar — visually aligned with RecordingBar */}
+      {/* Review bar — visually aligned with RecordingBar. `flex-wrap` on
+          both the outer row and the action group means the Recompute /
+          Summary / Delete buttons wrap under the "Reviewing" label at
+          narrow widths instead of getting pushed off-screen. */}
       <div className="px-5 py-3 border-b border-gray-800/60">
-        <div className="flex items-center gap-3 px-4 py-3 rounded-xl border bg-gray-900 border-gray-800">
+        <div className="flex flex-wrap items-center gap-y-2 gap-x-3 px-4 py-3 rounded-xl border bg-gray-900 border-gray-800">
           <button
             onClick={onBack}
             title="Back to Meeting Library"
-            className="flex items-center gap-1.5 px-2.5 py-1.5 text-xs text-gray-300 bg-gray-800/60 border border-gray-700 hover:border-gray-600 hover:bg-gray-800 rounded-lg transition-colors"
+            className="flex items-center gap-1.5 px-2.5 py-1.5 text-xs text-gray-300 bg-gray-800/60 border border-gray-700 hover:border-gray-600 hover:bg-gray-800 rounded-lg transition-colors flex-shrink-0"
           >
             <ArrowLeft size={13} />
             Library
           </button>
 
           <FileText size={13} className="text-gray-500 flex-shrink-0" />
-          <span className="text-sm text-gray-300 font-medium">Reviewing</span>
+          <span className="text-sm text-gray-300 font-medium flex-shrink-0">Reviewing</span>
 
           {duration !== null && (
-            <span className="flex items-center gap-1 text-sm text-gray-400 font-mono">
+            <span className="flex items-center gap-1 text-sm text-gray-400 font-mono flex-shrink-0">
               <Clock size={13} />
               {fmtDuration(duration)}
             </span>
           )}
 
-          <div className="ml-auto flex items-center gap-2">
+          <div className="ml-auto flex flex-wrap items-center gap-y-2 gap-x-2 min-w-0">
             {meeting.status === "done" && (
               <>
                 {(() => {
@@ -219,11 +222,12 @@ export function Review({
         </div>
       </div>
 
-      {/* Main 2-column: transcript + intelligence */}
-      <div className="flex-1 min-h-0 grid grid-cols-[minmax(0,1fr)_360px] gap-4 p-4">
+      {/* Main layout: stacked below xl so the transcript gets the full
+          width at narrow sizes; side-by-side at xl+ as before. */}
+      <div className="flex-1 min-h-0 grid grid-cols-1 xl:grid-cols-[minmax(0,1fr)_360px] gap-4 p-4">
         <section className="min-h-0 relative rounded-2xl overflow-hidden glow-border glow-shadow bg-gray-950">
           <div className="relative z-10 h-full flex flex-col">
-            <div className="flex items-center gap-3 px-5 pt-4 pb-3">
+            <div className="flex flex-wrap items-center gap-y-2 gap-x-3 px-5 pt-4 pb-3">
               <div className="flex-1 min-w-0">
                 {editingTitle ? (
                   <input
@@ -236,7 +240,7 @@ export function Review({
                   />
                 ) : (
                   <div className="flex items-center gap-2 min-w-0">
-                    <h1 className="text-xl font-bold text-gray-100 tracking-tight truncate">{meeting.title}</h1>
+                    <h1 className="text-xl font-bold text-gray-100 tracking-tight truncate min-w-0">{meeting.title}</h1>
                     <button
                       onClick={() => { setTitleDraft(meeting.title); setEditingTitle(true); }}
                       title="Rename transcription"
@@ -270,7 +274,9 @@ export function Review({
                 )}
               </div>
               {roster.length > 0 && (
-                <div className="flex-shrink-0 flex items-center gap-1.5 flex-wrap justify-end max-w-[55%]">
+                // Matches LiveFeed — wraps under the title at narrow
+                // widths instead of forcing the title to truncate.
+                <div className="flex items-center gap-1.5 flex-wrap justify-start xl:justify-end min-w-0 xl:max-w-[55%]">
                   {roster.map((name) => {
                     const c = colorForSpeaker(name, voices);
                     return (

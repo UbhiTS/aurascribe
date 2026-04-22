@@ -62,9 +62,9 @@ export function AutoCaptureChip({ state, setState }: Props) {
   if (!state) {
     // Pre-first-status placeholder — prevents layout shift.
     return (
-      <div className="flex items-center gap-2 text-xs" title="Auto-capture loading…">
+      <div className="flex items-center gap-2 text-xs flex-shrink-0" title="Auto-capture loading…">
         <Radio size={13} className="text-gray-600" />
-        <span className="text-gray-600">Auto Recording</span>
+        <span className="text-gray-600 hidden lg:inline">Auto Recording</span>
         <Switch enabled={false} disabled />
       </div>
     );
@@ -129,14 +129,16 @@ export function AutoCaptureChip({ state, setState }: Props) {
       title={title}
       role="switch"
       aria-checked={enabled}
-      className="flex items-center gap-2 text-xs transition-opacity disabled:cursor-default disabled:opacity-70"
+      className="flex items-center gap-2 text-xs flex-shrink-0 transition-opacity disabled:cursor-default disabled:opacity-70"
     >
       <Radio size={13} className={iconClass} />
-      <span className="text-gray-300">Auto Recording</span>
+      {/* Label collapses under lg — icon + switch carry the interaction,
+          tooltip carries the "Auto Recording" affordance. */}
+      <span className="text-gray-300 hidden lg:inline">Auto Recording</span>
       {subStatus && (
         <>
-          <span className="text-gray-600">·</span>
-          <span className={subStatusClass}>{subStatus}</span>
+          <span className="text-gray-600 hidden lg:inline">·</span>
+          <span className={`${subStatusClass} hidden lg:inline`}>{subStatus}</span>
         </>
       )}
       <Switch enabled={enabled} disabled={switchDisabled} />

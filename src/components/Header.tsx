@@ -19,10 +19,16 @@ interface Props {
   setAutoCaptureState: (s: AutoCaptureState | null) => void;
 }
 
+// Responsive ladder. The window min-width is 960px (Tauri config), so
+// below `lg` (1024px) we're in "just above minimum" territory — labels
+// start collapsing to icons so the essential bits (AI model, Auto
+// Recording toggle, system status) keep full visibility. At `2xl` and
+// above everything has generous breathing room.
+//
 // Every header item uses the same visual grammar: a colored icon carries
-// the state, gray text carries the label, a middle-dot separator carries
-// any secondary detail. Nothing is pilled — we used to mix pills with
-// icon+text and it read as "two languages in one bar".
+// state, gray text carries the label, a middle-dot separator carries any
+// secondary detail. Labels that collapse under `xl` fall back to an icon
+// with a tooltip — no info is lost, just visual density.
 
 function computeIconClass(device: "cuda" | "cpu" | null): string {
   if (device === "cuda") return "text-emerald-400";
@@ -45,7 +51,8 @@ function deviceTextClass(device: "cuda" | "cpu" | null): string {
 function StatusIndicator({ status, message }: { status: StatusEvent; message: string }) {
   // The status item is a dot + text instead of an icon + text — the dot
   // stays as the one place in the bar where animation (pulse) is a strong
-  // visual affordance for "something is happening right now".
+  // visual affordance for "something is happening right now". Below `md`
+  // the text hides and only the dot remains (tooltip carries the label).
   const cfg =
     status === "loading" || status === "processing"
       ? { dot: "bg-amber-500 animate-pulse", text: "text-amber-300", label: status === "processing" ? "Processing" : "Loading" }
@@ -56,9 +63,9 @@ function StatusIndicator({ status, message }: { status: StatusEvent; message: st
       : { dot: "bg-emerald-500", text: "text-emerald-300", label: "System Ready" };
 
   return (
-    <div className="flex items-center gap-1.5 text-xs">
+    <div className="flex items-center gap-1.5 text-xs flex-shrink-0" title={cfg.label}>
       <div className={`w-1.5 h-1.5 rounded-full ${cfg.dot}`} />
-      <span className={cfg.text}>{cfg.label}</span>
+      <span className={`${cfg.text} hidden md:inline`}>{cfg.label}</span>
     </div>
   );
 }
@@ -76,45 +83,51 @@ export function Header({
     !llm.loadedModels.includes(llm.configuredModel)
   );
 
+  // Shared by every "collapsing" header item — labels hide below `xl`
+  // (1280px), tooltip still carries the info.
+  const labelCollapsible = "hidden xl:inline";
+  const separatorCollapsible = "text-gray-600 hidden xl:inline";
+
   return (
-    <header className="flex items-center gap-3 px-4 py-2.5 border-b border-gray-800 bg-gray-950/80 backdrop-blur-sm flex-shrink-0">
+    <header className="flex items-center gap-2 lg:gap-3 px-3 lg:px-4 py-2.5 border-b border-gray-800 bg-gray-950/80 backdrop-blur-sm flex-shrink-0 overflow-hidden">
       {/* Sidecar WS connection */}
       <div
-        className="flex items-center gap-1.5 text-xs"
+        className="flex items-center gap-1.5 text-xs flex-shrink-0"
         title={wsConnected ? "Sidecar connected" : "Reconnecting to sidecar…"}
       >
         {wsConnected
           ? <PlugZap size={13} className="text-emerald-400" />
           : <Plug size={13} className="text-amber-400 animate-pulse" />}
-        <span className={wsConnected ? "text-gray-300" : "text-amber-400"}>
+        <span className={`${wsConnected ? "text-gray-300" : "text-amber-400"} ${labelCollapsible}`}>
           {wsConnected ? "Sidecar" : "Reconnecting"}
         </span>
       </div>
 
-      <div className="h-4 w-px bg-gray-800" />
+      <div className="h-4 w-px bg-gray-800 hidden xl:block" />
 
-      {/* AI model provider */}
+      {/* AI model provider — the model name truncates progressively so
+          narrow windows get a short slug instead of clobbering Whisper. */}
       <div
-        className="flex items-center gap-1.5 text-xs min-w-0"
+        className="flex items-center gap-1.5 text-xs min-w-0 flex-shrink"
         title={
           llm.online
             ? aiMisconfigured
               ? `Configured model "${llm.configuredModel}" not reported by the provider. Available: ${llm.loadedModels.join(", ") || "none"}.`
-              : `AI provider online. Available: ${llm.loadedModels.join(", ") || "none"}.`
+              : `AI provider online. Model: ${aiLabel}. Available: ${llm.loadedModels.join(", ") || "none"}.`
             : "AI provider unreachable — live intelligence and summaries will fail. Check Settings → LLM Provider."
         }
       >
         <Brain
           size={13}
-          className={
+          className={`flex-shrink-0 ${
             !llm.online ? "text-red-400"
             : aiMisconfigured ? "text-amber-400"
             : "text-emerald-400"
-          }
+          }`}
         />
-        <span className={!llm.online ? "text-red-400" : "text-gray-300"}>AI</span>
-        <span className="text-gray-600">·</span>
-        <span className={`truncate max-w-[220px] ${
+        <span className={`${!llm.online ? "text-red-400" : "text-gray-300"} flex-shrink-0`}>AI</span>
+        <span className="text-gray-600 flex-shrink-0">·</span>
+        <span className={`truncate min-w-0 max-w-[80px] lg:max-w-[140px] 2xl:max-w-[220px] ${
           !llm.online ? "text-red-400"
           : aiMisconfigured ? "text-amber-400"
           : "text-gray-400"
@@ -123,11 +136,11 @@ export function Header({
         </span>
       </div>
 
-      <div className="h-4 w-px bg-gray-800" />
+      <div className="h-4 w-px bg-gray-800 hidden xl:block" />
 
-      {/* Obsidian — icon color carries the state, no extra label */}
+      {/* Obsidian — label collapses under xl, icon+tooltip survive */}
       <div
-        className="flex items-center gap-1.5 text-xs"
+        className="flex items-center gap-1.5 text-xs flex-shrink-0"
         title={
           obsidianConfigured
             ? "Obsidian vault configured — meetings are mirrored to markdown"
@@ -138,19 +151,20 @@ export function Header({
           size={13}
           className={obsidianConfigured ? "text-emerald-400" : "text-red-400"}
         />
-        <span className={obsidianConfigured ? "text-gray-300" : "text-red-400"}>
+        <span className={`${obsidianConfigured ? "text-gray-300" : "text-red-400"} ${labelCollapsible}`}>
           Obsidian
         </span>
       </div>
 
-      {/* Compute-placement items. One per pipeline so the user always
-          knows where Whisper and pyannote are running — they can diverge
-          (ctranslate2 has its own CUDA path; torch may be CPU-only). */}
+      {/* Compute-placement items. Whisper model name collapses first
+          (hidden under lg), then the "Whisper" label under xl — icon +
+          GPU/CPU badge always survive so the most important signal
+          (where is compute happening) is never hidden. */}
       {asr && (
         <>
-          <div className="h-4 w-px bg-gray-800" />
+          <div className="h-4 w-px bg-gray-800 hidden xl:block" />
           <div
-            className="flex items-center gap-1.5 text-xs"
+            className="flex items-center gap-1.5 text-xs min-w-0 flex-shrink"
             title={[
               `Whisper · ${asr.model}`,
               `device: ${asr.device.toUpperCase()}`,
@@ -161,13 +175,15 @@ export function Header({
             ].filter(Boolean).join(" · ")}
           >
             {asr.device === "cuda"
-              ? <Zap size={13} className={computeIconClass(asr.device)} />
-              : <Cpu size={13} className={computeIconClass(asr.device)} />}
-            <span className="text-gray-300">Whisper</span>
-            <span className="text-gray-600">·</span>
-            <span className="text-gray-400 font-mono truncate max-w-[140px]">{asr.model}</span>
-            <span className="text-gray-600">·</span>
-            <span className={`font-semibold ${deviceTextClass(asr.device)}`}>
+              ? <Zap size={13} className={`flex-shrink-0 ${computeIconClass(asr.device)}`} />
+              : <Cpu size={13} className={`flex-shrink-0 ${computeIconClass(asr.device)}`} />}
+            <span className={`text-gray-300 flex-shrink-0 ${labelCollapsible}`}>Whisper</span>
+            <span className={separatorCollapsible}>·</span>
+            <span className="text-gray-400 font-mono truncate min-w-0 max-w-[100px] 2xl:max-w-[180px] hidden lg:inline">
+              {asr.model}
+            </span>
+            <span className="text-gray-600 hidden lg:inline flex-shrink-0">·</span>
+            <span className={`font-semibold flex-shrink-0 ${deviceTextClass(asr.device)}`}>
               {deviceLabel(asr.device)}
             </span>
           </div>
@@ -175,9 +191,9 @@ export function Header({
       )}
       {diarization && (
         <>
-          <div className="h-4 w-px bg-gray-800" />
+          <div className="h-4 w-px bg-gray-800 hidden xl:block" />
           <div
-            className="flex items-center gap-1.5 text-xs"
+            className="flex items-center gap-1.5 text-xs flex-shrink-0"
             title={
               diarization.enabled
                 ? `Speaker diarization · device: ${diarization.device?.toUpperCase()}${
@@ -189,8 +205,8 @@ export function Header({
             }
           >
             <Users size={13} className={computeIconClass(diarization.device)} />
-            <span className="text-gray-300">Diarize</span>
-            <span className="text-gray-600">·</span>
+            <span className={`text-gray-300 ${labelCollapsible}`}>Diarize</span>
+            <span className={separatorCollapsible}>·</span>
             <span className={`font-semibold ${deviceTextClass(diarization.device)}`}>
               {deviceLabel(diarization.device)}
             </span>
@@ -198,11 +214,11 @@ export function Header({
         </>
       )}
 
-      <div className="flex-1" />
+      <div className="flex-1 min-w-[8px]" />
 
       <AutoCaptureChip state={autoCaptureState} setState={setAutoCaptureState} />
 
-      <div className="h-4 w-px bg-gray-800" />
+      <div className="h-4 w-px bg-gray-800 hidden md:block" />
 
       <StatusIndicator status={systemStatus} message={statusMessage} />
     </header>
