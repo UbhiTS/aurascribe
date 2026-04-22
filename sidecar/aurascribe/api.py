@@ -170,6 +170,7 @@ async def get_status() -> dict:
     return {
         "ok": True,
         "version": __version__,
+        "platform": sys.platform,   # "win32" | "darwin" | "linux" — lets the frontend adapt UI text
         "engine_ready": manager.is_ready,
         "is_recording": manager.is_recording,
         "current_meeting_id": manager.current_meeting_id,
@@ -208,20 +209,39 @@ async def list_models() -> dict:
 async def open_mic_settings() -> dict:
     """Launch the OS microphone-privacy settings pane.
 
-    Called from the frontend's "permission denied" dialog so the user
-    gets a one-click path to the fix rather than having to hunt through
-    Windows Settings manually. No-op on non-Windows (returns a hint).
+    Called from the frontend's "permission denied" dialog so the user gets a
+    one-click path to the fix rather than having to hunt through system settings
+    manually.
+
+    Windows — opens ms-settings:privacy-microphone via cmd /c start.
+    macOS   — opens System Settings → Privacy & Security → Microphone via open.
+    Other   — returns {ok: false, reason: "unsupported-platform"}.
     """
-    if sys.platform != "win32":
-        return {"ok": False, "reason": "only-windows"}
-    try:
-        # `ms-settings:` is a Windows shell URI scheme. `cmd /c start` is the
-        # canonical dispatcher — same pattern as intel.open-prompt.
-        subprocess.Popen(
-            ["cmd", "/c", "start", "", "ms-settings:privacy-microphone"],
-            shell=False,
-            close_fds=True,
-        )
-    except Exception as e:
-        raise HTTPException(500, f"Could not open mic settings: {e}")
-    return {"ok": True}
+    if sys.platform == "win32":
+        try:
+            subprocess.Popen(
+                ["cmd", "/c", "start", "", "ms-settings:privacy-microphone"],
+                shell=False,
+                close_fds=True,
+            )
+        except Exception as e:
+            raise HTTPException(500, f"Could not open mic settings: {e}")
+        return {"ok": True}
+
+    if sys.platform == "darwin":
+        try:
+            # The x-apple.systempreferences: URL scheme opens the specified
+            # pane in System Settings (macOS 13+) or System Preferences (12).
+            subprocess.Popen(
+                [
+                    "open",
+                    "x-apple.systempreferences:com.apple.preference.security"
+                    "?Privacy_Microphone",
+                ],
+                close_fds=True,
+            )
+        except Exception as e:
+            raise HTTPException(500, f"Could not open mic settings: {e}")
+        return {"ok": True}
+
+    return {"ok": False, "reason": "unsupported-platform"}

@@ -173,6 +173,9 @@ export interface AppStatus {
     enabled: boolean;
     device: "cuda" | "cpu" | null;
   };
+  // sys.platform from the sidecar process — "win32", "darwin", or "linux".
+  // Used by the UI to display OS-appropriate instructions and labels.
+  platform?: string;
 }
 
 export interface DailyBriefDecision {

@@ -1,0 +1,1 @@
+This folder contains the code to my personal project for helping me keep a track of all my meetings as well as generating transcripts, and then notes which I maintian in obsidian

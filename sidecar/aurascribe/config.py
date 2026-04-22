@@ -1,4 +1,4 @@
-"""Runtime configuration — Windows-native paths.
+"""Runtime configuration — cross-platform paths.
 
 All user settings live in `APP_DATA/config.json`. `.env` is not consulted:
 if a value isn't in config.json, it falls back to the built-in default.
@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from pathlib import Path
 
 
@@ -33,13 +34,23 @@ def _expand(p: str | None) -> Path | None:
 # is. After that, no other state touches this location; everything else
 # follows APP_DATA.
 #
-# Note: `%APPDATA%` below reads the Windows system env var that points at
-# the per-user roaming folder — not a user-settable override. It's how
-# Windows tells us where to put user data.
+# Platform-appropriate user data directory:
+#   Windows  → %APPDATA%\AuraScribe          (e.g. C:\Users\<user>\AppData\Roaming\AuraScribe)
+#   macOS    → ~/Library/Application Support/AuraScribe
+#   Linux    → $XDG_DATA_HOME/AuraScribe     (falls back to ~/.local/share/AuraScribe)
 
-DEFAULT_APP_DATA: Path = Path(
-    os.environ.get("APPDATA", str(Path.home() / "AppData" / "Roaming"))
-) / "AuraScribe"
+if sys.platform == "win32":
+    DEFAULT_APP_DATA: Path = (
+        Path(os.environ.get("APPDATA", str(Path.home() / "AppData" / "Roaming")))
+        / "AuraScribe"
+    )
+elif sys.platform == "darwin":
+    DEFAULT_APP_DATA = Path.home() / "Library" / "Application Support" / "AuraScribe"
+else:
+    DEFAULT_APP_DATA = (
+        Path(os.environ.get("XDG_DATA_HOME", str(Path.home() / ".local" / "share")))
+        / "AuraScribe"
+    )
 
 # Bootstrap pointer — anchors the state tree. Never moves.
 BOOTSTRAP_FILE: Path = DEFAULT_APP_DATA / "bootstrap.json"
@@ -375,6 +386,16 @@ def _probe_hardware() -> dict:
                 info["vram_gb"] = round(props.total_memory / (1024**3), 1)
             except Exception:
                 pass
+        # Apple Silicon MPS — only probe when no CUDA was found (mutually
+        # exclusive on the same machine). MPS uses unified memory so there's
+        # no discrete VRAM figure; we leave vram_gb as None.
+        if info["device"] == "cpu":
+            try:
+                if torch.backends.mps.is_available():
+                    info["device"] = "mps"
+                    info["device_name"] = "Apple Silicon GPU"
+            except Exception:
+                pass
     except Exception:
         pass
 
@@ -390,13 +411,16 @@ def _default_whisper_device() -> str:
 
 def _default_whisper_compute_type() -> str:
     device = _default_whisper_device()
-    if device != "cuda":
+    if device == "cuda":
+        vram = HARDWARE_PROBE.get("vram_gb")
+        if vram is None or vram >= 8:
+            return "float16"
+        if vram >= 4:
+            return "int8_float16"
         return "int8"
-    vram = HARDWARE_PROBE.get("vram_gb")
-    if vram is None or vram >= 8:
+    if device == "mps":
+        # CTranslate2 uses Metal on MPS; float16 is the correct precision.
         return "float16"
-    if vram >= 4:
-        return "int8_float16"
     return "int8"
 
 
@@ -406,13 +430,16 @@ def _default_whisper_model() -> str:
     `large-v3-turbo` is terrific on GPU but excruciating on CPU (~8x realtime
     on an i7). On CPU we start with `small` (~1x realtime, still usable
     quality), which the user can upgrade once they see how it performs.
+    MPS (Apple Silicon) has excellent unified-memory bandwidth — treat it like
+    a mid-range GPU and default to `large-v3-turbo`.
     """
     device = _default_whisper_device()
-    if device != "cuda":
+    if device == "cpu":
         return "small"
-    vram = HARDWARE_PROBE.get("vram_gb")
-    if vram is not None and vram < 4:
-        return "medium"
+    if device == "cuda":
+        vram = HARDWARE_PROBE.get("vram_gb")
+        if vram is not None and vram < 4:
+            return "medium"
     return "large-v3-turbo"
 
 
@@ -422,7 +449,7 @@ WHISPER_COMPUTE_TYPE: str = _cfg_str("whisper_compute_type", _default_whisper_co
 
 # Safety net: float16 is a no-op / error on CPU. If the user has crossed
 # streams (e.g. device=cpu, compute_type=float16 from an old config) clamp
-# to a safe combo and log.
+# to a safe combo and log. MPS is GPU-backed so float16 is fine there.
 if WHISPER_DEVICE == "cpu" and WHISPER_COMPUTE_TYPE == "float16":
     import logging as _cfg_log
     _cfg_log.getLogger("aurascribe").warning(

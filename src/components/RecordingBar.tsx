@@ -21,6 +21,9 @@ interface Props {
   outputDevices: { index: number; name: string }[];
   onStarted: (id: string) => void;
   onStopped: () => void;
+  // sys.platform from the sidecar — "win32", "darwin", or "linux".
+  // Drives OS-specific labels (e.g. mic permission settings button).
+  platform?: string;
 }
 
 // localStorage keys. Device selection is stored by device *name* (not
@@ -36,7 +39,7 @@ function readMode(): SourceMode {
   return v === "mic" || v === "system" || v === "mix" ? v : "mic";
 }
 
-export function RecordingBar({ isRecording, devices, outputDevices, onStarted, onStopped }: Props) {
+export function RecordingBar({ isRecording, devices, outputDevices, onStarted, onStopped, platform }: Props) {
   const [mode, setMode] = useState<SourceMode>(() => readMode());
   const [deviceIndex, setDeviceIndex] = useState<number | undefined>(undefined);
   // Loopback / system-audio source. undefined = no system-audio capture
@@ -294,7 +297,10 @@ export function RecordingBar({ isRecording, devices, outputDevices, onStarted, o
           {mode !== "mic" && outputDevices.length > 0 && (
             <label
               className="flex items-center gap-1.5 text-xs text-gray-500"
-              title="System-audio source (WASAPI loopback). Captures whatever's playing through the selected speaker — use this for Zoom/Teams/Meet participants, video playback, etc."
+              title={platform === "darwin"
+              ? "System-audio source (BlackHole / virtual device). Captures whatever's playing — use this for Zoom/Teams/Meet participants, video playback, etc."
+              : "System-audio source (WASAPI loopback). Captures whatever's playing through the selected speaker — use this for Zoom/Teams/Meet participants, video playback, etc."
+            }
             >
               <Volume2 size={12} className="text-gray-500" />
               <select
@@ -369,7 +375,7 @@ export function RecordingBar({ isRecording, devices, outputDevices, onStarted, o
                 className="flex items-center gap-1.5 px-3 py-1.5 text-xs bg-brand-600 hover:bg-brand-700 disabled:opacity-50 text-white rounded-lg"
               >
                 <ExternalLink size={11} />
-                Open Windows mic settings
+                {platform === "darwin" ? "Open macOS Privacy Settings" : "Open Windows mic settings"}
               </button>
             )}
           </div>

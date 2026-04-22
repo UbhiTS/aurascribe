@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<!--
+  macOS hardened-runtime entitlements for AuraScribe.
+
+  These are required when the app is code-signed with Hardened Runtime
+  enabled (mandatory for Notarization). The microphone entitlement lets
+  the sidecar's sounddevice stream open without triggering a TCC denial,
+  and audio-input covers CoreAudio HAL access used by the loopback path.
+
+  For unsigned development builds, entitlements are not enforced by the
+  kernel — mic access is controlled solely by the NSMicrophoneUsageDescription
+  in Info.plist via the Privacy & Security permission dialog.
+-->
+<dict>
+    <!-- Required for sounddevice / PortAudio mic capture -->
+    <key>com.apple.security.device.microphone</key>
+    <true/>
+    <!-- Required for CoreAudio HAL (used by loopback / BlackHole path) -->
+    <key>com.apple.security.device.audio-input</key>
+    <true/>
+</dict>
+</plist>

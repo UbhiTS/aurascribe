@@ -1,23 +1,26 @@
 name: Release
 
-# Two-variant Windows release pipeline.
+# Cross-platform release pipeline — Windows (CUDA + CPU) and macOS (CPU/MPS).
 #
-#   * Tag push  (v*)         — builds BOTH variants in parallel + creates a
-#                              DRAFT GitHub Release with both installers
-#                              attached. Review + click Publish manually.
-#   * Manual    (workflow_dispatch) — builds + uploads both installers as
-#                              CI artifacts only (no release).
+#   * Tag push  (v*)             — builds all variants in parallel + creates a
+#                                  DRAFT GitHub Release with all installers
+#                                  attached. Review + click Publish manually.
+#   * Manual (workflow_dispatch) — builds + uploads installers as CI artifacts
+#                                  only (no release).
 #
 # VARIANTS
-#   cuda  — PyTorch CUDA 12.1 wheel + NVIDIA cuBLAS/cuDNN DLLs bundled.
-#           Works with or without an NVIDIA GPU (CPU fallback happens at
-#           runtime), but installer is ~1.5–2 GB.
-#   cpu   — PyTorch CPU wheel. No CUDA DLLs shipped. Installer is ~700–900 MB.
-#           Runs Whisper on CPU even on machines that have a GPU.
+#   windows-cuda  — PyTorch CUDA 12.8 wheel + NVIDIA cuBLAS/cuDNN DLLs bundled.
+#                   Works with or without an NVIDIA GPU (CPU fallback at runtime).
+#                   Installer ~1.5–2 GB (CUDA DLLs streamed on first launch).
+#   windows-cpu   — PyTorch CPU wheel. No CUDA DLLs. Installer ~700–900 MB.
+#   macos         — PyTorch standard wheel (MPS + CPU). Packaged as a .dmg.
+#                   Runs on Apple Silicon (MPS acceleration) and Intel (CPU).
+#                   Installer ~700 MB.
 #
 # Output filenames are stable so bookmarks / release pages don't break:
 #   AuraScribe-CUDA-setup.exe
 #   AuraScribe-CPU-setup.exe
+#   AuraScribe-macOS-arm64.dmg
 
 on:
   push:
@@ -34,24 +37,34 @@ permissions:
 
 jobs:
   build:
-    name: Build (${{ matrix.variant }})
-    runs-on: windows-latest
+    name: Build (${{ matrix.label }})
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 90
     strategy:
-      # Don't cancel the other variant if one fails — we still want a usable
-      # artifact even if one combo hits a transitive-dep issue on this runner.
+      # Don't cancel the other variants if one fails.
       fail-fast: false
       matrix:
         include:
-          - variant: cuda
-            # cu128 is the current CUDA-12 index with Python 3.13 wheels;
-            # cu121/cu124 were dropped for newer torch versions. Bump this
-            # when PyTorch ships a newer CUDA major.
+          # ── Windows CUDA ──────────────────────────────────────────────────
+          - label: windows-cuda
+            os: windows-latest
+            variant: cuda
             torch_index: https://download.pytorch.org/whl/cu128
             installer_name: AuraScribe-CUDA-setup.exe
-          - variant: cpu
+          # ── Windows CPU ───────────────────────────────────────────────────
+          - label: windows-cpu
+            os: windows-latest
+            variant: cpu
             torch_index: https://download.pytorch.org/whl/cpu
             installer_name: AuraScribe-CPU-setup.exe
+          # ── macOS arm64 (Apple Silicon — MPS; Intel via Rosetta 2 — CPU) ────
+          - label: macos-arm64
+            os: macos-latest        # resolves to macos-15 arm64 as of 2025
+            variant: cpu
+            # Standard PyPI torch wheel includes MPS for Apple Silicon.
+            # No special index URL needed.
+            torch_index: ""
+            installer_name: AuraScribe-macOS-arm64.dmg
 
     steps:
       - name: Checkout
@@ -75,63 +88,81 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: src-tauri
-          # Cache key includes the variant so cuda + cpu don't clobber
-          # each other's target/.
-          key: ${{ matrix.variant }}
+          key: ${{ matrix.label }}
 
       - name: Install npm dependencies
         run: npm ci
 
-      # Two-step pip install: first the variant-specific torch wheel,
-      # then the sidecar with its extras. Installing torch ahead of
-      # `pip install -e .[all]` pins the wheel so the extras' install
-      # doesn't re-resolve torch to the default CPU wheel from PyPI.
-      - name: Install PyTorch (${{ matrix.variant }})
+      # ── Python venv + deps (Windows) ────────────────────────────────────
+      - name: Install PyTorch — Windows (${{ matrix.variant }})
+        if: runner.os == 'Windows'
         shell: powershell
         run: |
           python -m venv .venv
           .venv\Scripts\python -m pip install --upgrade pip
           .venv\Scripts\pip install torch torchaudio --index-url ${{ matrix.torch_index }}
 
-      - name: Install sidecar + ML extras + build tools
+      - name: Install sidecar + ML extras + build tools — Windows
+        if: runner.os == 'Windows'
         shell: powershell
         run: |
           .venv\Scripts\pip install -e ".\sidecar[all]"
           .venv\Scripts\pip install pyinstaller
 
-      - name: Install NVIDIA CUDA runtime DLLs (cuda variant only)
-        if: matrix.variant == 'cuda'
+      - name: Install NVIDIA CUDA runtime DLLs (windows-cuda only)
+        if: matrix.label == 'windows-cuda'
         shell: powershell
         run: .venv\Scripts\pip install nvidia-cublas-cu12 nvidia-cudnn-cu12
 
-      - name: Build Python sidecar (PyInstaller onedir)
+      # ── Python venv + deps (macOS) ───────────────────────────────────────
+      - name: Install PyTorch — macOS (MPS-capable from PyPI)
+        if: runner.os == 'macOS'
+        run: |
+          python3 -m venv .venv
+          .venv/bin/python3 -m pip install --upgrade pip
+          .venv/bin/pip install torch torchaudio
+
+      - name: Install sidecar + ML extras + build tools — macOS
+        if: runner.os == 'macOS'
+        run: |
+          .venv/bin/pip install -e "./sidecar[all]"
+          .venv/bin/pip install pyinstaller
+
+      # ── Build Python sidecar ─────────────────────────────────────────────
+      - name: Build Python sidecar — Windows
+        if: runner.os == 'Windows'
         run: npm run build:sidecar
 
-      - name: Verify sidecar output
+      - name: Build Python sidecar — macOS
+        if: runner.os == 'macOS'
+        run: npm run build:sidecar
+
+      # ── Verify sidecar ───────────────────────────────────────────────────
+      - name: Verify sidecar output — Windows
+        if: runner.os == 'Windows'
         shell: powershell
         run: |
           $exe = "sidecar\dist\aurascribe-sidecar\aurascribe-sidecar.exe"
           if (-not (Test-Path $exe)) { throw "Sidecar not produced at $exe" }
           $bundleDir = Split-Path $exe
           $sizeMB = [math]::Round(((Get-ChildItem -Recurse $bundleDir | Measure-Object Length -Sum).Sum / 1MB), 1)
-          Write-Host "Sidecar bundle (${{ matrix.variant }}): $sizeMB MB"
+          Write-Host "Sidecar bundle (${{ matrix.label }}): $sizeMB MB"
 
-      # NSIS (32-bit makensis) crashes with "Internal compiler error
-      # #12345: error mmapping datablock" on the full ~1.5 GB CUDA
-      # sidecar. WiX's light.exe is also 32-bit and OOMs similarly.
-      # Workaround: move the big CUDA DLLs out of the sidecar bundle
-      # into a separate zip that gets shipped as a release asset and
-      # downloaded by the sidecar on first launch. The installer then
-      # carries only the slim "CUDA-less" bundle, which NSIS handles
-      # just fine.
-      #
-      # The marker file tells the running sidecar (see
-      # aurascribe/cuda_runtime.py) that the runtime needs hydrating.
-      # The ready-marker file is written only after a successful
-      # extract on the user's machine, so crashed/interrupted downloads
-      # are retried automatically.
-      - name: Split CUDA runtime bundle (cuda variant only)
-        if: matrix.variant == 'cuda'
+      - name: Verify sidecar output — macOS
+        if: runner.os == 'macOS'
+        run: |
+          bin="sidecar/dist/aurascribe-sidecar/aurascribe-sidecar"
+          if [[ ! -f "$bin" ]]; then echo "ERROR: Sidecar not produced at $bin" >&2; exit 1; fi
+          size=$(du -sh "$(dirname "$bin")" | cut -f1)
+          echo "Sidecar bundle (${{ matrix.label }}): $size"
+
+      # ── Windows CUDA runtime split ───────────────────────────────────────
+      # NSIS (32-bit makensis) crashes on bundles > ~1 GB. Move the big CUDA
+      # DLLs out into separate .partN.zip files that the sidecar streams on
+      # first launch. The slim installer then carries only the CUDA-less
+      # bundle, which NSIS handles fine.
+      - name: Split CUDA runtime bundle (windows-cuda only)
+        if: matrix.label == 'windows-cuda'
         shell: powershell
         env:
           VERSION: ${{ github.ref_name }}
@@ -141,19 +172,11 @@ jobs:
           $runtimeDir = "sidecar\dist\cuda-runtime"
           New-Item -ItemType Directory -Force -Path $runtimeDir | Out-Null
 
-          # Plant the marker inside the sidecar bundle so that at
-          # runtime the sidecar knows to fetch the runtime zip before
-          # importing anything CUDA-backed.
           $markerDir = Join-Path $bundleDir "_internal\aurascribe"
           New-Item -ItemType Directory -Force -Path $markerDir | Out-Null
           $version | Out-File -FilePath (Join-Path $markerDir "requires_cuda_runtime.txt") `
             -Encoding ASCII -NoNewline
 
-          # Move anything >=50 MB (the big CUDA kernel DLLs —
-          # torch_cuda.dll, cudnn_*, cublas_*, etc.) plus everything
-          # under _internal/nvidia/ (nvidia-cu12 wheel contents). The
-          # resulting bundle is comfortably under 1 GB so NSIS handles
-          # it without blowing through its mmap limit.
           $threshold = 50MB
           $bundleRoot = $bundleDir.Path
           $big = Get-ChildItem -Path $bundleRoot -Recurse -File | Where-Object { $_.Length -ge $threshold }
@@ -173,18 +196,10 @@ jobs:
           }
 
           $runtimeBytes = (Get-ChildItem -Recurse $runtimeDir | Measure-Object Length -Sum).Sum
-          $remainBytes = (Get-ChildItem -Recurse $bundleRoot | Measure-Object Length -Sum).Sum
+          $remainBytes  = (Get-ChildItem -Recurse $bundleRoot  | Measure-Object Length -Sum).Sum
           Write-Host ("Split: runtime={0:N1} MB, remaining bundle={1:N1} MB" -f `
             ($runtimeBytes / 1MB), ($remainBytes / 1MB))
 
-          # The full runtime is ~3.9 GB — GitHub Release assets are
-          # capped at 2 GB per file, so we bin-pack files into multiple
-          # < 1800 MB zips and publish a small manifest next to them.
-          # First-fit-decreasing: sort files by size descending, drop
-          # each into the first bin with room, else open a new bin.
-          # CUDA kernel DLLs don't compress (they're already compressed
-          # internally) so we store (-mx=0) to keep CI + client-side
-          # extract fast.
           $maxBinSize = 1800MB
           $files = Get-ChildItem -Path $runtimeDir -Recurse -File | Sort-Object Length -Descending
           $bins = New-Object System.Collections.ArrayList
@@ -199,10 +214,7 @@ jobs:
               }
             }
             if (-not $placed) {
-              $bin = [pscustomobject]@{
-                Files = New-Object System.Collections.ArrayList
-                Size  = 0L
-              }
+              $bin = [pscustomobject]@{ Files = New-Object System.Collections.ArrayList; Size = 0L }
               $bin.Files.Add($f) | Out-Null
               $bin.Size = $f.Length
               $bins.Add($bin) | Out-Null
@@ -215,26 +227,20 @@ jobs:
           $manifestLines.Add("version=$version") | Out-Null
           $manifestLines.Add("parts=$($bins.Count)") | Out-Null
 
-          # Capture the absolute paths BEFORE the push — inside the
-          # pushed location, relative references like $runtimeDir
-          # resolve against the new cwd (creating a doubled path).
           $runtimeDirAbs = (Resolve-Path $runtimeDir).Path
-          $workspaceDir = (Get-Location).Path
+          $workspaceDir  = (Get-Location).Path
 
           Push-Location $runtimeDir
           try {
             for ($i = 0; $i -lt $bins.Count; $i++) {
               $partIndex = $i + 1
-              $partName = "$baseName.part$partIndex.zip"
-              $listFile = Join-Path $env:RUNNER_TEMP "part$partIndex.lst"
-              $partAbs = Join-Path $workspaceDir $partName
-
-              # Write relative paths so 7z zips with paths preserved.
-              $relPaths = foreach ($bf in $bins[$i].Files) {
+              $partName  = "$baseName.part$partIndex.zip"
+              $listFile  = Join-Path $env:RUNNER_TEMP "part$partIndex.lst"
+              $partAbs   = Join-Path $workspaceDir $partName
+              $relPaths  = foreach ($bf in $bins[$i].Files) {
                 $bf.FullName.Substring($runtimeDirAbs.Length + 1)
               }
               Set-Content -Path $listFile -Value $relPaths -Encoding ASCII
-
               & $sevenZip a -tzip -mx=0 $partAbs "@$listFile" | Out-Null
               if ($LASTEXITCODE -ne 0) { throw "7z failed on part $partIndex with exit $LASTEXITCODE" }
             }
@@ -244,7 +250,7 @@ jobs:
 
           for ($i = 0; $i -lt $bins.Count; $i++) {
             $partIndex = $i + 1
-            $partName = "$baseName.part$partIndex.zip"
+            $partName  = "$baseName.part$partIndex.zip"
             $partSizeMB = [math]::Round((Get-Item $partName).Length / 1MB, 1)
             $manifestLines.Add("part$partIndex=$partName") | Out-Null
             Write-Host "Part ${partIndex}: $partName ($partSizeMB MB)"
@@ -255,10 +261,8 @@ jobs:
           Write-Host "Manifest: $manifestName"
           Get-Content $manifestName | ForEach-Object { Write-Host "  $_" }
 
-      # Upload one artifact per runtime part + the manifest. The release
-      # job globs `AuraScribe-CUDA-runtime-*` to pick them all up.
-      - name: Upload CUDA runtime parts (cuda variant only)
-        if: matrix.variant == 'cuda'
+      - name: Upload CUDA runtime parts (windows-cuda only)
+        if: matrix.label == 'windows-cuda'
         uses: actions/upload-artifact@v4
         with:
           name: AuraScribe-CUDA-runtime-parts-${{ github.ref_name }}
@@ -268,13 +272,13 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
-      - name: Build Tauri app (${{ matrix.variant }})
+      # ── Build Tauri app ───────────────────────────────────────────────────
+      - name: Build Tauri app (${{ matrix.label }})
         run: npm run tauri:build
 
-      # Tauri's default NSIS output name is versioned + arch-tagged
-      # (e.g. AuraScribe_0.1.0_x64-setup.exe). Rename to the stable
-      # variant-tagged filename the release expects.
-      - name: Rename installer to ${{ matrix.installer_name }}
+      # ── Rename installer to stable filename ──────────────────────────────
+      - name: Rename installer — Windows
+        if: runner.os == 'Windows'
         shell: powershell
         run: |
           $src = Get-ChildItem -Path "src-tauri\target\release\bundle\nsis\*.exe" | Select-Object -First 1
@@ -284,7 +288,19 @@ jobs:
           $sizeMB = [math]::Round((Get-Item $dst).Length / 1MB, 1)
           Write-Host "Installer: ${{ matrix.installer_name }} ($sizeMB MB)"
 
-      - name: Upload installer artifact
+      - name: Rename installer — macOS
+        if: runner.os == 'macOS'
+        run: |
+          src=$(find src-tauri/target/release/bundle/dmg -name "*.dmg" | head -1)
+          if [[ -z "$src" ]]; then echo "ERROR: No DMG produced" >&2; exit 1; fi
+          dst="$(dirname "$src")/${{ matrix.installer_name }}"
+          cp "$src" "$dst"
+          size=$(du -h "$dst" | cut -f1)
+          echo "Installer: ${{ matrix.installer_name }} ($size)"
+
+      # ── Upload installer artifact ────────────────────────────────────────
+      - name: Upload installer — Windows
+        if: runner.os == 'Windows'
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.installer_name }}
@@ -292,15 +308,23 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
+      - name: Upload installer — macOS
+        if: runner.os == 'macOS'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.installer_name }}
+          path: src-tauri/target/release/bundle/dmg/${{ matrix.installer_name }}
+          if-no-files-found: error
+          retention-days: 30
+
   release:
     name: Draft GitHub Release
     needs: build
     runs-on: ubuntu-latest
-    # Release creation only fires on actual tag pushes. workflow_dispatch
-    # runs stop at the build stage with the installers as artifacts.
+    # Only fire on actual tag pushes; workflow_dispatch stops after build.
     if: startsWith(github.ref, 'refs/tags/')
     steps:
-      - name: Download installers + CUDA runtime parts
+      - name: Download all installers + CUDA runtime parts
         uses: actions/download-artifact@v4
         with:
           pattern: AuraScribe-*
@@ -317,27 +341,29 @@ jobs:
           name: AuraScribe ${{ github.ref_name }}
           draft: true
           prerelease: false
-          # Glob picks up all the runtime parts + manifest automatically.
-          # Each part is < 2 GB (GitHub's per-file release asset limit).
           files: |
             installers/AuraScribe-CUDA-setup.exe
             installers/AuraScribe-CPU-setup.exe
+            installers/AuraScribe-macOS-arm64.dmg
             installers/AuraScribe-CUDA-runtime-${{ github.ref_name }}.manifest.txt
             installers/AuraScribe-CUDA-runtime-${{ github.ref_name }}.part*.zip
           body: |
-            Windows installers — two flavours:
+            ## Download
 
-            | Installer | When to pick it | Installer size | Disk after first launch |
-            |---|---|---|---|
-            | **AuraScribe-CUDA-setup.exe** | You have an NVIDIA GPU (any RTX card). Fastest transcription + GPU diarization. On first launch the sidecar streams a ~6 GB CUDA DLL bundle from this release (four `.partN.zip` files + a manifest) into the install dir. Plan ~10–20 min on typical broadband before the app is usable. | ~140 MB | ~6 GB |
-            | **AuraScribe-CPU-setup.exe** | No GPU, or you want the smaller install. Transcription is 5–10× slower but still usable. | ~260 MB | ~700–900 MB |
+            | Platform | Installer | Notes |
+            |---|---|---|
+            | **Windows** (NVIDIA GPU) | `AuraScribe-CUDA-setup.exe` | Fastest transcription. On first launch the sidecar streams ~6 GB of CUDA DLLs — allow 10–20 min on typical broadband before the app is usable. |
+            | **Windows** (no GPU) | `AuraScribe-CPU-setup.exe` | ~5–10× slower transcription but no large download. |
+            | **macOS** (Apple Silicon native; Intel via Rosetta 2) | `AuraScribe-macOS-arm64.dmg` | MPS acceleration on Apple Silicon (M1/M2/M3/M4). Intel Macs run transparently via Rosetta 2 on CPU. |
 
-            Both installers:
-            - Install per-user to `%LOCALAPPDATA%\Programs\AuraScribe` — no admin rights needed.
-            - Store app data (DB, audio, logs, models) under `%APPDATA%\AuraScribe`. Uninstalling leaves that tree untouched.
-            - Download the Whisper + pyannote models (~2 GB) on first launch; subsequent launches are instant.
+            ### Windows installers
+            Both install per-user to `%LOCALAPPDATA%\Programs\AuraScribe` — no admin rights needed. App data (DB, audio, logs, models) lives under `%APPDATA%\AuraScribe` and survives uninstall.
 
-            Not sure which to pick? Install CUDA. It works with or without an NVIDIA GPU — the CUDA DLL download runs regardless, but if there's no GPU the CPU fallback kicks in at runtime.
+            ### macOS installer
+            Drag AuraScribe to Applications. On first launch macOS will ask for microphone permission — click Allow. For **System Audio** capture (record remote participants in Zoom/Teams/Meet), install [BlackHole 2ch](https://github.com/ExistentialAudio/BlackHole) and select it as the System Audio source.
+
+            ### First launch
+            All variants download the Whisper model (~1–2 GB depending on model size) and the pyannote speaker-diarization pipeline on first launch. Subsequent launches are instant.
 
             ---
-            **Why the CUDA runtime is a separate download:** the full CUDA payload is ~6 GB. NSIS (32-bit makensis) crashes with "Internal compiler error #12345" when asked to pack >1 GB of data, and GitHub release assets cap at 2 GB per file. The runtime ships as four bin-packed `.partN.zip` files plus a small `.manifest.txt`; the sidecar reads the manifest, downloads + extracts each part on first launch, and restores the full PyInstaller layout.
+            **Why the Windows CUDA runtime is a separate download:** the full CUDA payload is ~6 GB. NSIS (32-bit makensis) crashes on bundles > ~1 GB, and GitHub release assets cap at 2 GB per file. The runtime ships as bin-packed `.partN.zip` files plus a `.manifest.txt`; the sidecar reads the manifest, downloads + extracts on first launch, and restores the full PyInstaller layout.

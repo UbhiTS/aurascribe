@@ -41,13 +41,41 @@ fn write_panic_file(info: &std::panic::PanicHookInfo<'_>) -> std::io::Result<()>
     Ok(())
 }
 
-/// `%APPDATA%\AuraScribe\logs` on Windows. Matches what the Python sidecar
-/// uses so crash evidence from both sides ends up in one folder.
+/// Platform-appropriate log directory — mirrors the logic in Python's config.py
+/// so crash dumps from both the Rust shell and Python sidecar land together.
+///
+///   Windows → %APPDATA%\AuraScribe\logs
+///   macOS   → ~/Library/Application Support/AuraScribe/logs
+///   Linux   → $XDG_DATA_HOME/AuraScribe/logs  (falls back to ~/.local/share)
 fn logs_dir() -> PathBuf {
-    let base = std::env::var("APPDATA")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("."));
-    base.join("AuraScribe").join("logs")
+    #[cfg(target_os = "windows")]
+    {
+        let base = std::env::var("APPDATA")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from("."));
+        base.join("AuraScribe").join("logs")
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let home = std::env::var("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from("."));
+        home.join("Library")
+            .join("Application Support")
+            .join("AuraScribe")
+            .join("logs")
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        let base = std::env::var("XDG_DATA_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| {
+                std::env::var("HOME")
+                    .map(|h| PathBuf::from(h).join(".local").join("share"))
+                    .unwrap_or_else(|_| PathBuf::from("."))
+            });
+        base.join("AuraScribe").join("logs")
+    }
 }
 
 /// Basic timestamp string without pulling in a date crate — YYYYMMDD-HHMMSS
@@ -162,8 +190,16 @@ fn resolve_sidecar_launch(app: &AppHandle) -> Result<SidecarLaunch, String> {
             .parent()
             .ok_or_else(|| "Could not resolve repo root from CARGO_MANIFEST_DIR".to_string())?
             .to_path_buf();
+        // Platform-specific venv layout:
+        //   Windows → .venv\Scripts\python.exe
+        //   macOS / Linux → .venv/bin/python3
+        let python = if cfg!(windows) {
+            root.join(".venv").join("Scripts").join("python.exe")
+        } else {
+            root.join(".venv").join("bin").join("python3")
+        };
         Ok(SidecarLaunch {
-            python: Some(root.join(".venv").join("Scripts").join("python.exe")),
+            python: Some(python),
             target: root.join("sidecar").join("main.py"),
             cwd: root,
         })
@@ -194,10 +230,15 @@ fn spawn_sidecar(app: &AppHandle) -> Result<Child, String> {
 
     if let Some(py) = launch.python.as_ref() {
         if !py.exists() {
+            let setup_cmd = if cfg!(windows) {
+                "py -3.13 -m venv .venv && .venv\\Scripts\\pip install -e ./sidecar[all]"
+            } else {
+                "python3.13 -m venv .venv && .venv/bin/pip install -e ./sidecar[all]"
+            };
             return Err(format!(
-                "Python interpreter not found at {}.\n\n\
-                 Dev setup: py -3.13 -m venv .venv && .venv\\Scripts\\pip install -e ./sidecar[all]",
-                py.display()
+                "Python interpreter not found at {}.\n\nDev setup:\n  {}",
+                py.display(),
+                setup_cmd,
             ));
         }
     }

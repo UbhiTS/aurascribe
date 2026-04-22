@@ -3,23 +3,27 @@
 Yields audio chunks when speech is detected. Torch is a soft dep — imported
 lazily in `start()` so the sidecar boots without the `[asr]` extra installed.
 
-When `loopback_device` is supplied to `start()`, a second WASAPI-loopback
-capture is opened on that output device via `soundcard` (the libportaudio
-bundled with `sounddevice` is built without loopback support — missing
-`PaWasapi_IsLoopback` symbol — so we can't use the same library for both
-streams). A background worker pops aligned 10ms frames from both streams,
-runs Speex-style AEC (pyaec) with the loopback as reference, sums the
-cleaned mic with the loopback, and feeds the 16kHz mono result into the
-existing 512-sample block pipeline. That lets us capture remote
-participants (Zoom/Teams/Meet) + the local speaker over a
-single-mic-on-speakers setup without getting doubled transcripts from
-acoustic echo.
+System-audio / loopback capture is platform-specific:
+
+  Windows — a second WASAPI-loopback stream is opened on the chosen output
+  device via `soundcard` (the libportaudio bundled with `sounddevice` is built
+  without loopback support — missing `PaWasapi_IsLoopback` symbol). A
+  background worker aligns 10ms frames from both streams, runs Speex-style AEC
+  (pyaec) with the loopback as reference, sums the cleaned mic with the
+  loopback, and feeds the 16kHz mono result into the 512-sample block pipeline.
+
+  macOS — system audio is captured via a virtual loopback device such as
+  BlackHole (https://github.com/ExistentialAudio/BlackHole). BlackHole appears
+  as a standard CoreAudio input device, so a plain `sounddevice.InputStream` is
+  sufficient; no COM initialisation and no AEC are needed (the signal is
+  already clean digital audio with no acoustic echo path).
 """
 from __future__ import annotations
 
 import asyncio
 import ctypes
 import logging
+import sys
 import threading
 import time as _time
 from collections import deque
@@ -60,12 +64,12 @@ _MAX_SKEW_SAMPLES = 1280  # 80ms @ 16kHz
 
 
 class MicUnavailableError(RuntimeError):
-    """Microphone couldn't be opened — most commonly because Windows has
-    denied mic access to the app, the device is in use by another process,
-    or the selected device index has disappeared (Bluetooth headset gone).
+    """Microphone couldn't be opened — most commonly because the OS has denied
+    mic access to the app, the device is in use by another process, or the
+    selected device index has disappeared (Bluetooth headset gone).
 
     Carries a UI-friendly `kind` so the frontend can show the right
-    affordance (e.g. "Open Windows mic settings" for permission denials).
+    affordance (e.g. "Open mic settings" for permission denials).
     """
 
     def __init__(self, message: str, *, kind: str = "unknown") -> None:
@@ -102,9 +106,10 @@ class AudioCapture:
         self._mic_fifo: deque[np.ndarray] = deque()
         self._lb_fifo: deque[np.ndarray] = deque()
         self._fifo_lock = threading.Lock()
-        self._aec = None                  # pyaec.Aec instance
+        self._aec = None                  # pyaec.Aec instance (Windows only)
         self._aec_cancel = None           # direct lib.AecCancelEcho bound for ctypes fast-path
         self._aec_handle = None           # raw AecHandle pointer
+        self._aec_enabled: bool = False   # True only when Windows + pyaec is active
         self._worker: threading.Thread | None = None
         self._worker_stop = threading.Event()
         # Sync callback fired once per 512-sample block with (rms, peak) of
@@ -176,16 +181,25 @@ class AudioCapture:
         # Mic-only fast path — emit 512-sample blocks directly.
         self._emit_blocks(chunk)
 
-    def _loopback_thread_main(self, speaker_id: str, emit_direct: bool) -> None:
-        """Runs in a dedicated thread while the meeting is active.
+    def _loopback_thread_main(self, speaker_id: "str | int", emit_direct: bool) -> None:
+        """Dispatch to the platform-appropriate loopback capture thread.
+
+        On Windows ``speaker_id`` is a soundcard id string for the WASAPI
+        loopback endpoint. On macOS it is a sounddevice device index for a
+        virtual loopback device (e.g. BlackHole).
+        """
+        if sys.platform != "win32":
+            self._loopback_thread_coreaudio(int(speaker_id), emit_direct)
+            return
+        self._loopback_thread_wasapi(str(speaker_id), emit_direct)
+
+    def _loopback_thread_wasapi(self, speaker_id: str, emit_direct: bool) -> None:
+        """Windows WASAPI loopback via soundcard.
 
         `soundcard`'s recorder is a synchronous `record(numframes=N)` call
         inside a `with` block — there's no callback model — so we poll
         it on a thread. Ask for 16kHz mono directly and let WASAPI's
-        shared-mode resampler/mixer handle the conversion from the
-        endpoint's native format; it's more than good enough for
-        AEC-reference quality and cuts a soxr stream we'd otherwise have
-        to run on this thread.
+        shared-mode resampler/mixer handle the conversion.
 
         Two destinations depending on mode:
           * `emit_direct=False` (mix mode): push into `_lb_fifo` for the
@@ -197,8 +211,7 @@ class AudioCapture:
         have COM initialized. In mix mode sounddevice's own audio thread
         already did this so soundcard piggybacks without issue — but in
         system-only mode this thread is the first to touch COM in the
-        process, so we initialize explicitly. `CoInitializeEx` is a no-op
-        if COM is already up, so it's safe to always call.
+        process, so we initialize explicitly.
         """
         import soundcard as sc
         com_initialized = False
@@ -253,6 +266,64 @@ class AudioCapture:
                 except Exception:
                     pass
 
+    def _loopback_thread_coreaudio(self, device_index: int, emit_direct: bool) -> None:
+        """macOS: record from a virtual loopback device (e.g. BlackHole) via sounddevice.
+
+        BlackHole appears as a regular CoreAudio input device — no COM init
+        or WASAPI-specific APIs required. The captured signal is clean digital
+        audio, so no AEC is needed even in Mix mode.
+
+        Two destinations depending on mode (same semantics as the WASAPI path):
+          * ``emit_direct=True``  (system-only): push straight into `_emit_blocks`.
+          * ``emit_direct=False`` (mix):         push into `_lb_fifo` for the
+            mixer worker (which will sum without AEC on macOS).
+        """
+        import sounddevice as sd
+        import soxr
+
+        try:
+            info = sd.query_devices(device_index, kind="input")
+            native_sr = int(info["default_samplerate"]) or SAMPLE_RATE
+        except Exception as e:
+            log.warning("coreaudio loopback: could not query device %s: %s", device_index, e)
+            return
+
+        resampler = None
+        if native_sr != SAMPLE_RATE:
+            resampler = soxr.ResampleStream(
+                native_sr, SAMPLE_RATE, num_channels=1, dtype="float32", quality="HQ"
+            )
+        blocksize = (
+            int(round(_AEC_FRAME * native_sr / SAMPLE_RATE))
+            if native_sr != SAMPLE_RATE
+            else _AEC_FRAME
+        )
+
+        try:
+            with sd.InputStream(
+                device=device_index,
+                samplerate=native_sr,
+                channels=1,
+                dtype="float32",
+                blocksize=blocksize,
+            ) as stream:
+                while not self._lb_thread_stop.is_set():
+                    data, _ = stream.read(blocksize)
+                    chunk = (data[:, 0] if data.ndim == 2 else data).astype(
+                        np.float32, copy=False
+                    )
+                    if resampler is not None:
+                        chunk = resampler.resample_chunk(chunk)
+                        if chunk.size == 0:
+                            continue
+                    if emit_direct:
+                        self._emit_blocks(chunk)
+                    else:
+                        with self._fifo_lock:
+                            self._lb_fifo.append(chunk)
+        except Exception as e:
+            log.warning("coreaudio loopback recorder exited: %s", e)
+
     def _run_aec_frame(self, mic_i16: np.ndarray, ref_i16: np.ndarray) -> np.ndarray:
         """Direct ctypes call into pyaec's bundled aec.dll — skips the list-
         packing overhead of the pure-Python wrapper (which is a per-sample
@@ -304,10 +375,17 @@ class AudioCapture:
             for i in range(n_frames):
                 mic_f = mic_buf[i * _AEC_FRAME:(i + 1) * _AEC_FRAME]
                 lb_f = lb_buf[i * _AEC_FRAME:(i + 1) * _AEC_FRAME]
-                mic_i16 = np.clip(mic_f * 32767.0, -32768, 32767).astype(np.int16)
-                lb_i16 = np.clip(lb_f * 32767.0, -32768, 32767).astype(np.int16)
-                cleaned_i16 = self._run_aec_frame(mic_i16, lb_i16)
-                cleaned_f = cleaned_i16.astype(np.float32) * (1.0 / 32768.0)
+                if self._aec_enabled and self._aec is not None:
+                    # Windows path: run Speex AEC to cancel room echo from
+                    # the loopback reference out of the mic signal.
+                    mic_i16 = np.clip(mic_f * 32767.0, -32768, 32767).astype(np.int16)
+                    lb_i16 = np.clip(lb_f * 32767.0, -32768, 32767).astype(np.int16)
+                    cleaned_i16 = self._run_aec_frame(mic_i16, lb_i16)
+                    cleaned_f = cleaned_i16.astype(np.float32) * (1.0 / 32768.0)
+                else:
+                    # macOS path (BlackHole): no acoustic echo path exists —
+                    # loopback is clean digital audio, use mic as-is.
+                    cleaned_f = mic_f
                 # No pre-attenuation: the user reported that dropping the
                 # mic by 3 dB (plus AEC preprocess) made Mix mode sound
                 # noticeably quieter than Mic only. Summing full-level
@@ -341,17 +419,22 @@ class AudioCapture:
         return self._list_devices(output=False)
 
     def list_output_devices(self) -> list[dict]:
-        """Return output endpoints usable as a WASAPI-loopback source.
+        """Return output endpoints usable as a system-audio loopback source.
 
-        Enumerated via `soundcard` (not sounddevice) because sounddevice's
-        bundled libportaudio DLL is built without loopback support. The
-        returned `index` is this method's stable sort position — used as
-        the round-trip handle the frontend passes back to `start()` and
-        which we map to the speaker's soundcard `id` string via
-        `_resolve_loopback_speaker`. Marked as "Default speaker" when it
-        matches `sc.default_speaker()` so the UI can surface which
-        endpoint Windows actually routes audio to right now.
+        Windows — returns all WASAPI speakers (enumerated via soundcard).
+        The returned ``index`` is the sort position; the frontend passes it
+        back to ``start()`` which resolves it to a soundcard id via
+        ``_resolve_loopback_speaker``.
+
+        macOS — returns virtual loopback *input* devices such as BlackHole or
+        Loopback Audio (enumerated via sounddevice). The returned ``index`` is
+        the sounddevice device index and is passed directly to the loopback
+        thread — no further resolution step is needed.
         """
+        if sys.platform != "win32":
+            return self._list_mac_loopback_devices()
+
+        # ── Windows WASAPI ────────────────────────────────────────────────
         try:
             import soundcard as sc
         except Exception:
@@ -370,6 +453,42 @@ class AudioCapture:
                 "channels": int(getattr(sp, "channels", 2) or 2),
                 "host_api": "Windows WASAPI",
             })
+        return result
+
+    def _list_mac_loopback_devices(self) -> list[dict]:
+        """macOS: return virtual loopback input devices suitable for system-audio capture.
+
+        Looks for well-known virtual audio drivers: BlackHole (most common),
+        Loopback Audio (Rogue Amoeba), and Soundflower (legacy). The frontend
+        shows these in the System Audio / Mix source picker. If none are found,
+        an empty list is returned and the System/Mix source options are hidden.
+
+        The user is expected to install BlackHole separately:
+        https://github.com/ExistentialAudio/BlackHole
+        """
+        try:
+            import sounddevice as sd
+        except Exception:
+            return []
+
+        _VIRTUAL_KEYWORDS = ("blackhole", "loopback audio", "loopback", "soundflower")
+        try:
+            devices = sd.query_devices()
+        except Exception:
+            return []
+
+        result: list[dict] = []
+        for i, d in enumerate(devices):
+            if d["max_input_channels"] <= 0:
+                continue
+            name_lower = d["name"].lower()
+            if any(kw in name_lower for kw in _VIRTUAL_KEYWORDS):
+                result.append({
+                    "index": i,
+                    "name": d["name"],
+                    "channels": int(d["max_input_channels"]),
+                    "host_api": "macOS CoreAudio",
+                })
         return result
 
     def _resolve_loopback_speaker(self, loopback_index: int) -> str | None:
@@ -391,8 +510,6 @@ class AudioCapture:
         return None
 
     def _list_devices(self, output: bool) -> list[dict]:
-        # `output=True` is handled by `list_output_devices` via soundcard —
-        # this stub stays for back-compat in case anyone calls it directly.
         if output:
             return self.list_output_devices()
 
@@ -401,6 +518,46 @@ class AudioCapture:
         except Exception:
             return []
 
+        if sys.platform != "win32":
+            return self._list_input_devices_coreaudio(sd)
+        return self._list_input_devices_windows(sd)
+
+    def _list_input_devices_coreaudio(self, sd: object) -> list[dict]:
+        """macOS: enumerate CoreAudio input devices.
+
+        CoreAudio presents each physical device once, so no deduplication is
+        needed. Virtual loopback devices (BlackHole etc.) are excluded here —
+        they appear in ``list_output_devices`` instead so the UI keeps mic and
+        system-audio pickers separate.
+        """
+        _VIRTUAL_KEYWORDS = ("blackhole", "loopback audio", "soundflower")
+        try:
+            devices = sd.query_devices()  # type: ignore[union-attr]
+        except Exception:
+            return []
+
+        result: list[dict] = []
+        for i, d in enumerate(devices):
+            if d["max_input_channels"] <= 0:
+                continue
+            name_lower = d["name"].lower()
+            if any(kw in name_lower for kw in _VIRTUAL_KEYWORDS):
+                continue  # shown in output/loopback list instead
+            result.append({
+                "index": i,
+                "name": d["name"],
+                "channels": int(d["max_input_channels"]),
+                "host_api": "macOS CoreAudio",
+            })
+        return sorted(result, key=lambda x: x["name"].lower())
+
+    def _list_input_devices_windows(self, sd: object) -> list[dict]:
+        """Windows: enumerate WASAPI input devices with deduplication.
+
+        Windows exposes each physical device under several host APIs (MME,
+        DirectSound, WASAPI, WDM-KS). We dedupe by name and prefer the
+        modern APIs so the UI only shows one row per physical mic.
+        """
         # Lower rank wins when the same device name appears under multiple APIs.
         HOST_RANK = {
             "Windows WASAPI": 0,
@@ -411,8 +568,11 @@ class AudioCapture:
         # MME virtual/pseudo devices — noise in the dropdown, always skip.
         META = {"Microsoft Sound Mapper - Input", "Primary Sound Capture Driver"}
 
-        devices = sd.query_devices()
-        hostapis = sd.query_hostapis()
+        try:
+            devices = sd.query_devices()  # type: ignore[union-attr]
+            hostapis = sd.query_hostapis()  # type: ignore[union-attr]
+        except Exception:
+            return []
 
         best: dict[str, dict] = {}
         for i, d in enumerate(devices):
@@ -423,9 +583,6 @@ class AudioCapture:
                 continue
             # Disconnected Bluetooth Hands-Free / A2DP endpoints leak through
             # as raw MUI strings like "Headset (@System32\drivers\bthhfenum.sys,#2;…)".
-            # Windows only resolves the friendly name when the device is paired
-            # and active, so an unresolved "@...\\...sys" signature means the
-            # endpoint isn't currently connected — hide it.
             if "@" in name and ".sys" in name:
                 continue
             hostapi_idx = d.get("hostapi", -1)
@@ -532,24 +689,34 @@ class AudioCapture:
             except Exception as e:
                 self._stream = None
                 msg = str(e).lower()
-                # Windows privacy denial + "device in use" both show up as
-                # PortAudio host errors. We can't distinguish them reliably,
-                # so we hand the user the most common fix.
+                # PortAudio surface mic-permission denial and device-in-use
+                # as opaque host errors. Pattern-match the known signatures
+                # so we can offer a one-click "open mic settings" shortcut.
                 is_probable_permission = (
                     "unanticipated host error" in msg
                     or "invalid device" in msg
                     or "access is denied" in msg
-                    or "0x80070005" in msg   # E_ACCESSDENIED
+                    or "0x80070005" in msg           # Windows E_ACCESSDENIED
+                    or "input device is unavailable" in msg  # macOS CoreAudio
+                    or "kaudiiodevice" in msg         # macOS HAL error
                 )
                 if is_probable_permission:
-                    raise MicUnavailableError(
-                        "Microphone could not be opened. Most commonly this is "
-                        "Windows blocking mic access — check Settings → Privacy → "
-                        "Microphone and ensure AuraScribe is allowed. If another "
-                        "app (Teams, Zoom, Discord) is holding the mic, close it "
-                        "and try again.",
-                        kind="permission",
-                    ) from e
+                    if sys.platform == "darwin":
+                        human_msg = (
+                            "Microphone could not be opened. Check System Settings → "
+                            "Privacy & Security → Microphone and make sure AuraScribe "
+                            "is allowed. If another app is holding the device, quit it "
+                            "and try again."
+                        )
+                    else:
+                        human_msg = (
+                            "Microphone could not be opened. Most commonly this is "
+                            "Windows blocking mic access — check Settings → Privacy → "
+                            "Microphone and ensure AuraScribe is allowed. If another "
+                            "app (Teams, Zoom, Discord) is holding the mic, close it "
+                            "and try again."
+                        )
+                    raise MicUnavailableError(human_msg, kind="permission") from e
                 raise MicUnavailableError(
                     f"Microphone could not be opened: {e}",
                     kind="unknown",
@@ -581,14 +748,41 @@ class AudioCapture:
                     ) from e
 
     def _start_loopback(self, loopback_device: int, mic_active: bool) -> None:
-        """Resolve the UI's output-device index to a soundcard speaker id,
-        spin up the loopback-capture thread, and — when the mic is also
-        active — start the mixer worker for AEC + mix. In system-only mode
-        (mic inactive) the loopback thread emits blocks directly and no
-        mixer/AEC is initialised.
+        """Spin up loopback capture and (when mic is active) the mixer thread.
+
+        Platform behaviour:
+          Windows — resolves `loopback_device` (UI index) to a soundcard speaker
+          id, opens a WASAPI-loopback stream, and initialises Speex AEC for
+          Mix mode so room echo is cancelled from the mic signal.
+
+          macOS — `loopback_device` is already the sounddevice device index for
+          the chosen virtual loopback (BlackHole). No COM init, no AEC (the
+          captured signal is clean digital audio).
 
         Raises on failure — caller decides whether to fall back.
         """
+        if sys.platform != "win32":
+            # macOS: loopback_device IS the sounddevice device index.
+            # No AEC — BlackHole gives clean digital system audio.
+            self._aec_enabled = False
+            self._lb_active = mic_active
+            self._lb_thread_stop.clear()
+            self._lb_thread = threading.Thread(
+                target=self._loopback_thread_main,
+                args=(loopback_device, not mic_active),
+                name="aurascribe-loopback-capture",
+                daemon=True,
+            )
+            self._lb_thread.start()
+            if mic_active:
+                self._worker_stop.clear()
+                self._worker = threading.Thread(
+                    target=self._mix_worker, name="aurascribe-aec-mixer", daemon=True,
+                )
+                self._worker.start()
+            return
+
+        # ── Windows WASAPI path ──────────────────────────────────────────────
         speaker_id = self._resolve_loopback_speaker(loopback_device)
         if speaker_id is None:
             raise RuntimeError(f"output device index {loopback_device} not found")
@@ -600,18 +794,16 @@ class AudioCapture:
             # non-linear echo leakage the adaptive filter can't fully
             # cancel. Without it users hear a "large hall" reverb in
             # mix mode (two copies of remote audio: clean from loopback
-            # and delayed from the mic path). The AGC will moderate mic
-            # level a bit — an acceptable tradeoff for clean audio.
+            # and delayed from the mic path).
             from pyaec import Aec, lib as _aec_lib
             self._aec = Aec(_AEC_FRAME, _AEC_TAIL, SAMPLE_RATE, True)
             self._aec_cancel = _aec_lib.AecCancelEcho
             self._aec_handle = self._aec._aec
+            self._aec_enabled = True
 
         # Flip the flag BEFORE starting the thread so any concurrent mic
         # callbacks route through the FIFO — otherwise the first few ms of
-        # mic audio get emitted directly and skip AEC. `_lb_active` only
-        # gates the mic callback's dispatch, so it's safe to set True even
-        # in system-only mode (there's no mic callback in that case).
+        # mic audio get emitted directly and skip AEC.
         self._lb_active = mic_active
         self._lb_thread_stop.clear()
         self._lb_thread = threading.Thread(
@@ -650,6 +842,7 @@ class AudioCapture:
         self._aec = None
         self._aec_cancel = None
         self._aec_handle = None
+        self._aec_enabled = False
         with self._fifo_lock:
             self._mic_fifo.clear()
             self._lb_fifo.clear()

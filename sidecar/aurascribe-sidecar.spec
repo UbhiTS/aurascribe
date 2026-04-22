@@ -1,14 +1,14 @@
-# PyInstaller spec — AuraScribe Python sidecar.
+# PyInstaller spec — AuraScribe Python sidecar (cross-platform).
 #
 # Produces a self-contained onedir bundle at `dist/aurascribe-sidecar/`
-# containing `aurascribe-sidecar.exe` plus every DLL + Python module it
-# needs. The Tauri installer copies this whole folder into the app's
-# resource directory; at runtime, src-tauri/src/lib.rs spawns the .exe
-# directly — no Python interpreter required on the user's machine.
+# containing the entry binary plus every shared library + Python module it
+# needs. The Tauri bundle copies this whole folder into the app's resource
+# directory; src-tauri/src/lib.rs spawns the binary directly — no Python
+# interpreter required on the end-user's machine.
 #
-# Run with: .venv/Scripts/python -m PyInstaller aurascribe-sidecar.spec
-#           --clean --noconfirm
-# (build.ps1 wraps this.)
+# Run with: .venv/bin/python3 -m PyInstaller aurascribe-sidecar.spec \
+#               --clean --noconfirm
+# (build.sh / build.ps1 wraps this for the respective platform.)
 #
 # NOTES
 # -----
@@ -16,18 +16,23 @@
 #   package. Heavy for the ML stack but removes an entire class of
 #   "ImportError at runtime" failures for packages that import their own
 #   submodules lazily (torch, pyannote, librosa, numba).
-# * CUDA DLLs: the `nvidia-*-cu12` wheels drop cuBLAS/cuDNN/cuda_nvrtc
+# * Windows CUDA DLLs: the `nvidia-*-cu12` wheels drop cuBLAS/cuDNN/cuda_nvrtc
 #   into `site-packages/nvidia/*/bin`. We scoop those up as binaries so
-#   ctranslate2 finds them at runtime. PyInstaller's bootloader puts the
-#   bundle dir on the DLL search path automatically on Windows.
+#   ctranslate2 finds them at runtime. Skipped on macOS (no CUDA).
+# * macOS MPS: CTranslate2 and PyTorch include Metal support in the standard
+#   PyPI wheels — no extra binaries to collect.
 # * Bundled prompt files (aurascribe/llm/*.md) ride along under the same
 #   package path so config.py's seeding logic still resolves them via
 #   `Path(__file__).parent`.
 
+import sys
 from pathlib import Path
 import site
 
 from PyInstaller.utils.hooks import collect_all
+
+IS_WINDOWS = sys.platform == "win32"
+IS_MACOS   = sys.platform == "darwin"
 
 block_cipher = None
 
@@ -36,18 +41,10 @@ datas: list[tuple] = []
 binaries: list[tuple] = []
 
 # ── Heavy / lazy-import packages ─────────────────────────────────────────────
-for pkg in (
+_base_packages = [
     # ASR + audio
     "faster_whisper", "ctranslate2", "sounddevice", "soundfile", "soxr",
     "scipy", "librosa", "numba", "numpy",
-    # pyaec ships a bundled aec.dll next to its __init__.py; collect_all
-    # picks it up so `os.path.join(os.path.dirname(__file__), "aec.dll")`
-    # still resolves inside the PyInstaller bundle.
-    "pyaec",
-    # soundcard is a cffi-backed wrapper around WASAPI — needs its cffi
-    # _soundcard.cdef and the cffi runtime collected so the pure-Python
-    # calls into the OS audio APIs still work in the frozen bundle.
-    "soundcard", "cffi",
     # Diarization
     "torch", "torchaudio", "pyannote", "pyannote.audio",
     "speechbrain", "omegaconf", "lightning_fabric", "pytorch_lightning",
@@ -57,7 +54,20 @@ for pkg in (
     "aiosqlite", "aiofiles", "websockets",
     # LLM
     "openai",
-):
+]
+
+_windows_packages = [
+    # pyaec ships a bundled aec.dll next to its __init__.py; collect_all
+    # picks it up so `os.path.join(os.path.dirname(__file__), "aec.dll")`
+    # still resolves inside the PyInstaller bundle.
+    "pyaec",
+    # soundcard is a cffi-backed wrapper around WASAPI — needs its cffi
+    # _soundcard.cdef and the cffi runtime collected so the pure-Python
+    # calls into the OS audio APIs still work in the frozen bundle.
+    "soundcard", "cffi",
+]
+
+for pkg in _base_packages + (IS_WINDOWS and _windows_packages or []):
     try:
         tmp_datas, tmp_bins, tmp_hidden = collect_all(pkg)
         datas += tmp_datas
@@ -70,23 +80,25 @@ for pkg in (
 datas += [("aurascribe/llm/live_intelligence.md", "aurascribe/llm")]
 datas += [("aurascribe/llm/daily_brief.md", "aurascribe/llm")]
 
-# ── CUDA 12 DLLs from nvidia-* wheels ───────────────────────────────────────
-# CTranslate2 (faster-whisper's backend) is linked against CUDA 12. The
-# wheels drop their DLLs under `site-packages/nvidia/*/bin`, which isn't on
+# ── CUDA 12 DLLs from nvidia-* wheels (Windows only) ────────────────────────
+# CTranslate2 (faster-whisper's backend) is linked against CUDA 12 on Windows.
+# The wheels drop their DLLs under `site-packages/nvidia/*/bin`, which isn't on
 # any default search path — we explicitly ship those into the bundle root.
-for sp in site.getsitepackages():
-    nvidia_root = Path(sp) / "nvidia"
-    if not nvidia_root.is_dir():
-        continue
-    for pkg_dir in nvidia_root.iterdir():
-        bin_dir = pkg_dir / "bin"
-        if not bin_dir.is_dir():
+# On macOS, CTranslate2 uses Metal (MPS) and no CUDA DLLs are needed.
+if IS_WINDOWS:
+    for sp in site.getsitepackages():
+        nvidia_root = Path(sp) / "nvidia"
+        if not nvidia_root.is_dir():
             continue
-        for dll in bin_dir.glob("*.dll"):
-            # Second tuple element = destination inside the bundle. Empty
-            # string = bundle root, so the DLLs sit next to .exe where the
-            # PyInstaller bootloader's DLL search finds them first.
-            binaries.append((str(dll), "."))
+        for pkg_dir in nvidia_root.iterdir():
+            bin_dir = pkg_dir / "bin"
+            if not bin_dir.is_dir():
+                continue
+            for dll in bin_dir.glob("*.dll"):
+                # Second tuple element = destination inside the bundle. Empty
+                # string = bundle root, so the DLLs sit next to the executable
+                # where the PyInstaller bootloader's DLL search finds them first.
+                binaries.append((str(dll), "."))
 
 # ── Uvicorn's reflection-loaded submodules (PyInstaller can't see these) ────
 hiddenimports += [

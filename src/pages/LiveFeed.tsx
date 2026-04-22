@@ -91,6 +91,7 @@ export function LiveFeed({
           outputDevices={appStatus?.audio_output_devices ?? []}
           onStarted={onMeetingStarted}
           onStopped={onMeetingStopped}
+          platform={appStatus?.platform}
         />
       </div>
 
