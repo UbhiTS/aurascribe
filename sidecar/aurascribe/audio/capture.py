@@ -626,7 +626,6 @@ class AudioCapture:
         """
         import sounddevice as sd
         import soxr
-        import torch
 
         if not capture_mic and loopback_device is None:
             raise RuntimeError(
@@ -635,13 +634,11 @@ class AudioCapture:
             )
 
         if self._vad_model is None:
-            self._vad_model, self._vad_utils = torch.hub.load(
-                repo_or_dir="snakers4/silero-vad",
-                model="silero_vad",
-                force_reload=False,
-                trust_repo=True,
-            )
-            self._vad_model.eval()
+            # Shared with the auto-capture monitor — a single model instance
+            # is loaded once per process and reused by every caller. See
+            # audio/vad_model.py for the cache.
+            from aurascribe.audio.vad_model import get_vad_model
+            self._vad_model, self._vad_utils = get_vad_model()
 
         while not self._queue.empty():
             self._queue.get_nowait()

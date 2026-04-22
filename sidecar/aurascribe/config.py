@@ -176,6 +176,11 @@ _CONFIG_KEYS = {
     "obsidian_write_interval_sec",
     "obsidian_write_chunks",
     "daily_brief_auto_refresh",
+    # Auto-capture — sustained-speech-based auto-start/stop.
+    "auto_capture_enabled",
+    "auto_capture_start_speech_sec",
+    "auto_capture_stop_silence_sec",
+    "auto_capture_vad_threshold",
 }
 
 # One-shot rename of the old LM-Studio-specific keys to provider-agnostic
@@ -530,6 +535,53 @@ OBSIDIAN_WRITE_CHUNKS: int = _cfg_int("obsidian_write_chunks", 5)
 # and most users would rather kick it off manually from the Daily Brief
 # page when they want it fresh.
 DAILY_BRIEF_AUTO_REFRESH: bool = _cfg_bool("daily_brief_auto_refresh", False)
+
+# ── Auto-capture (sustained-speech auto-start/stop) ─────────────────────────
+#
+# When True, the sidecar keeps a lightweight mic stream open whenever a
+# meeting isn't already recording, runs Silero VAD on it, and auto-fires
+# `start_meeting()` once it hears `auto_capture_start_speech_sec` of
+# sustained speech. While the recording is active (and only when it was
+# the monitor that started it — not a manual click), the pipeline's RMS
+# stream is watched for `auto_capture_stop_silence_sec` of quiet before
+# firing `stop_meeting()`. See `aurascribe.auto_capture` for the state
+# machine. Default-on so a freshly installed app "just works" without the
+# user needing to remember to hit Record — flip off in Settings to get
+# the manual-only behavior back.
+AUTO_CAPTURE_ENABLED: bool = _cfg_bool("auto_capture_enabled", True)
+# Seconds of sustained speech before we auto-fire start_meeting. Lower =
+# snappier (but may fire on a cough); higher = slower + more conservative.
+AUTO_CAPTURE_START_SPEECH_SEC: float = _cfg_float("auto_capture_start_speech_sec", 1.5)
+# Seconds of sustained silence during an auto-started recording before we
+# auto-fire stop_meeting. Manually-started recordings ignore this — they
+# always run until the user clicks Stop. Default 90s so natural pauses
+# (looking something up, brief interruption) don't end the meeting.
+AUTO_CAPTURE_STOP_SILENCE_SEC: float = _cfg_float("auto_capture_stop_silence_sec", 90.0)
+# Silero VAD confidence threshold used by the monitor. Defaults to the
+# shared `vad_threshold` (the same gate the recording pipeline uses); set
+# explicitly to tune listening sensitivity independently — e.g. raise it
+# in a noisy open office if the monitor keeps triggering on background
+# chatter.
+AUTO_CAPTURE_VAD_THRESHOLD: float = _cfg_float("auto_capture_vad_threshold", VAD_THRESHOLD)
+
+
+def reload_auto_capture_from_file() -> None:
+    """Re-read auto-capture keys from config.json into the module-level
+    vars. Called after a successful PUT /api/settings/config so the
+    running monitor can pick up toggle + threshold changes without a
+    sidecar restart. Every other setting still requires a restart — these
+    four are singled out because the monitor is the one piece of state
+    that can safely hot-swap, and a user toggling auto-capture wants to
+    feel an immediate effect."""
+    global AUTO_CAPTURE_ENABLED, AUTO_CAPTURE_START_SPEECH_SEC
+    global AUTO_CAPTURE_STOP_SILENCE_SEC, AUTO_CAPTURE_VAD_THRESHOLD
+    fresh = load_user_config()
+    _user_config.clear()
+    _user_config.update(fresh)
+    AUTO_CAPTURE_ENABLED = _cfg_bool("auto_capture_enabled", True)
+    AUTO_CAPTURE_START_SPEECH_SEC = _cfg_float("auto_capture_start_speech_sec", 1.5)
+    AUTO_CAPTURE_STOP_SILENCE_SEC = _cfg_float("auto_capture_stop_silence_sec", 90.0)
+    AUTO_CAPTURE_VAD_THRESHOLD = _cfg_float("auto_capture_vad_threshold", VAD_THRESHOLD)
 
 # ── Realtime intelligence (live highlights / action items / talking points) ──
 

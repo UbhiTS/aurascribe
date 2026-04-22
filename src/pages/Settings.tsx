@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import {
   Cpu, Mic, FolderCheck, FolderX, Sparkles, FileText, ExternalLink,
   HardDrive, AlertTriangle, Languages, Users, Zap, SlidersHorizontal,
+  Radio,
 } from "lucide-react";
 import { api } from "../lib/api";
 import type {
@@ -33,6 +34,12 @@ const SECTION_KEYS = {
   adv_partials: ["speculative_interval_sec", "speculative_window_sec"] as ConfigKey[],
   adv_obsidian: ["obsidian_write_interval_sec", "obsidian_write_chunks"] as ConfigKey[],
   adv_daily_brief: ["daily_brief_auto_refresh"] as ConfigKey[],
+  auto_capture: [
+    "auto_capture_enabled",
+    "auto_capture_start_speech_sec",
+    "auto_capture_stop_silence_sec",
+    "auto_capture_vad_threshold",
+  ] as ConfigKey[],
 };
 
 // Per-field option lists for fields rendered as a <select>. Keys not listed
@@ -61,6 +68,9 @@ const NUMERIC_KEYS = new Set<ConfigKey>([
   "speculative_window_sec",
   "obsidian_write_interval_sec",
   "obsidian_write_chunks",
+  "auto_capture_start_speech_sec",
+  "auto_capture_stop_silence_sec",
+  "auto_capture_vad_threshold",
 ]);
 
 // Boolean fields render as a three-way select (auto / on / off) and save
@@ -68,6 +78,7 @@ const NUMERIC_KEYS = new Set<ConfigKey>([
 // default comes back on next restart.
 const BOOL_KEYS = new Set<ConfigKey>([
   "daily_brief_auto_refresh",
+  "auto_capture_enabled",
 ]);
 
 // Stringifies a stored config value for display inside an <input>. Null /
@@ -495,6 +506,36 @@ export function Settings({ appStatus, obsidianConfigured }: Props) {
           <ConfigField cfg={cfg} drafts={drafts} onChange={setDraft}
             k="rt_highlights_window_sec" label="Conversation window (seconds)" type="number"
             hint="How many seconds of recent conversation the AI sees each time it refreshes." />
+        </ConfigSection>
+
+        {/* ── Auto-capture (hands-free recording) ──────────────────── */}
+        <ConfigSection
+          icon={<Radio size={14} className="text-red-400" />}
+          title="Auto-capture (hands-free recording)"
+          description="When on, AuraScribe keeps a light mic stream open whenever it's not already recording, and auto-starts a meeting as soon as it hears sustained speech. Auto-started meetings also auto-stop after a long silence. Manual Start/Stop clicks always override it."
+          sectionId="auto_capture"
+          keys={SECTION_KEYS.auto_capture}
+          isDirty={isDirty}
+          savingSection={savingSection}
+          sectionErrors={sectionErrors}
+          sectionSavedAt={sectionSavedAt}
+          onSave={() => saveSection("auto_capture", SECTION_KEYS.auto_capture)}
+        >
+          <ConfigField cfg={cfg} drafts={drafts} onChange={setDraft}
+            k="auto_capture_enabled" label="Auto-start/stop recording"
+            hint="Master switch. When on, the mic is always listening when you're not already recording — flip off to go back to fully manual control." />
+          <ConfigField cfg={cfg} drafts={drafts} onChange={setDraft}
+            k="auto_capture_start_speech_sec" label="Sustained speech before auto-start (seconds)" type="number"
+            hint="How long AuraScribe needs to hear continuous speech before starting a meeting. Lower = snappier (risk: coughs/laughs trigger it); higher = slower + more deliberate." />
+          <ConfigField cfg={cfg} drafts={drafts} onChange={setDraft}
+            k="auto_capture_stop_silence_sec" label="Silence before auto-stop (seconds)" type="number"
+            hint="How long of a silence ends an auto-started meeting. Long enough that natural pauses (looking something up, a brief interruption) don't cut you off. Only applies to meetings AuraScribe started automatically — manual recordings run until you click Stop." />
+          <ConfigField cfg={cfg} drafts={drafts} onChange={setDraft}
+            k="auto_capture_vad_threshold" label="Listening sensitivity (0 – 1)" type="number"
+            hint="How confident the voice detector needs to be that a sound is speech. Raise in noisy rooms if the monitor keeps triggering on background chatter; lower if it's missing quiet speech." />
+          <p className="text-[11px] text-amber-200/80 px-2.5 py-2 rounded-lg bg-amber-950/30 border border-amber-900/30">
+            Heads-up: while auto-capture is on, your operating system's "microphone in use" indicator stays lit even when you aren't actively recording. Audio never leaves your PC — the monitor only runs Silero VAD locally — but the indicator is there for the normal reason (something has the mic open).
+          </p>
         </ConfigSection>
 
         {/* ── Advanced Settings ────────────────────────────────────── */}

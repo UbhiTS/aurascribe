@@ -52,6 +52,19 @@ ws_clients: list[WebSocket] = []
 # `broadcast()` — payload drops, or "list changed size during iteration".
 broadcast_lock = asyncio.Lock()
 
+# Populated during FastAPI lifespan startup — see aurascribe.api. Lives
+# here so every router (settings for hot-reload, auto_capture routes for
+# toggle, status endpoint for snapshot) can reach it without reintroducing
+# the `api → routes → api` import cycle.
+auto_capture_monitor: "AutoCaptureMonitor | None" = None  # type: ignore[name-defined]
+
+
+def set_auto_capture_monitor(monitor: object) -> None:
+    """Install the process-wide AutoCaptureMonitor. Called once during
+    lifespan startup."""
+    global auto_capture_monitor
+    auto_capture_monitor = monitor  # type: ignore[assignment]
+
 
 async def broadcast(payload: dict) -> None:
     async with broadcast_lock:

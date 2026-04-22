@@ -176,6 +176,32 @@ export interface AppStatus {
   // sys.platform from the sidecar process — "win32", "darwin", or "linux".
   // Used by the UI to display OS-appropriate instructions and labels.
   platform?: string;
+  // Auto-capture monitor snapshot. Snapshot-only — live updates arrive
+  // on the WebSocket as `{ type: "auto_capture", ... }` messages.
+  auto_capture?: AutoCaptureState;
+}
+
+// States the auto-capture monitor can be in. Drives the small toggle chip
+// on the RecordingBar:
+//   disabled   — master toggle is off; the chip shows "Auto: off"
+//   listening  — monitor is hot, running VAD on the default mic
+//   armed      — sustained speech detected, start_meeting is firing
+//   recording  — a meeting is active (started by us OR manually)
+//   error      — mic couldn't be opened (permission, device in use, etc.);
+//                the monitor auto-retries with exponential backoff
+export type AutoCaptureStateKind =
+  | "disabled" | "listening" | "armed" | "recording" | "error";
+
+export interface AutoCaptureState {
+  enabled: boolean;
+  state: AutoCaptureStateKind;
+  // EMA-smoothed Silero VAD confidence in [0, 1]. Drives the tiny
+  // activity bar inside the chip when listening.
+  confidence: number;
+  // Seconds of sustained silence observed DURING an auto-started
+  // recording. Reaches `auto_capture_stop_silence_sec` → auto-stop fires.
+  // Zero for manually-started meetings (they never auto-stop).
+  silent_seconds?: number;
 }
 
 export interface DailyBriefDecision {
@@ -247,7 +273,12 @@ export type ConfigKey =
   | "speculative_window_sec"
   | "obsidian_write_interval_sec"
   | "obsidian_write_chunks"
-  | "daily_brief_auto_refresh";
+  | "daily_brief_auto_refresh"
+  // Auto-capture (sustained-speech auto-start/stop).
+  | "auto_capture_enabled"
+  | "auto_capture_start_speech_sec"
+  | "auto_capture_stop_silence_sec"
+  | "auto_capture_vad_threshold";
 
 export interface ConfigFieldState {
   // What the running process is actually using. Frozen at sidecar import
@@ -522,6 +553,19 @@ export const api = {
     refresh: (date: string) =>
       request<DailyBriefResponse>(`/daily-brief/refresh?date=${encodeURIComponent(date)}`, {
         method: "POST",
+      }),
+  },
+  autoCapture: {
+    // Snapshot — only needed for the initial render. Live updates ride
+    // on the WebSocket `auto_capture` message type; see useWebSocket.ts.
+    get: () => request<AutoCaptureState>("/auto-capture"),
+    // Persists to config.json AND applies to the running monitor in one
+    // call — no restart required, which is the point of surfacing this
+    // as a front-and-center toggle instead of burying it in Settings.
+    setEnabled: (enabled: boolean) =>
+      request<AutoCaptureState>("/auto-capture", {
+        method: "PUT",
+        body: JSON.stringify({ enabled }),
       }),
   },
 };

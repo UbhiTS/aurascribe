@@ -3,6 +3,7 @@ import { api, EMPTY_LIVE_INTEL, liveIntelFromMeeting } from "./lib/api";
 import type {
   ActionItemOther,
   AppStatus,
+  AutoCaptureState,
   LiveIntel,
   Meeting,
   Utterance,
@@ -63,6 +64,9 @@ export default function App() {
   const [dailyBriefSignal, setDailyBriefSignal] = useState<
     { date: string; status: "refreshing" | "ready" | "stale"; tick: number } | null
   >(null);
+  // Auto-capture monitor state — seeded from /api/status, kept fresh by
+  // `type: "auto_capture"` WS messages at ~5Hz while the monitor runs.
+  const [autoCaptureState, setAutoCaptureState] = useState<AutoCaptureState | null>(null);
   // WS utterance filter keys off the LIVE meeting only — library loads can't redirect the stream.
   const liveMeetingIdRef = useRef<string | null>(null);
 
@@ -111,6 +115,10 @@ export default function App() {
         const s = await api.status();
         if (cancelled) return;
         setAppStatus(s);
+        // Seed auto-capture from the snapshot so the chip shows the right
+        // state before the first WS message arrives (and after a reconnect
+        // where the WS might have missed the last broadcast).
+        if (s.auto_capture) setAutoCaptureState(s.auto_capture);
         if (s.engine_ready) {
           isReady = true;
           setSystemStatus((prev) => (prev === "loading" ? "ready" : prev));
@@ -189,7 +197,24 @@ export default function App() {
     if (msg.type === "status") {
       setSystemStatus(msg.event as StatusEvent);
       setStatusMessage(msg.message ?? "");
+      if (msg.event === "recording" && msg.meeting_id) {
+        // Patch the local appStatus so `isRecording` flips in LiveFeed
+        // (→ RecordingBar's Start⇄Stop button) the moment the sidecar
+        // confirms, not 30s later at the next /api/status heartbeat.
+        // This is the ONLY code path that updates the UI for an
+        // auto-capture-triggered start — a manual click's own optimistic
+        // patch in handleMeetingStarted just ends up being idempotent.
+        const meetingId = msg.meeting_id;
+        setAppStatus((s) => s ? { ...s, is_recording: true, current_meeting_id: meetingId } : s);
+        // Refresh for `active_audio_device` (not carried on the WS event).
+        api.status().then(setAppStatus).catch(() => {});
+      }
       if (msg.event === "done" && msg.meeting_id) {
+        // Clear is_recording immediately — otherwise an auto-capture
+        // stop would leave the button stuck on "Stop Recording" until
+        // the next heartbeat. Same idempotency note as above: the
+        // manual stop path already patches this via handleMeetingStopped.
+        setAppStatus((s) => s ? { ...s, is_recording: false, current_meeting_id: null, active_audio_device: null } : s);
         setRefreshKey((k) => k + 1);
         // Refresh the live meeting card with its finalized data (summary, action items, vault_path).
         // Only the live pane gets updated — review's meeting is untouched.
@@ -206,6 +231,14 @@ export default function App() {
       window.dispatchEvent(new CustomEvent("aurascribe:audio-level", {
         detail: { rms: msg.rms, peak: msg.peak, t: performance.now() },
       }));
+    }
+    if (msg.type === "auto_capture") {
+      setAutoCaptureState({
+        enabled: Boolean(msg.enabled),
+        state: msg.state,
+        confidence: typeof msg.confidence === "number" ? msg.confidence : 0,
+        silent_seconds: typeof msg.silent_seconds === "number" ? msg.silent_seconds : 0,
+      });
     }
   }, []);
   const { connected: wsConnected } = useWebSocket(handleWsMessage);
@@ -246,6 +279,8 @@ export default function App() {
       hardware={appStatus?.hardware ?? null}
       asr={appStatus?.asr ?? null}
       diarization={appStatus?.diarization ?? null}
+      autoCaptureState={autoCaptureState}
+      setAutoCaptureState={setAutoCaptureState}
     >
       {/* Only render once the engine has finished loading — the welcome
           dialog displays the detected hardware, so we want the status

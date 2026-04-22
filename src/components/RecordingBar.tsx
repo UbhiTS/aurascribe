@@ -39,7 +39,9 @@ function readMode(): SourceMode {
   return v === "mic" || v === "system" || v === "mix" ? v : "mic";
 }
 
-export function RecordingBar({ isRecording, devices, outputDevices, onStarted, onStopped, platform }: Props) {
+export function RecordingBar({
+  isRecording, devices, outputDevices, onStarted, onStopped, platform,
+}: Props) {
   const [mode, setMode] = useState<SourceMode>(() => readMode());
   const [deviceIndex, setDeviceIndex] = useState<number | undefined>(undefined);
   // Loopback / system-audio source. undefined = no system-audio capture

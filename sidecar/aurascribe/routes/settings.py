@@ -113,6 +113,11 @@ _CONFIG_FIELDS: list[tuple[str, object]] = [
     ("obsidian_write_chunks",          5),
     # Advanced — Daily Brief
     ("daily_brief_auto_refresh",       False),
+    # Auto-capture (sustained-speech auto-start/stop)
+    ("auto_capture_enabled",           True),
+    ("auto_capture_start_speech_sec",  1.5),
+    ("auto_capture_stop_silence_sec",  90.0),
+    ("auto_capture_vad_threshold",     0.5),
 ]
 
 
@@ -149,6 +154,10 @@ def _effective_for(key: str) -> object:
         "obsidian_write_interval_sec":    config.OBSIDIAN_WRITE_INTERVAL_SEC,
         "obsidian_write_chunks":          config.OBSIDIAN_WRITE_CHUNKS,
         "daily_brief_auto_refresh":       config.DAILY_BRIEF_AUTO_REFRESH,
+        "auto_capture_enabled":           config.AUTO_CAPTURE_ENABLED,
+        "auto_capture_start_speech_sec":  config.AUTO_CAPTURE_START_SPEECH_SEC,
+        "auto_capture_stop_silence_sec":  config.AUTO_CAPTURE_STOP_SILENCE_SEC,
+        "auto_capture_vad_threshold":     config.AUTO_CAPTURE_VAD_THRESHOLD,
     }
     return readers[key]
 
@@ -185,6 +194,10 @@ class UserConfigUpdate(BaseModel):
     obsidian_write_interval_sec: float | None = None
     obsidian_write_chunks: int | None = None
     daily_brief_auto_refresh: bool | None = None
+    auto_capture_enabled: bool | None = None
+    auto_capture_start_speech_sec: float | None = None
+    auto_capture_stop_silence_sec: float | None = None
+    auto_capture_vad_threshold: float | None = None
 
 
 def _config_response() -> dict:
@@ -206,6 +219,17 @@ async def get_settings_config() -> dict:
     return _config_response()
 
 
+# Keys that the running sidecar can pick up without a restart. Anything
+# else landing in config.json still flips `requires_restart` so the UI
+# can nudge the user.
+_HOT_RELOAD_KEYS = {
+    "auto_capture_enabled",
+    "auto_capture_start_speech_sec",
+    "auto_capture_stop_silence_sec",
+    "auto_capture_vad_threshold",
+}
+
+
 @router.put("/config")
 async def put_settings_config(req: UserConfigUpdate) -> dict:
     provided = req.model_fields_set if hasattr(req, "model_fields_set") else req.__fields_set__
@@ -222,13 +246,35 @@ async def put_settings_config(req: UserConfigUpdate) -> dict:
         else:
             updates[key] = val
     config.save_user_config(updates)
+
+    # Auto-capture settings hot-reload so the monitor reacts immediately
+    # to a toggle / threshold change instead of waiting for a restart.
+    # `reload_auto_capture_from_file` refreshes the module-level vars;
+    # `monitor.reload_from_config` picks them up.
+    touched_hot_keys = _HOT_RELOAD_KEYS & set(provided)
+    if touched_hot_keys:
+        config.reload_auto_capture_from_file()
+        # Import here to avoid a top-level cycle (settings → _shared →
+        # auto_capture module pulls in things settings doesn't need).
+        from aurascribe.routes._shared import auto_capture_monitor
+        if auto_capture_monitor is not None:
+            try:
+                await auto_capture_monitor.reload_from_config()
+            except Exception:
+                # Best-effort — a bad reload shouldn't fail the save. The
+                # next manual toggle or restart will re-sync.
+                pass
+
     resp = _config_response()
-    # Any field whose persisted value differs from what's live requires a
-    # restart. Clearing an override (override=None) also counts if the
-    # live value differs from the built-in default.
+    # Any NON-hot-reload field whose persisted value differs from what's
+    # live requires a restart. Clearing an override (override=None) also
+    # counts if the live value differs from the built-in default.
     resp["requires_restart"] = any(
-        (f.get("override") if f.get("override") is not None else f.get("default"))
-        != f.get("effective")
-        for f in resp["settings"].values()
+        key not in _HOT_RELOAD_KEYS
+        and (
+            (f.get("override") if f.get("override") is not None else f.get("default"))
+            != f.get("effective")
+        )
+        for key, f in resp["settings"].items()
     )
     return resp

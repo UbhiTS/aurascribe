@@ -15,9 +15,11 @@ from contextlib import asynccontextmanager
 import aiosqlite
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 
 from aurascribe import __version__
 from aurascribe import config
+from aurascribe.auto_capture import AutoCaptureMonitor
 from aurascribe.db.database import init_db
 from aurascribe.llm.client import get_available_models
 from aurascribe.obsidian.writer import cleanup_vault_stragglers
@@ -28,11 +30,13 @@ from aurascribe.routes import (
     settings_router,
     voices_router,
 )
+from aurascribe.routes import _shared as _shared_mod
 from aurascribe.routes._shared import (
     backfill_voice_colors,
     broadcast,
     broadcast_lock,
     manager,
+    set_auto_capture_monitor,
     ws_clients,
 )
 from aurascribe.routes.daily_brief import regen_brief_for_meeting
@@ -76,8 +80,22 @@ async def lifespan(app: FastAPI):
             {"type": "partial_utterance", "meeting_id": meeting_id, "speaker": speaker, "text": text}
         )
 
+    # Built before on_status so the handler can forward events to it.
+    auto_capture = AutoCaptureMonitor(manager=manager, broadcast=broadcast)
+    set_auto_capture_monitor(auto_capture)
+
     async def on_status(event: str, data: dict) -> None:
         await broadcast({"type": "status", "event": event, **data})
+        # Hand the event to the auto-capture monitor so it can close its
+        # listening stream on "recording" and re-open on "done". Fire-and-
+        # forget — the monitor's own lock serialises the resulting mic
+        # transitions.
+        asyncio.create_task(auto_capture.on_manager_status(event, data))
+        # Auto-enable the monitor the first time the engine reports ready.
+        # We don't enable during "loading" because start_meeting() would
+        # reject any trigger with "Models still loading" anyway.
+        if event == "ready" and config.AUTO_CAPTURE_ENABLED and not auto_capture.enabled:
+            asyncio.create_task(auto_capture.enable())
         # Meeting finished → the Daily Brief for that meeting's date is now
         # stale. Mark + regenerate in the background so the user's next
         # visit to the Daily Briefs page is already fresh. Skipped when the
@@ -94,6 +112,10 @@ async def lifespan(app: FastAPI):
         # ~30Hz during recording. Small-payload broadcast, no coalescing —
         # the WS lock is cheap and Waveform sub-samples to 20Hz anyway.
         await broadcast({"type": "audio_level", "rms": rms, "peak": peak})
+        # Feed the same signal into auto-capture's silence detector so it
+        # can auto-stop meetings it started. The monitor guards its own
+        # state transitions; manually-started meetings are a no-op here.
+        await auto_capture.on_manager_level(rms, peak)
 
     manager.on_utterance(on_utterance)
     manager.on_partial(on_partial)
@@ -102,6 +124,12 @@ async def lifespan(app: FastAPI):
     manager.intel.set_broadcast(broadcast)
     asyncio.create_task(manager.initialize())
     yield
+    # Shutdown — release the monitor's mic stream cleanly so a restart
+    # doesn't trip over a lingering PortAudio handle on Windows.
+    try:
+        await auto_capture.disable()
+    except Exception:
+        pass
 
 
 app = FastAPI(title="AuraScribe Sidecar", version=__version__, lifespan=lifespan)
@@ -197,6 +225,50 @@ async def get_status() -> dict:
             "enabled": diar_enabled,
             "device": diar_device,  # "cuda" | "cpu" | None
         },
+        # Snapshot of the auto-capture monitor so the UI can render the
+        # correct toggle state on first load, before the first WS
+        # `auto_capture` event arrives. `state` is one of:
+        #   "disabled" | "listening" | "armed" | "recording" | "error"
+        "auto_capture": (
+            _shared_mod.auto_capture_monitor.snapshot()
+            if _shared_mod.auto_capture_monitor is not None
+            else {"enabled": False, "state": "disabled", "confidence": 0.0}
+        ),
+    }
+
+
+# ── Auto-capture toggle ─────────────────────────────────────────────────────
+#
+# Persisted to config.json (same place Settings uses) AND applied live to
+# the running monitor. Kept as a dedicated endpoint rather than making the
+# user navigate to Settings — the toggle lives front-and-center on the
+# Recording bar so flipping it mid-session shouldn't need two API calls.
+
+
+class AutoCaptureToggle(BaseModel):
+    enabled: bool
+
+
+@app.get("/api/auto-capture")
+async def get_auto_capture() -> dict:
+    monitor = _shared_mod.auto_capture_monitor
+    if monitor is None:
+        return {"enabled": False, "state": "disabled", "confidence": 0.0}
+    return monitor.snapshot()
+
+
+@app.put("/api/auto-capture")
+async def put_auto_capture(req: AutoCaptureToggle) -> dict:
+    config.save_user_config({"auto_capture_enabled": req.enabled})
+    config.reload_auto_capture_from_file()
+    monitor = _shared_mod.auto_capture_monitor
+    if monitor is not None:
+        try:
+            await monitor.reload_from_config()
+        except Exception as e:
+            raise HTTPException(500, f"Could not apply auto-capture toggle: {e}")
+    return monitor.snapshot() if monitor is not None else {
+        "enabled": req.enabled, "state": "disabled", "confidence": 0.0,
     }
 
 

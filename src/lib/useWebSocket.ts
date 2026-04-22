@@ -14,7 +14,18 @@ export type WSMessage =
   // visualizers reflect the signal that's actually being transcribed
   // (mic + AEC-cancelled loopback, when system audio is enabled),
   // not just the raw mic via getUserMedia.
-  | { type: "audio_level"; rms: number; peak: number };
+  | { type: "audio_level"; rms: number; peak: number }
+  // ~5Hz while the auto-capture monitor is running. `state` is the
+  // monitor's current node in its state machine and `confidence` is a
+  // 0–1 EMA-smoothed Silero VAD output. Rendered as the small "Auto"
+  // chip on the RecordingBar.
+  | {
+      type: "auto_capture";
+      enabled: boolean;
+      state: "disabled" | "listening" | "armed" | "recording" | "error";
+      confidence: number;
+      silent_seconds?: number;
+    };
 
 type Handler = (msg: WSMessage) => void;
 

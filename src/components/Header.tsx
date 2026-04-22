@@ -1,6 +1,7 @@
 import { Book, Brain, Cpu, Plug, PlugZap, Users, Zap } from "lucide-react";
 import type { LLMHealth } from "../lib/useLLMHealth";
-import type { AppStatus } from "../lib/api";
+import type { AppStatus, AutoCaptureState } from "../lib/api";
+import { AutoCaptureChip } from "./AutoCaptureChip";
 
 type StatusEvent =
   | "loading" | "ready" | "recording" | "processing" | "done" | "error";
@@ -14,14 +15,19 @@ interface Props {
   hardware: AppStatus["hardware"] | null;
   asr: AppStatus["asr"] | null;
   diarization: AppStatus["diarization"] | null;
+  autoCaptureState: AutoCaptureState | null;
+  setAutoCaptureState: (s: AutoCaptureState | null) => void;
 }
 
-// Visual grammar for the compute chips: a single colour per location so
-// green=GPU / amber=CPU / gray=disabled reads consistently at a glance.
-function computeChipClass(device: "cuda" | "cpu" | null): string {
-  if (device === "cuda") return "text-emerald-300 border-emerald-800/50 bg-emerald-950/30";
-  if (device === "cpu") return "text-amber-300 border-amber-800/50 bg-amber-950/30";
-  return "text-gray-400 border-gray-800 bg-gray-900/60";
+// Every header item uses the same visual grammar: a colored icon carries
+// the state, gray text carries the label, a middle-dot separator carries
+// any secondary detail. Nothing is pilled — we used to mix pills with
+// icon+text and it read as "two languages in one bar".
+
+function computeIconClass(device: "cuda" | "cpu" | null): string {
+  if (device === "cuda") return "text-emerald-400";
+  if (device === "cpu") return "text-amber-400";
+  return "text-gray-500";
 }
 
 function deviceLabel(device: "cuda" | "cpu" | null): string {
@@ -30,20 +36,29 @@ function deviceLabel(device: "cuda" | "cpu" | null): string {
   return "off";
 }
 
-function StatusPill({ status, message }: { status: StatusEvent; message: string }) {
+function deviceTextClass(device: "cuda" | "cpu" | null): string {
+  if (device === "cuda") return "text-emerald-300";
+  if (device === "cpu") return "text-amber-300";
+  return "text-gray-500";
+}
+
+function StatusIndicator({ status, message }: { status: StatusEvent; message: string }) {
+  // The status item is a dot + text instead of an icon + text — the dot
+  // stays as the one place in the bar where animation (pulse) is a strong
+  // visual affordance for "something is happening right now".
   const cfg =
     status === "loading" || status === "processing"
-      ? { dot: "bg-amber-500 animate-pulse", ring: "border-amber-800/50 text-amber-400 bg-amber-950/30", text: status === "processing" ? "Processing" : "Loading" }
+      ? { dot: "bg-amber-500 animate-pulse", text: "text-amber-300", label: status === "processing" ? "Processing" : "Loading" }
       : status === "recording"
-      ? { dot: "bg-red-500 animate-pulse", ring: "border-red-800/50 text-red-400 bg-red-950/30", text: "Recording" }
+      ? { dot: "bg-red-500 animate-pulse", text: "text-red-300", label: "Recording" }
       : status === "error"
-      ? { dot: "bg-red-500", ring: "border-red-800/50 text-red-400 bg-red-950/30", text: message || "Error" }
-      : { dot: "bg-emerald-500", ring: "border-emerald-800/50 text-emerald-400 bg-emerald-950/30", text: "System Ready" };
+      ? { dot: "bg-red-500", text: "text-red-300", label: message || "Error" }
+      : { dot: "bg-emerald-500", text: "text-emerald-300", label: "System Ready" };
 
   return (
-    <div className={`flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs border ${cfg.ring}`}>
+    <div className="flex items-center gap-1.5 text-xs">
       <div className={`w-1.5 h-1.5 rounded-full ${cfg.dot}`} />
-      {cfg.text}
+      <span className={cfg.text}>{cfg.label}</span>
     </div>
   );
 }
@@ -51,7 +66,7 @@ function StatusPill({ status, message }: { status: StatusEvent; message: string 
 export function Header({
   wsConnected, llm,
   obsidianConfigured, systemStatus, statusMessage,
-  hardware, asr, diarization,
+  hardware, asr, diarization, autoCaptureState, setAutoCaptureState,
 }: Props) {
   // Provider online when the model list is non-empty. Prefer the configured
   // model name for display; fall back to whatever the provider reports.
@@ -98,11 +113,11 @@ export function Header({
           }
         />
         <span className={!llm.online ? "text-red-400" : "text-gray-300"}>AI</span>
-        <span className="text-gray-500">·</span>
+        <span className="text-gray-600">·</span>
         <span className={`truncate max-w-[220px] ${
           !llm.online ? "text-red-400"
           : aiMisconfigured ? "text-amber-400"
-          : "text-gray-300"
+          : "text-gray-400"
         }`}>
           {llm.online ? (aiLabel ?? "ready") : "offline"}
         </span>
@@ -128,15 +143,14 @@ export function Header({
         </span>
       </div>
 
-      {/* Compute-placement chips. Two of them — one per pipeline — so the
-          user always knows where Whisper and pyannote are actually running.
-          The two can diverge (ctranslate2 has its own CUDA path; torch may
-          be CPU-only), which this layout makes obvious. */}
+      {/* Compute-placement items. One per pipeline so the user always
+          knows where Whisper and pyannote are running — they can diverge
+          (ctranslate2 has its own CUDA path; torch may be CPU-only). */}
       {asr && (
         <>
           <div className="h-4 w-px bg-gray-800" />
           <div
-            className={`flex items-center gap-1.5 px-2 py-0.5 rounded-full text-[11px] border ${computeChipClass(asr.device)}`}
+            className="flex items-center gap-1.5 text-xs"
             title={[
               `Whisper · ${asr.model}`,
               `device: ${asr.device.toUpperCase()}`,
@@ -146,18 +160,24 @@ export function Header({
                 : null,
             ].filter(Boolean).join(" · ")}
           >
-            {asr.device === "cuda" ? <Zap size={11} /> : <Cpu size={11} />}
-            <span className="font-medium">Whisper</span>
-            <span className="font-mono opacity-80 truncate max-w-[140px]">{asr.model}</span>
-            <span className="opacity-70">·</span>
-            <span className="font-semibold">{deviceLabel(asr.device)}</span>
+            {asr.device === "cuda"
+              ? <Zap size={13} className={computeIconClass(asr.device)} />
+              : <Cpu size={13} className={computeIconClass(asr.device)} />}
+            <span className="text-gray-300">Whisper</span>
+            <span className="text-gray-600">·</span>
+            <span className="text-gray-400 font-mono truncate max-w-[140px]">{asr.model}</span>
+            <span className="text-gray-600">·</span>
+            <span className={`font-semibold ${deviceTextClass(asr.device)}`}>
+              {deviceLabel(asr.device)}
+            </span>
           </div>
         </>
       )}
       {diarization && (
         <>
+          <div className="h-4 w-px bg-gray-800" />
           <div
-            className={`flex items-center gap-1.5 px-2 py-0.5 rounded-full text-[11px] border ${computeChipClass(diarization.device)}`}
+            className="flex items-center gap-1.5 text-xs"
             title={
               diarization.enabled
                 ? `Speaker diarization · device: ${diarization.device?.toUpperCase()}${
@@ -168,17 +188,23 @@ export function Header({
                 : "Speaker diarization is disabled — requires HF_TOKEN + accepting the pyannote license."
             }
           >
-            <Users size={11} />
-            <span className="font-medium">Diarize</span>
-            <span className="opacity-70">·</span>
-            <span className="font-semibold">{deviceLabel(diarization.device)}</span>
+            <Users size={13} className={computeIconClass(diarization.device)} />
+            <span className="text-gray-300">Diarize</span>
+            <span className="text-gray-600">·</span>
+            <span className={`font-semibold ${deviceTextClass(diarization.device)}`}>
+              {deviceLabel(diarization.device)}
+            </span>
           </div>
         </>
       )}
 
       <div className="flex-1" />
 
-      <StatusPill status={systemStatus} message={statusMessage} />
+      <AutoCaptureChip state={autoCaptureState} setState={setAutoCaptureState} />
+
+      <div className="h-4 w-px bg-gray-800" />
+
+      <StatusIndicator status={systemStatus} message={statusMessage} />
     </header>
   );
 }
