@@ -25,6 +25,18 @@ export type WSMessage =
       state: "disabled" | "listening" | "armed" | "recording" | "error";
       confidence: number;
       silent_seconds?: number;
+    }
+  // Fired by the live title-refinement loop when it has a better
+  // suggestion (only when title_locked is false). The frontend patches
+  // `liveMeeting.title` in place and shows a subtle fade so the user
+  // notices the change without it feeling jarring.
+  | {
+      type: "title_updated";
+      meeting_id: string;
+      title: string;
+      // "live_refinement" today; reserved for future sources (e.g.
+      // "ai_summary" if we want to echo that through WS too).
+      source?: string;
     };
 
 type Handler = (msg: WSMessage) => void;

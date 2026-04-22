@@ -116,7 +116,12 @@ PROMPTS_DIR.mkdir(parents=True, exist_ok=True)
 _BUNDLED_PROMPTS_DIR: Path = Path(__file__).resolve().parent / "llm"
 # Known prompts we own. New prompts can be dropped in PROMPTS_DIR at any
 # time — nothing seeds or gates them, they just need to live there.
-_SEEDED_PROMPTS: tuple[str, ...] = ("live_intelligence.md", "daily_brief.md")
+_SEEDED_PROMPTS: tuple[str, ...] = (
+    "live_intelligence.md",
+    "daily_brief.md",
+    "meeting_analysis.md",
+    "meeting_title_refinement.md",
+)
 
 for _name in _SEEDED_PROMPTS:
     _target = PROMPTS_DIR / _name

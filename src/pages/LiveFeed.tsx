@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Sparkles, Loader, Pencil, CheckSquare, Square, RefreshCw, Lightbulb } from "lucide-react";
+import { Sparkles, Loader, Pencil, CheckSquare, Square, RefreshCw, Lightbulb, Lock, Unlock } from "lucide-react";
 import type { AppStatus, LiveIntel, Meeting, Utterance, Voice } from "../lib/api";
 import { api } from "../lib/api";
 import { useClockTick } from "../lib/useClockTick";
@@ -51,9 +51,23 @@ export function LiveFeed({
   const handleRenameTitle = async () => {
     if (!meetingId || !titleDraft.trim()) { setEditingTitle(false); return; }
     await api.meetings.rename(meetingId, titleDraft.trim());
-    setMeeting(meeting ? { ...meeting, title: titleDraft.trim() } : null);
+    // Server flips title_locked=true as a side effect of rename so the
+    // live-refinement loop leaves the user's title alone from now on.
+    setMeeting(meeting ? { ...meeting, title: titleDraft.trim(), title_locked: true } : null);
     bumpRefreshKey();
     setEditingTitle(false);
+  };
+
+  const handleToggleTitleLock = async () => {
+    if (!meetingId || !meeting) return;
+    const next = !(meeting.title_locked ?? false);
+    // Optimistic flip so the icon reacts instantly; failure rolls back.
+    setMeeting({ ...meeting, title_locked: next });
+    try {
+      await api.meetings.setTitleLock(meetingId, next);
+    } catch {
+      setMeeting({ ...meeting, title_locked: !next });
+    }
   };
 
   const handleSummarize = async () => {
@@ -147,6 +161,23 @@ export function LiveFeed({
                         className="flex-shrink-0 text-gray-500 hover:text-brand-400 transition-colors"
                       >
                         <Sparkles size={14} />
+                      </button>
+                    )}
+                    {meeting && (
+                      <button
+                        onClick={handleToggleTitleLock}
+                        title={
+                          meeting.title_locked
+                            ? "Title is frozen. Click to unlock so live AI refinement + AI Summary can update it."
+                            : "Title will auto-update as the meeting progresses. Click to freeze the current title."
+                        }
+                        className={`flex-shrink-0 transition-colors ${
+                          meeting.title_locked
+                            ? "text-brand-400 hover:text-brand-300"
+                            : "text-gray-500 hover:text-gray-200"
+                        }`}
+                      >
+                        {meeting.title_locked ? <Lock size={14} /> : <Unlock size={14} />}
                       </button>
                     )}
                   </div>

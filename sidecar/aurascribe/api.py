@@ -122,6 +122,7 @@ async def lifespan(app: FastAPI):
     manager.on_status(on_status)
     manager.on_level(on_level)
     manager.intel.set_broadcast(broadcast)
+    manager.title_refiner.set_broadcast(broadcast)
     asyncio.create_task(manager.initialize())
     yield
     # Shutdown — release the monitor's mic stream cleanly so a restart

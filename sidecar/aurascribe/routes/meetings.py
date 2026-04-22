@@ -16,7 +16,6 @@ from pydantic import BaseModel
 
 from aurascribe.audio.capture import MicUnavailableError
 from aurascribe.config import AUDIO_DIR, DB_PATH
-from aurascribe.llm.analysis import is_placeholder_title
 from aurascribe.llm.client import LLMUnavailableError
 from aurascribe.routes._shared import (
     PROVISIONAL_LABEL_RE,
@@ -236,6 +235,9 @@ class RenameMeetingRequest(BaseModel):
 
 @router.patch("/{meeting_id}")
 async def rename_meeting(meeting_id: str, req: RenameMeetingRequest) -> dict:
+    """Apply a user-typed title. Implicitly sets title_locked = 1 so the
+    live-refinement loop and AI Summary don't overwrite what the user
+    just typed. The lock can be cleared later via PATCH /title-lock."""
     if not req.title.strip():
         raise HTTPException(400, "Title cannot be empty")
     async with aiosqlite.connect(DB_PATH) as db:
@@ -248,7 +250,8 @@ async def rename_meeting(meeting_id: str, req: RenameMeetingRequest) -> dict:
             raise HTTPException(404, "Meeting not found")
         old_vault_path = row["vault_path"]
         await db.execute(
-            "UPDATE meetings SET title = ? WHERE id = ?", (req.title.strip(), meeting_id)
+            "UPDATE meetings SET title = ?, title_locked = 1 WHERE id = ?",
+            (req.title.strip(), meeting_id),
         )
         await db.commit()
     if old_vault_path:
@@ -259,6 +262,35 @@ async def rename_meeting(meeting_id: str, req: RenameMeetingRequest) -> dict:
     return {"ok": True}
 
 
+class TitleLockRequest(BaseModel):
+    locked: bool
+
+
+@router.patch("/{meeting_id}/title-lock")
+async def set_meeting_title_lock(meeting_id: str, req: TitleLockRequest) -> dict:
+    """Toggle the title-frozen flag WITHOUT changing the title.
+
+    Flipping to `locked=false` re-enables the live-refinement loop and
+    the AI Summary auto-rename; flipping to `locked=true` freezes the
+    current title against both. The frontend uses this for the lock
+    icon next to the title — typing a custom title via PATCH already
+    locks automatically, so this endpoint is for the explicit toggle
+    path (unlock to get AI help; re-lock after the AI did its thing).
+    """
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT 1 FROM meetings WHERE id = ?", (meeting_id,)
+        )
+        if await cursor.fetchone() is None:
+            raise HTTPException(404, "Meeting not found")
+        await db.execute(
+            "UPDATE meetings SET title_locked = ? WHERE id = ?",
+            (1 if req.locked else 0, meeting_id),
+        )
+        await db.commit()
+    return {"ok": True, "locked": req.locked}
+
+
 # ── Summary / title suggestion ──────────────────────────────────────────────
 
 
@@ -266,13 +298,12 @@ async def rename_meeting(meeting_id: str, req: RenameMeetingRequest) -> dict:
 async def summarize_meeting(meeting_id: str) -> dict:
     """Generate/refresh the AI summary.
 
-    Piggyback: since the combined LLM call also produces title
-    suggestions, if the meeting still carries a placeholder title
-    (e.g. "Transcription <timestamp>") we auto-apply the top suggestion
-    as the new title, updating the Obsidian file to match. A user-
-    supplied title is never overwritten.
+    Piggyback: the same LLM call produces title candidates, so if the
+    title is still unlocked (the user hasn't typed their own) we
+    auto-apply the top suggestion + rename the Obsidian file. A locked
+    title is never overwritten — the user owns it.
     """
-    result, current_title, current_vault_path = await run_analysis(meeting_id)
+    result, _current_title, current_vault_path, title_locked = await run_analysis(meeting_id)
 
     if not result.summary_markdown:
         raise HTTPException(
@@ -282,9 +313,10 @@ async def summarize_meeting(meeting_id: str) -> dict:
         )
     await persist_summary(meeting_id, result.summary_markdown)
 
-    # Free auto-rename — only applies when the user hasn't typed their
-    # own title yet, and only when we actually got a usable suggestion.
-    if is_placeholder_title(current_title) and result.titles:
+    # Auto-rename only when the title is unlocked. The user can unlock
+    # a frozen title at any time via PATCH /title-lock and re-run
+    # Summary to get a fresh suggestion applied.
+    if not title_locked and result.titles:
         await rename_with_vault_move(meeting_id, result.titles[0], current_vault_path)
 
     await rewrite_vault(meeting_id)
@@ -300,7 +332,7 @@ async def suggest_meeting_title(meeting_id: str) -> dict:
     frontend applies the user's chosen title via PATCH so rename/vault
     sync stays in one code path.
     """
-    result, _current_title, _old_vault = await run_analysis(meeting_id)
+    result, _current_title, _old_vault, _title_locked = await run_analysis(meeting_id)
 
     if not result.titles:
         raise HTTPException(

@@ -1,5 +1,5 @@
 import { useCallback, useMemo, useRef, useState } from "react";
-import { ArrowLeft, Clock, Loader, Pencil, Sparkles, CheckSquare, Square, FileText, Trash2, Wand2 } from "lucide-react";
+import { ArrowLeft, Clock, Loader, Pencil, Sparkles, CheckSquare, Square, FileText, Trash2, Wand2, Lock, Unlock } from "lucide-react";
 import { api, tagsPending } from "../lib/api";
 import type { Meeting, Voice } from "../lib/api";
 import { TranscriptView } from "../components/TranscriptView";
@@ -54,9 +54,22 @@ export function Review({
   const handleRenameTitle = async () => {
     if (!meetingId || !titleDraft.trim()) { setEditingTitle(false); return; }
     await api.meetings.rename(meetingId, titleDraft.trim());
-    setMeeting(meeting ? { ...meeting, title: titleDraft.trim() } : null);
+    // Server auto-locks on rename — mirror the flag in local state so
+    // the lock icon flips to "frozen" immediately.
+    setMeeting(meeting ? { ...meeting, title: titleDraft.trim(), title_locked: true } : null);
     onMeetingChanged();
     setEditingTitle(false);
+  };
+
+  const handleToggleTitleLock = async () => {
+    if (!meetingId || !meeting) return;
+    const next = !(meeting.title_locked ?? false);
+    setMeeting({ ...meeting, title_locked: next });
+    try {
+      await api.meetings.setTitleLock(meetingId, next);
+    } catch {
+      setMeeting({ ...meeting, title_locked: !next });
+    }
   };
 
   const handleSummarize = async () => {
@@ -264,6 +277,21 @@ export function Review({
                       className="flex-shrink-0 text-gray-500 hover:text-brand-400 transition-colors"
                     >
                       <Sparkles size={14} />
+                    </button>
+                    <button
+                      onClick={handleToggleTitleLock}
+                      title={
+                        meeting.title_locked
+                          ? "Title is frozen. Click to unlock so AI Summary can refine it."
+                          : "AI Summary will overwrite this title. Click to freeze it."
+                      }
+                      className={`flex-shrink-0 transition-colors ${
+                        meeting.title_locked
+                          ? "text-brand-400 hover:text-brand-300"
+                          : "text-gray-500 hover:text-gray-200"
+                      }`}
+                    >
+                      {meeting.title_locked ? <Lock size={14} /> : <Unlock size={14} />}
                     </button>
                   </div>
                 )}

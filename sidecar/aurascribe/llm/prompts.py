@@ -50,49 +50,22 @@ Comma-separated list of main topics discussed.
 List each person mentioned with a one-line description of their role/relevance in this meeting."""
 
 
-MEETING_ANALYSIS_SYSTEM = """You are AuraScribe, an expert meeting analyst.
-You read a meeting transcript and return TWO things in ONE response:
-
-1. Three distinct title candidates for the meeting.
-2. A structured markdown summary.
-
-Output ONLY a single JSON object with this exact shape:
-{
-  "titles": ["…", "…", "…"],
-  "summary_markdown": "## Summary\\n…\\n## Key Decisions\\n…"
-}
-
-Title rules:
-- Exactly 3 distinct titles. At most 60 characters each. No trailing period.
-- No quotes, no emoji, no filler like "Meeting about…" or "Discussion of…".
-- Use Title Case.
-- Prefer concrete nouns over vague verbs. Include the one or two most
-  distinctive topics, projects, or decisions.
-- Do NOT include dates, times, or speaker names.
-
-summary_markdown MUST contain these exact sections in this order:
-
-## Summary
-2-3 sentence overview of what was discussed and decided.
-
-## Key Decisions
-Bullet list of decisions made. If none, write "None."
-
-## Action Items
-Bullet list in format: "- [ ] [Person] — [action] (by [date if mentioned])"
-If no actions, write "None."
-
-## Key Topics
-Comma-separated list of main topics discussed.
-
-## People Mentioned
-List each person mentioned with a one-line description of their role/relevance in this meeting.
-
-Be concise, factual, and actionable. Escape newlines as \\n inside the
-JSON string. Output ONLY the JSON object. No prose, no code fences."""
+# The meeting-analysis system prompt used to live here as a module-level
+# constant. It moved to `sidecar/aurascribe/llm/meeting_analysis.md`
+# (seeded into APP_DATA/prompts/ on first run) so users can tune tone
+# and output format from the Settings → Prompt Files UI without editing
+# source. `analysis.py` reads the user copy on every call, falling back
+# to the bundled default if the user file is missing or unreadable.
 
 
-def meeting_analysis_prompt(*, transcript: str, current_title: str | None) -> str:
+def meeting_analysis_user_prompt(*, transcript: str, current_title: str | None) -> str:
+    """Per-request user message for the combined title+summary call.
+
+    The system prompt (loaded from meeting_analysis.md) establishes
+    format + rules; this message carries the only things that change per
+    request: the transcript, and the current (usually-placeholder) title
+    for context.
+    """
     parts: list[str] = []
     if current_title:
         parts.append(
@@ -104,7 +77,7 @@ def meeting_analysis_prompt(*, transcript: str, current_title: str | None) -> st
     return f"""{body}
 
 ---
-Analyze this meeting. Return the JSON object with both `titles` and `summary_markdown`."""
+Analyze this meeting. Return the JSON object with `entity`, `topics`, and `summary_markdown`."""
 
 
 def people_notes_prompt(person_name: str, existing_notes: str, new_transcript_excerpt: str) -> str:

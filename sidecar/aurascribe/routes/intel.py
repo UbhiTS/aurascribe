@@ -27,6 +27,8 @@ router = APIRouter(prefix="/api/intel")
 _PROMPT_LABELS = {
     "live_intelligence.md": "Live Intelligence",
     "daily_brief.md": "Daily Brief",
+    "meeting_analysis.md": "Meeting Analysis (title + summary)",
+    "meeting_title_refinement.md": "Live Title Refinement",
 }
 
 

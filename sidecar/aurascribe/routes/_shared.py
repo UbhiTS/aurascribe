@@ -255,13 +255,17 @@ def delete_vault_files(vault_paths: list[str | None]) -> None:
 # ── Analysis helpers (title + summary) ──────────────────────────────────────
 
 
-async def run_analysis(meeting_id: str) -> tuple[AnalysisResult, str | None, str | None]:
+async def run_analysis(
+    meeting_id: str,
+) -> tuple[AnalysisResult, str | None, str | None, bool]:
     """Shared body for the two analysis-driven endpoints.
 
     Loads the meeting + utterances, runs the combined title+summary LLM
-    call, and returns the parsed result alongside the fields the caller
-    needs for its follow-up work: the current title (for placeholder
-    detection) and the current vault_path (for auto-rename file moves).
+    call, and returns the parsed result alongside the fields callers
+    need for follow-up work:
+      * current title       — for placeholder detection + DB updates
+      * current vault_path  — for auto-rename file moves
+      * title_locked        — whether the caller is allowed to auto-rename
 
     Raises HTTPException for the cases both endpoints share:
       404 — no such meeting
@@ -272,13 +276,25 @@ async def run_analysis(meeting_id: str) -> tuple[AnalysisResult, str | None, str
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
-            "SELECT title, vault_path FROM meetings WHERE id = ?", (meeting_id,)
+            "SELECT title, vault_path, started_at, title_locked "
+            "FROM meetings WHERE id = ?",
+            (meeting_id,),
         )
         row = await cursor.fetchone()
         if not row:
             raise HTTPException(404, "Meeting not found")
         current_title = row["title"]
         current_vault_path = row["vault_path"]
+        title_locked = bool(row["title_locked"])
+        # Authoritative wall-clock start from the DB. Parsed into a
+        # datetime and handed to analyze_meeting so it can stitch the
+        # `YYYY-MM-DD HH-MM-SS - entity - topic` title format without
+        # asking the LLM to echo the date (which hallucinates).
+        started_at_raw = row["started_at"]
+        try:
+            started_at = datetime.fromisoformat(started_at_raw) if started_at_raw else None
+        except Exception:
+            started_at = None
         cursor = await db.execute(
             "SELECT id, speaker, text, start_time, end_time FROM utterances "
             "WHERE meeting_id = ? ORDER BY start_time",
@@ -299,6 +315,7 @@ async def run_analysis(meeting_id: str) -> tuple[AnalysisResult, str | None, str
         result = await analyze_meeting(
             transcript=transcript,
             current_title=current_title,
+            started_at=started_at,
         )
     except LLMUnavailableError as e:
         raise HTTPException(503, str(e))
@@ -311,7 +328,7 @@ async def run_analysis(meeting_id: str) -> tuple[AnalysisResult, str | None, str
             "`llm_context_tokens` (try 16384+), or switch `llm_model` to a "
             "non-reasoning model. Then hit Try again.",
         )
-    return result, current_title, current_vault_path
+    return result, current_title, current_vault_path, title_locked
 
 
 async def persist_summary(meeting_id: str, summary_md: str) -> None:
@@ -381,6 +398,10 @@ def normalize_meeting_row(row: dict) -> dict:
             log.warning("meeting row %s: malformed JSON in %s — dropping",
                         row.get("id"), field)
             row[field] = None
+    # SQLite stores bools as INTEGER (0/1); surface as real bool to the
+    # frontend so `if (meeting.title_locked)` works without === 1 checks.
+    if "title_locked" in row:
+        row["title_locked"] = bool(row["title_locked"])
     return row
 
 

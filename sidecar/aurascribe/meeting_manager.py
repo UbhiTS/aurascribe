@@ -38,6 +38,7 @@ from aurascribe.llm.prompts import (
     people_notes_prompt,
 )
 from aurascribe.llm.realtime import RealtimeIntelligence
+from aurascribe.llm.title_refinement import TitleRefinement
 from aurascribe.obsidian.writer import (
     forget_meeting_throttle,
     note_chunk_arrived,
@@ -154,6 +155,11 @@ class MeetingManager:
         # Real-time intelligence loop. The api layer wires its broadcast
         # callback in via `intel.set_broadcast(...)` during lifespan setup.
         self.intel = RealtimeIntelligence()
+        # Live meeting-title refinement. Runs on the same debounce cadence
+        # as `intel` so LLM activity is batched rather than scattered.
+        # Broadcast is set via `title_refiner.set_broadcast(...)` in the
+        # same lifespan block so it can fire `title_updated` WS events.
+        self.title_refiner = TitleRefinement()
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -244,6 +250,7 @@ class MeetingManager:
             log.warning("Opus recording unavailable for %s: %s", meeting_id, e)
 
         await self.intel.prepare_meeting(meeting_id)
+        await self.title_refiner.prepare_meeting(meeting_id)
         # Seed the partial anchor to the current capture wall-clock so the
         # first partial only covers audio captured FROM THIS POINT ON —
         # monitor-mode audio that preceded the Start button shouldn't bleed
@@ -284,6 +291,7 @@ class MeetingManager:
         self._provisional_pools.pop(meeting_id, None)
         self._provisional_next_n.pop(meeting_id, None)
         await self.intel.flush_and_clear(meeting_id)
+        await self.title_refiner.flush_and_clear(meeting_id)
         # Drop throttle counters — finalize will do the last write itself.
         forget_meeting_throttle(meeting_id)
 
@@ -353,6 +361,11 @@ class MeetingManager:
                     # Realtime intelligence runs on a debounced timer — this
                     # call only schedules; it doesn't block the record loop.
                     await self.intel.note_utterances(meeting_id, utterances)
+                    # Fire-and-forget title refinement — same debounce
+                    # window as intel, but a cheaper LLM call (only
+                    # {entity, topic} returned). The module no-ops if
+                    # title_locked is 1.
+                    await self.title_refiner.note_utterances(meeting_id, utterances)
 
                     # Throttled vault write: skip unless we've hit either
                     # gate. The intel loop's writes also reset these counters

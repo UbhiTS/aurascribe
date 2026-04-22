@@ -47,6 +47,12 @@ export interface Meeting {
   // "Recompute to apply" hint.
   last_tagged_at: string | null;
   last_recomputed_at: string | null;
+  // True when the user has claimed ownership of the title (typed a
+  // custom one, or picked a suggestion, or clicked the freeze icon).
+  // While false, the live-refinement loop + AI Summary can overwrite
+  // it with a better suggestion from transcript context. Optional on
+  // the type because legacy persisted rows predate the column.
+  title_locked?: boolean;
 }
 
 /**
@@ -452,6 +458,14 @@ export const api = {
       request<{ ok: boolean }>(`/meetings/${id}`, {
         method: "PATCH",
         body: JSON.stringify({ title }),
+      }),
+    // Toggle the title-frozen flag WITHOUT changing the title. Typing a
+    // custom title via `rename()` already locks automatically; this is
+    // for the explicit lock/unlock icon next to the title.
+    setTitleLock: (id: string, locked: boolean) =>
+      request<{ ok: boolean; locked: boolean }>(`/meetings/${id}/title-lock`, {
+        method: "PATCH",
+        body: JSON.stringify({ locked }),
       }),
     summarize: (id: string) =>
       request<Meeting>(`/meetings/${id}/summarize`, { method: "POST" }),

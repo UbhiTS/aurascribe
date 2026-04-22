@@ -109,11 +109,20 @@ export default function App() {
     let cancelled = false;
     let timer: number | null = null;
     let isReady = false;  // local, so the timing doesn't depend on React state flush
+    // How long we've been unable to reach the sidecar since mount (or
+    // since the last successful poll). Seconds. If this climbs past
+    // STARTUP_UNREACHABLE_SEC without a single good response, we assume
+    // the sidecar crashed during startup — flip to error so the splash
+    // hides and the user sees the red pill in the header instead of
+    // spinning forever.
+    let unreachableSince: number | null = null;
+    const STARTUP_UNREACHABLE_SEC = 30;
 
     const tick = async () => {
       try {
         const s = await api.status();
         if (cancelled) return;
+        unreachableSince = null;  // good response resets the timer
         setAppStatus(s);
         // Seed auto-capture from the snapshot so the chip shows the right
         // state before the first WS message arrives (and after a reconnect
@@ -126,9 +135,29 @@ export default function App() {
         }
       } catch {
         // Request failed — sidecar not up yet (startup) or crashed (post-ready).
-        if (!cancelled && isReady) {
+        if (cancelled) return;
+        if (isReady) {
+          // Post-ready disconnect: surface immediately. Header pill + error.
           setSystemStatus("error");
           setStatusMessage("Sidecar unreachable");
+        } else {
+          // Pre-ready disconnect: the sidecar may still be importing
+          // modules or loading Whisper weights, so a few seconds of
+          // ECONNREFUSED is normal. But if it persists past
+          // STARTUP_UNREACHABLE_SEC, something's wrong (crash during
+          // init_db, missing extra, bad config.json) — flip to error
+          // so the splash dismisses and the user can see diagnostics.
+          const now = Date.now();
+          if (unreachableSince === null) unreachableSince = now;
+          else if ((now - unreachableSince) / 1000 > STARTUP_UNREACHABLE_SEC) {
+            setSystemStatus("error");
+            setStatusMessage(
+              "Sidecar failed to start. Check the log at the path shown "
+              + "in Settings → Data Directory (sidecar.log). Common "
+              + "causes: corrupt DB migration, missing Python dependency, "
+              + "or a bad config.json.",
+            );
+          }
         }
       }
       if (!cancelled) {
@@ -239,6 +268,11 @@ export default function App() {
         confidence: typeof msg.confidence === "number" ? msg.confidence : 0,
         silent_seconds: typeof msg.silent_seconds === "number" ? msg.silent_seconds : 0,
       });
+    }
+    if (msg.type === "title_updated" && msg.meeting_id === liveMeetingIdRef.current) {
+      // Title refinement landed server-side. Patch the live meeting in
+      // place so the UI picks up the new value without a full refetch.
+      setLiveMeeting((prev) => prev ? { ...prev, title: msg.title } : prev);
     }
   }, []);
   const { connected: wsConnected } = useWebSocket(handleWsMessage);
