@@ -48,24 +48,22 @@ function deviceTextClass(device: "cuda" | "cpu" | null): string {
   return "text-gray-500";
 }
 
-function StatusIndicator({ status, message }: { status: StatusEvent; message: string }) {
-  // The status item is a dot + text instead of an icon + text — the dot
-  // stays as the one place in the bar where animation (pulse) is a strong
-  // visual affordance for "something is happening right now". Below `md`
-  // the text hides and only the dot remains (tooltip carries the label).
-  const cfg =
-    status === "loading" || status === "processing"
-      ? { dot: "bg-amber-500 animate-pulse", text: "text-amber-300", label: status === "processing" ? "Processing" : "Loading" }
-      : status === "recording"
-      ? { dot: "bg-red-500 animate-pulse", text: "text-red-300", label: "Recording" }
-      : status === "error"
-      ? { dot: "bg-red-500", text: "text-red-300", label: message || "Error" }
-      : { dot: "bg-emerald-500", text: "text-emerald-300", label: "System Ready" };
-
+// Only renders when something is actually wrong. Every other status
+// (Loading / Recording / Processing / Ready) is already conveyed more
+// clearly elsewhere in the UI:
+//   * Loading    — the Sidecar indicator on the far left flips to
+//                  "Reconnecting" when the sidecar isn't ready.
+//   * Recording  — the RecordingBar shows its own red pulsing dot +
+//                  timer + Stop button.
+//   * Processing — transient state the user doesn't need to act on.
+//   * Ready      — the green Sidecar indicator already signals health.
+// Surfacing errors is the one case the user can't learn about from
+// anywhere else, so the pill is reserved for that.
+function ErrorIndicator({ message }: { message: string }) {
   return (
-    <div className="flex items-center gap-1.5 text-xs flex-shrink-0" title={cfg.label}>
-      <div className={`w-1.5 h-1.5 rounded-full ${cfg.dot}`} />
-      <span className={`${cfg.text} hidden md:inline`}>{cfg.label}</span>
+    <div className="flex items-center gap-1.5 text-xs flex-shrink-0" title={message || "Error"}>
+      <div className="w-1.5 h-1.5 rounded-full bg-red-500" />
+      <span className="text-red-300 hidden md:inline">{message || "Error"}</span>
     </div>
   );
 }
@@ -218,9 +216,12 @@ export function Header({
 
       <AutoCaptureChip state={autoCaptureState} setState={setAutoCaptureState} />
 
-      <div className="h-4 w-px bg-gray-800 hidden md:block" />
-
-      <StatusIndicator status={systemStatus} message={statusMessage} />
+      {systemStatus === "error" && (
+        <>
+          <div className="h-4 w-px bg-gray-800 hidden md:block" />
+          <ErrorIndicator message={statusMessage} />
+        </>
+      )}
     </header>
   );
 }
