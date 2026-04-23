@@ -176,13 +176,16 @@ def meeting_vault_link(started_at: datetime, title: str) -> str | None:
 
 
 def daily_brief_file_path(brief_date: str) -> Path | None:
-    """Canonical path for a daily brief: `Daily/YYYY-MM-DD.md`. Flat —
-    one file per day, no year/month subfolders. Daily briefs are cheap
-    to scroll through in Obsidian's file tree even over several years,
-    and the flat layout makes them trivial to cross-link by date."""
-    if VAULT_DAILY is None:
+    """Canonical path for a daily brief: `Daily/YYYY-MM/YYYY-MM-DD.md`.
+
+    Month folders keep each directory to ~31 files — scanning "what did
+    I work on in March?" stays usable, and Obsidian's file tree doesn't
+    turn into a wall of 365+ entries after a year of use.
+    """
+    if VAULT_DAILY is None or len(brief_date) < 7:
         return None
-    return VAULT_DAILY / f"{brief_date}.md"
+    year_month = brief_date[:7]  # "YYYY-MM"
+    return VAULT_DAILY / year_month / f"{brief_date}.md"
 
 
 # ── People-note lookup (voice_id is the real identity key) ──────────────────

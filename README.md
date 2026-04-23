@@ -68,7 +68,7 @@ First launch shows a welcome dialog with your detected hardware and the chosen W
 <vault>/
   Meetings/YYYY/YYYY-MM-DD/HH-MM - <title>.md
   People/<Display Name>.md            # voice_id in frontmatter is the real identity key
-  Daily/YYYY-MM-DD.md                 # generated daily briefs, flat by date
+  Daily/YYYY-MM/YYYY-MM-DD.md         # generated daily briefs, grouped by month
 ```
 
 People notes are keyed by `voice_id` in frontmatter, not filename — rename a note in Obsidian and AuraScribe still finds it on the next write. Two voices with the same display name get a disambiguation suffix on creation (`John Smith (acme).md` — from email domain → org → short voice_id hash). Attendee wikilinks in meeting notes use alias syntax when disambiguated: `[[John Smith (acme)|John Smith]]`.

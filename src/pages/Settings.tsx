@@ -505,7 +505,7 @@ export function Settings({ appStatus, obsidianConfigured }: Props) {
             k="obsidian_vault" label="Vault folder"
             hint="Full path to your Obsidian vault folder. Leave empty to skip writing Markdown files." />
           <p className="text-[11px] text-gray-500 mt-1">
-            Meetings land at <code>&lt;vault&gt;\Meetings\YYYY\YYYY-MM-DD\HH-MM - title.md</code>. People notes live under <code>People\</code> (keyed by voice id in frontmatter, so rename freely in Obsidian). Daily briefs land under <code>Daily\</code>.
+            Meetings land at <code>&lt;vault&gt;\Meetings\YYYY\YYYY-MM-DD\HH-MM - title.md</code>. People notes live under <code>People\</code> (keyed by voice id in frontmatter, so rename freely in Obsidian). Daily briefs land at <code>Daily\YYYY-MM\YYYY-MM-DD.md</code>.
           </p>
         </ConfigSection>
 
