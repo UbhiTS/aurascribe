@@ -120,8 +120,45 @@ _SEEDED_PROMPTS: tuple[str, ...] = (
     "live_intelligence.md",
     "daily_brief.md",
     "meeting_analysis.md",
+    "meeting_bucket.md",
+)
+
+# One-shot cleanup of prompt files we used to ship but no longer support.
+# Live title refinement was folded into live_intelligence.md (one LLM call
+# now returns highlights + entity + topic), so the standalone prompt is
+# dead weight that would otherwise confuse a user editing it expecting
+# it to do something.
+_RETIRED_PROMPTS: tuple[str, ...] = (
     "meeting_title_refinement.md",
 )
+
+# Prompts whose APP_DATA copy gets nuked AND re-seeded from the bundled
+# default on boot — used when we shipped a structural change to the
+# prompt's input/output contract that the user's previous edits could
+# never satisfy. Once the contract stabilises post-GA, this list goes
+# back to empty (and prompt edits become sticky again).
+_FORCE_RESEED_PROMPTS: tuple[str, ...] = (
+    # live_intelligence now also returns `entity` + `topic` in JSON for
+    # the merged title-refinement path. Old user copies don't ask for
+    # those fields so the response would lack them.
+    "live_intelligence.md",
+)
+
+for _name in _RETIRED_PROMPTS:
+    _stale = PROMPTS_DIR / _name
+    if _stale.exists():
+        try:
+            _stale.unlink()
+        except Exception:
+            pass
+
+for _name in _FORCE_RESEED_PROMPTS:
+    _stale = PROMPTS_DIR / _name
+    if _stale.exists():
+        try:
+            _stale.unlink()
+        except Exception:
+            pass
 
 for _name in _SEEDED_PROMPTS:
     _target = PROMPTS_DIR / _name
@@ -186,6 +223,7 @@ _CONFIG_KEYS = {
     "auto_capture_start_speech_sec",
     "auto_capture_stop_silence_sec",
     "auto_capture_vad_threshold",
+    "auto_capture_countdown_after_silence_sec",
 }
 
 # One-shot rename of the old LM-Studio-specific keys to provider-agnostic
@@ -332,12 +370,31 @@ LLM_CONTEXT_TOKENS: int = _cfg_int("llm_context_tokens", 4096)
 # Obsidian vault root. None = integration disabled (transcripts still saved to DB).
 OBSIDIAN_VAULT: Path | None = _expand(_cfg_optional_str("obsidian_vault"))
 
+# Top-level buckets land at the vault root with numeric prefixes so they sort
+# predictably in Obsidian's file tree and don't collide with the user's own
+# folders. Layout contract is captured in memory file
+# `project_vault_structure.md`.
+#
+#   00-Inbox/         staging + low-confidence meetings awaiting triage
+#   10-Customers/     <Customer>/{MOC.md, People/, Projects/, Meetings/, Notes/}
+#   20-Internal/      non-customer Google work (1-1s, team syncs, internal demos)
+#   30-Interviews/    candidate / panel interviews
+#   40-Personal/      misc (support calls, household, anything non-work)
+#   50-Daily/         YYYY/MM/YYYY-MM-DD.md — generated daily briefs
+#   90-Templates/     seeded on first boot
+#   99-Archive/       closed customers get moved here by hand
 if OBSIDIAN_VAULT:
-    VAULT_MEETINGS: Path | None = OBSIDIAN_VAULT / "AuraScribe" / "Meetings"
-    VAULT_PEOPLE: Path | None = OBSIDIAN_VAULT / "AuraScribe" / "People"
-    VAULT_DAILY: Path | None = OBSIDIAN_VAULT / "AuraScribe" / "Daily"
+    VAULT_INBOX: Path | None = OBSIDIAN_VAULT / "00-Inbox"
+    VAULT_CUSTOMERS: Path | None = OBSIDIAN_VAULT / "10-Customers"
+    VAULT_INTERNAL: Path | None = OBSIDIAN_VAULT / "20-Internal"
+    VAULT_INTERVIEWS: Path | None = OBSIDIAN_VAULT / "30-Interviews"
+    VAULT_PERSONAL: Path | None = OBSIDIAN_VAULT / "40-Personal"
+    VAULT_DAILY: Path | None = OBSIDIAN_VAULT / "50-Daily"
+    VAULT_TEMPLATES: Path | None = OBSIDIAN_VAULT / "90-Templates"
+    VAULT_ARCHIVE: Path | None = OBSIDIAN_VAULT / "99-Archive"
 else:
-    VAULT_MEETINGS = VAULT_PEOPLE = VAULT_DAILY = None
+    VAULT_INBOX = VAULT_CUSTOMERS = VAULT_INTERNAL = VAULT_INTERVIEWS = None
+    VAULT_PERSONAL = VAULT_DAILY = VAULT_TEMPLATES = VAULT_ARCHIVE = None
 
 # ── ASR (faster-whisper) — device-adaptive defaults ──────────────────────────
 #
@@ -559,9 +616,16 @@ AUTO_CAPTURE_ENABLED: bool = _cfg_bool("auto_capture_enabled", True)
 AUTO_CAPTURE_START_SPEECH_SEC: float = _cfg_float("auto_capture_start_speech_sec", 1.5)
 # Seconds of sustained silence during an auto-started recording before we
 # auto-fire stop_meeting. Manually-started recordings ignore this — they
-# always run until the user clicks Stop. Default 90s so natural pauses
-# (looking something up, brief interruption) don't end the meeting.
-AUTO_CAPTURE_STOP_SILENCE_SEC: float = _cfg_float("auto_capture_stop_silence_sec", 90.0)
+# always run until the user clicks Stop. Default 30s — short enough that
+# the meeting wraps up promptly when the conversation actually ends, long
+# enough to ride out a normal "let me look that up" pause.
+AUTO_CAPTURE_STOP_SILENCE_SEC: float = _cfg_float("auto_capture_stop_silence_sec", 30.0)
+# Seconds of continuous silence before the Stop button morphs into a
+# live countdown. Gives the user early warning that auto-stop is
+# counting against them — before the warning, the bar stays quiet.
+AUTO_CAPTURE_COUNTDOWN_AFTER_SILENCE_SEC: float = _cfg_float(
+    "auto_capture_countdown_after_silence_sec", 5.0,
+)
 # Silero VAD confidence threshold used by the monitor. Defaults to the
 # shared `vad_threshold` (the same gate the recording pipeline uses); set
 # explicitly to tune listening sensitivity independently — e.g. raise it
@@ -580,13 +644,17 @@ def reload_auto_capture_from_file() -> None:
     feel an immediate effect."""
     global AUTO_CAPTURE_ENABLED, AUTO_CAPTURE_START_SPEECH_SEC
     global AUTO_CAPTURE_STOP_SILENCE_SEC, AUTO_CAPTURE_VAD_THRESHOLD
+    global AUTO_CAPTURE_COUNTDOWN_AFTER_SILENCE_SEC
     fresh = load_user_config()
     _user_config.clear()
     _user_config.update(fresh)
     AUTO_CAPTURE_ENABLED = _cfg_bool("auto_capture_enabled", True)
     AUTO_CAPTURE_START_SPEECH_SEC = _cfg_float("auto_capture_start_speech_sec", 1.5)
-    AUTO_CAPTURE_STOP_SILENCE_SEC = _cfg_float("auto_capture_stop_silence_sec", 90.0)
+    AUTO_CAPTURE_STOP_SILENCE_SEC = _cfg_float("auto_capture_stop_silence_sec", 30.0)
     AUTO_CAPTURE_VAD_THRESHOLD = _cfg_float("auto_capture_vad_threshold", VAD_THRESHOLD)
+    AUTO_CAPTURE_COUNTDOWN_AFTER_SILENCE_SEC = _cfg_float(
+        "auto_capture_countdown_after_silence_sec", 5.0,
+    )
 
 # ── Realtime intelligence (live highlights / action items / talking points) ──
 

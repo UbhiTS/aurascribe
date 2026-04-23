@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Sparkles, Loader, Pencil, CheckSquare, Square, RefreshCw, Lightbulb, Lock, Unlock } from "lucide-react";
-import type { AppStatus, LiveIntel, Meeting, Utterance, Voice } from "../lib/api";
+import type { AppStatus, AutoCaptureState, LiveIntel, Meeting, Utterance, Voice } from "../lib/api";
 import { api } from "../lib/api";
 import { useClockTick } from "../lib/useClockTick";
 import { RecordingBar } from "../components/RecordingBar";
@@ -11,6 +11,7 @@ import { avatarSrcFor, colorForSpeaker } from "../lib/speakerColors";
 
 interface Props {
   appStatus: AppStatus | null;
+  autoCaptureState: AutoCaptureState | null;
   // The live meeting — fully isolated from Meeting Library / Review state.
   meeting: Meeting | null;
   setMeeting: (m: Meeting | null) => void;
@@ -27,7 +28,7 @@ interface Props {
 }
 
 export function LiveFeed({
-  appStatus, meeting, setMeeting, meetingId,
+  appStatus, autoCaptureState, meeting, setMeeting, meetingId,
   liveUtterances, livePartial, liveIntel, intelTick, voices, onVoicesChanged,
   onMeetingStarted, onMeetingStopped, bumpRefreshKey,
 }: Props) {
@@ -106,6 +107,8 @@ export function LiveFeed({
           onStarted={onMeetingStarted}
           onStopped={onMeetingStopped}
           platform={appStatus?.platform}
+          autoCaptureState={autoCaptureState}
+          meetingStartedAt={meeting?.started_at ?? null}
         />
       </div>
 

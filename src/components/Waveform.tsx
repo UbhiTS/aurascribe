@@ -94,6 +94,9 @@ export function Waveform() {
   // Keep the waveform rendering if we have sidecar levels even when the
   // browser mic errored; the history gets populated from the sidecar feed.
   if (error && !sidecarActive) return null;
-  // Fixed width: 3× VuMeter (16 bars × 4px + 15 × 1px gap = 79px → 237px).
-  return <canvas ref={canvasRef} className="w-[237px] h-8 flex-shrink-0" />;
+  // Stretch to absorb whatever horizontal slack the row has — when the
+  // source controls fit on the same line, the waveform fills the gap;
+  // when they wrap to a new line, it grows to fill the freed-up width.
+  // The min-width keeps it readable before triggering a wrap.
+  return <canvas ref={canvasRef} className="flex-1 min-w-[120px] h-8" />;
 }

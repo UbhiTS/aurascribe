@@ -25,10 +25,10 @@ router = APIRouter(prefix="/api/intel")
 # Friendly display names for the prompt files we know about. Anything else in
 # PROMPTS_DIR is shown with its raw filename so the user can still find it.
 _PROMPT_LABELS = {
-    "live_intelligence.md": "Live Intelligence",
+    "live_intelligence.md": "Live Intelligence (highlights + live title)",
     "daily_brief.md": "Daily Brief",
     "meeting_analysis.md": "Meeting Analysis (title + summary)",
-    "meeting_title_refinement.md": "Live Title Refinement",
+    "meeting_bucket.md": "Meeting Bucket Classifier",
 }
 
 

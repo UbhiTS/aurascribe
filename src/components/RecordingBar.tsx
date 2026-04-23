@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
-import { Mic, MicOff, Square, Clock, ExternalLink, X, Volume2 } from "lucide-react";
+import { Mic, MicOff, Square, Clock, ExternalLink, X, Volume2, Hourglass } from "lucide-react";
 import { api, ApiError } from "../lib/api";
+import type { AutoCaptureState } from "../lib/api";
 import { MicAudioProvider } from "../lib/MicAudioContext";
 import { VuMeter } from "./VuMeter";
 import { Waveform } from "./Waveform";
@@ -24,6 +25,15 @@ interface Props {
   // sys.platform from the sidecar — "win32", "darwin", or "linux".
   // Drives OS-specific labels (e.g. mic permission settings button).
   platform?: string;
+  // Drives the "auto-stop in Xs" countdown. Only present when the
+  // active meeting was started by the auto-capture monitor — manual
+  // recordings never auto-stop, so the chip stays hidden.
+  autoCaptureState?: AutoCaptureState | null;
+  // ISO timestamp of when the active meeting started. Used to derive
+  // the elapsed-time chip so the timer survives tab navigation — the
+  // component state resets on unmount, but started_at lives upstream
+  // on the liveMeeting object in App.
+  meetingStartedAt?: string | null;
 }
 
 // localStorage keys. Device selection is stored by device *name* (not
@@ -40,7 +50,8 @@ function readMode(): SourceMode {
 }
 
 export function RecordingBar({
-  isRecording, devices, outputDevices, onStarted, onStopped, platform,
+  isRecording, devices, outputDevices, onStarted, onStopped, platform, autoCaptureState,
+  meetingStartedAt,
 }: Props) {
   const [mode, setMode] = useState<SourceMode>(() => readMode());
   const [deviceIndex, setDeviceIndex] = useState<number | undefined>(undefined);
@@ -101,25 +112,33 @@ export function RecordingBar({
     else window.localStorage.removeItem(LS_SPEAKER_NAME);
   };
 
-  const startTimer = () => {
-    if (timerRef.current) clearInterval(timerRef.current);
-    timerRef.current = setInterval(() => setElapsed((e) => e + 1), 1000);
-  };
-
-  const stopTimer = () => {
-    if (timerRef.current) {
-      clearInterval(timerRef.current);
-      timerRef.current = null;
+  // Drive the timer from `meetingStartedAt` when available so it
+  // survives navigating away and back to Live Feed — RecordingBar
+  // unmounts on tab switch, but the started_at timestamp lives
+  // upstream on App's liveMeeting. When it's not yet available (first
+  // few frames after a click, before api.meetings.get resolves), tick
+  // from 0 so the display isn't frozen.
+  useEffect(() => {
+    if (!isRecording) {
+      if (timerRef.current) {
+        clearInterval(timerRef.current);
+        timerRef.current = null;
+      }
+      setElapsed(0);
+      return;
     }
-    setElapsed(0);
-  };
-
-  // Guarantee the interval is cleared if the component unmounts mid-recording
-  // (e.g. user navigates away). Without this, the setInterval would keep
-  // firing setElapsed against an unmounted component.
-  useEffect(() => () => {
-    if (timerRef.current) clearInterval(timerRef.current);
-  }, []);
+    const parsed = meetingStartedAt ? Date.parse(meetingStartedAt) : NaN;
+    const anchor = Number.isFinite(parsed) ? parsed : Date.now();
+    const recompute = () => setElapsed(Math.max(0, Math.floor((Date.now() - anchor) / 1000)));
+    recompute();
+    timerRef.current = setInterval(recompute, 1000);
+    return () => {
+      if (timerRef.current) {
+        clearInterval(timerRef.current);
+        timerRef.current = null;
+      }
+    };
+  }, [isRecording, meetingStartedAt]);
 
   // Pre-recording monitor. When idle + mode is anything other than
   // "mic" (where browser getUserMedia already drives the visualizers),
@@ -180,7 +199,6 @@ export function RecordingBar({
         captureMic,
       });
       onStarted(res.meeting_id);
-      startTimer();
     } catch (e) {
       // 403 from the sidecar carries structured {message, kind} detail —
       // "permission" means we know Windows is blocking us and can offer
@@ -218,7 +236,6 @@ export function RecordingBar({
     setLoading(true);
     try {
       await api.meetings.stop(false);
-      stopTimer();
       onStopped();
     } finally {
       setLoading(false);
@@ -230,6 +247,23 @@ export function RecordingBar({
     const sec = (s % 60).toString().padStart(2, "0");
     return `${m}:${sec}`;
   };
+
+  // Auto-stop countdown. Only fires when the auto-capture monitor is
+  // silence-counting against an auto-started recording (the backend
+  // zeros silent_seconds for manual starts, so this naturally stays
+  // null there). Gated by `countdown_after_silence_sec` so the Stop
+  // button stays quiet during normal short pauses — once silence
+  // exceeds the gate, the button morphs into a live countdown.
+  const autoStopRemaining: number | null = (() => {
+    if (!isRecording || !autoCaptureState) return null;
+    if (autoCaptureState.state !== "recording") return null;
+    const silent = autoCaptureState.silent_seconds ?? 0;
+    const threshold = autoCaptureState.stop_silence_seconds ?? 0;
+    const gate = autoCaptureState.countdown_after_silence_sec ?? 5;
+    if (silent < gate || threshold <= 0) return null;
+    return Math.max(0, Math.ceil(threshold - silent));
+  })();
+  const autoStopUrgent = autoStopRemaining !== null && autoStopRemaining <= 10;
 
   return (
     <MicAudioProvider deviceName={selectedDeviceName}>
@@ -327,11 +361,27 @@ export function RecordingBar({
           <button
             onClick={handleStop}
             disabled={loading}
-            className="flex items-center gap-2 px-3 py-1.5 bg-red-600 hover:bg-red-700 disabled:opacity-50 text-white text-sm rounded-lg transition-colors flex-shrink-0"
+            title={autoStopRemaining !== null
+              ? `Auto-stop in ${autoStopRemaining}s unless someone speaks. Click to stop now.`
+              : undefined}
+            className={`flex items-center gap-2 px-3 py-1.5 disabled:opacity-50 text-white text-sm rounded-lg transition-colors flex-shrink-0 ${
+              autoStopUrgent
+                ? "bg-amber-600 hover:bg-amber-700 animate-pulse"
+                : "bg-red-600 hover:bg-red-700"
+            }`}
           >
-            <Square size={14} />
-            <span className="hidden sm:inline">Stop Recording</span>
-            <span className="sm:hidden">Stop</span>
+            {autoStopRemaining !== null ? <Hourglass size={14} /> : <Square size={14} />}
+            {autoStopRemaining !== null ? (
+              <>
+                <span className="hidden sm:inline font-mono">Stop in {fmt(autoStopRemaining)}</span>
+                <span className="sm:hidden font-mono">{fmt(autoStopRemaining)}</span>
+              </>
+            ) : (
+              <>
+                <span className="hidden sm:inline">Stop Recording</span>
+                <span className="sm:hidden">Stop</span>
+              </>
+            )}
           </button>
         ) : (
           <button

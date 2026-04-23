@@ -30,6 +30,7 @@ from aurascribe.config import (
     SPECULATIVE_INTERVAL_SEC,
     SPECULATIVE_WINDOW_SEC,
 )
+from aurascribe.llm.bucket_inference import infer_bucket
 from aurascribe.llm.client import chat
 from aurascribe.llm.prompts import (
     MEETING_SUMMARY_SYSTEM,
@@ -38,8 +39,12 @@ from aurascribe.llm.prompts import (
     people_notes_prompt,
 )
 from aurascribe.llm.realtime import RealtimeIntelligence
-from aurascribe.llm.title_refinement import TitleRefinement
 from aurascribe.obsidian.writer import (
+    BUCKET_CUSTOMER,
+    BUCKET_INBOX,
+    BUCKET_INTERNAL,
+    bootstrap_customer,
+    find_person_path,
     forget_meeting_throttle,
     note_chunk_arrived,
     time_since_write,
@@ -154,12 +159,10 @@ class MeetingManager:
         self._provisional_next_n: dict[str, int] = {}
         # Real-time intelligence loop. The api layer wires its broadcast
         # callback in via `intel.set_broadcast(...)` during lifespan setup.
+        # Live title refinement (entity + topic) is now part of the same
+        # call — RealtimeIntelligence emits `title_updated` WS events when
+        # title_locked == 0, no separate refiner instance needed.
         self.intel = RealtimeIntelligence()
-        # Live meeting-title refinement. Runs on the same debounce cadence
-        # as `intel` so LLM activity is batched rather than scattered.
-        # Broadcast is set via `title_refiner.set_broadcast(...)` in the
-        # same lifespan block so it can fire `title_updated` WS events.
-        self.title_refiner = TitleRefinement()
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -194,7 +197,10 @@ class MeetingManager:
             raise RuntimeError("Models still loading — try again in a moment")
 
         if not title:
-            title = f"Transcription {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+            # Placeholder — replaced by live-intelligence refinement once
+            # there's a transcript. The filename gets its own timestamp
+            # via meeting_file_path, so no date needed here.
+            title = "Untitled recording"
 
         meeting_id = str(uuid.uuid4())
         async with aiosqlite.connect(DB_PATH) as db:
@@ -250,7 +256,6 @@ class MeetingManager:
             log.warning("Opus recording unavailable for %s: %s", meeting_id, e)
 
         await self.intel.prepare_meeting(meeting_id)
-        await self.title_refiner.prepare_meeting(meeting_id)
         # Seed the partial anchor to the current capture wall-clock so the
         # first partial only covers audio captured FROM THIS POINT ON —
         # monitor-mode audio that preceded the Start button shouldn't bleed
@@ -291,7 +296,6 @@ class MeetingManager:
         self._provisional_pools.pop(meeting_id, None)
         self._provisional_next_n.pop(meeting_id, None)
         await self.intel.flush_and_clear(meeting_id)
-        await self.title_refiner.flush_and_clear(meeting_id)
         # Drop throttle counters — finalize will do the last write itself.
         forget_meeting_throttle(meeting_id)
 
@@ -314,12 +318,6 @@ class MeetingManager:
         assert row is not None
         _initial_title, started_at_str = row
         started_at = datetime.fromisoformat(started_at_str)
-        # Track the filename we last wrote to so we can clean it up on rename.
-        # The rename endpoint deletes the old file, but a chunk write racing
-        # with the rename can recreate it; sweeping on next write keeps the
-        # vault tidy.
-        prev_title: str | None = None
-
         all_utterances: list[Utterance] = []
 
         async for audio_chunk in self.capture.stream_speech_chunks():
@@ -360,12 +358,9 @@ class MeetingManager:
                         await cb(meeting_id, utterances)
                     # Realtime intelligence runs on a debounced timer — this
                     # call only schedules; it doesn't block the record loop.
+                    # The same call also handles live title refinement
+                    # (entity + topic in the JSON), gated on title_locked.
                     await self.intel.note_utterances(meeting_id, utterances)
-                    # Fire-and-forget title refinement — same debounce
-                    # window as intel, but a cheaper LLM call (only
-                    # {entity, topic} returned). The module no-ops if
-                    # title_locked is 1.
-                    await self.title_refiner.note_utterances(meeting_id, utterances)
 
                     # Throttled vault write: skip unless we've hit either
                     # gate. The intel loop's writes also reset these counters
@@ -381,16 +376,16 @@ class MeetingManager:
                         try:
                             # Re-fetch the title on every write — user can
                             # rename mid-recording and we must write to the
-                            # new filename (otherwise every chunk recreates
-                            # the old one).
+                            # new filename. write_meeting reads the prior
+                            # `vault_path` from the DB and unlinks it if
+                            # the path changes (rename, or bucket reclassify),
+                            # so no separate cleanup step is needed here.
                             async with aiosqlite.connect(DB_PATH) as db:
                                 cursor = await db.execute(
                                     "SELECT title FROM meetings WHERE id = ?", (meeting_id,)
                                 )
                                 title_row = await cursor.fetchone()
                             current_title = title_row[0] if title_row else _initial_title
-                            if prev_title and prev_title != current_title:
-                                self._cleanup_vault_file(started_at, prev_title)
                             await write_meeting(
                                 meeting_id=meeting_id,
                                 title=current_title,
@@ -399,30 +394,11 @@ class MeetingManager:
                                 summary="",
                                 action_items=[],
                             )
-                            prev_title = current_title
                         except Exception as e:
                             log.warning(f"Live Obsidian write failed: {e}")
             except Exception as e:
                 log.error(f"Transcription error: {e}", exc_info=True)
                 await self._emit_status("error", {"message": str(e), "meeting_id": meeting_id})
-
-    @staticmethod
-    def _cleanup_vault_file(started_at: datetime, title: str) -> None:
-        """Delete the vault file named after `(started_at, title)`, if any.
-
-        Called when a mid-recording rename leaves a stale file behind. Safe
-        even if the file doesn't exist. Uses the shared path helper so it
-        agrees with the writer on where a given meeting lives.
-        """
-        from aurascribe.obsidian.writer import meeting_file_path
-
-        path = meeting_file_path(started_at, title)
-        if path is None or not path.exists():
-            return
-        try:
-            path.unlink()
-        except Exception as e:
-            log.warning("Could not delete stale vault file %s: %s", path, e)
 
     async def _speculative_loop(self, meeting_id: str) -> None:
         """Periodically re-transcribe everything since the last committed
@@ -599,13 +575,51 @@ class MeetingManager:
             return {"meeting_id": meeting_id, "error": "No speech detected"}
 
         async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
             cursor = await db.execute(
-                "SELECT title, started_at FROM meetings WHERE id = ?", (meeting_id,)
+                "SELECT title, started_at, vault_bucket, vault_customer "
+                "FROM meetings WHERE id = ?",
+                (meeting_id,),
             )
             row = await cursor.fetchone()
             assert row is not None
-            title, started_at_str = row
-        started_at = datetime.fromisoformat(started_at_str)
+            title = row["title"]
+            started_at = datetime.fromisoformat(row["started_at"])
+            bucket = row["vault_bucket"]
+            customer = row["vault_customer"]
+
+        # Bucket inference — only when the meeting hasn't already been
+        # classified (manually via UI or by an earlier finalize). Speaker
+        # lookup is free; LLM fallback runs only when speakers can't
+        # disambiguate. A failure path lands in inbox at low confidence.
+        if not bucket or bucket == BUCKET_INBOX:
+            inferred = await infer_bucket(utterances)
+            log.info(
+                "Bucket inference for %s: %s/%s via %s (conf=%.2f) — %s",
+                meeting_id,
+                inferred.bucket,
+                inferred.customer,
+                inferred.source,
+                inferred.confidence,
+                inferred.reasoning,
+            )
+            bucket = inferred.bucket
+            customer = inferred.customer
+            async with aiosqlite.connect(DB_PATH) as db:
+                await db.execute(
+                    "UPDATE meetings SET vault_bucket = ?, vault_customer = ? WHERE id = ?",
+                    (bucket, customer, meeting_id),
+                )
+                await db.commit()
+
+        # If we landed on a customer, ensure the per-customer folder
+        # skeleton exists before the writer tries to create files inside
+        # it. Idempotent — existing customers reuse their folder.
+        if bucket == BUCKET_CUSTOMER and customer:
+            try:
+                await bootstrap_customer(customer)
+            except Exception as e:
+                log.warning("Customer bootstrap failed for %s: %s", customer, e)
 
         summary_md = ""
         action_items: list[str] = []
@@ -637,17 +651,34 @@ class MeetingManager:
                     action_items=action_items,
                 )
 
-                speakers = list({
-                    u.speaker for u in utterances
-                    if u.speaker != "Me"
-                    and u.speaker != "Unknown"
-                    and not _PROVISIONAL_LABEL_RE.match(u.speaker)
-                })
-                for speaker in speakers:
-                    speaker_lines = "\n".join(u.text for u in utterances if u.speaker == speaker)
-                    existing = await self._get_existing_person_note(speaker)
-                    updated = await chat(people_notes_prompt(speaker, existing, speaker_lines))
-                    await update_person_note(speaker, updated, title, started_at)
+                # Auto-person-notes only for already-classified meetings.
+                # Inbox = unclassified → don't write anywhere yet, the
+                # bucket-inference pass (run after stop) will classify
+                # and a subsequent recompute will produce notes in the
+                # right home.
+                if bucket in (BUCKET_CUSTOMER, BUCKET_INTERNAL):
+                    speakers = list({
+                        u.speaker for u in utterances
+                        if u.speaker != "Me"
+                        and u.speaker != "Unknown"
+                        and not _PROVISIONAL_LABEL_RE.match(u.speaker)
+                    })
+                    for speaker in speakers:
+                        speaker_lines = "\n".join(
+                            u.text for u in utterances if u.speaker == speaker
+                        )
+                        existing = await self._get_existing_person_note(speaker)
+                        updated = await chat(
+                            people_notes_prompt(speaker, existing, speaker_lines)
+                        )
+                        await update_person_note(
+                            speaker,
+                            updated,
+                            title,
+                            started_at,
+                            bucket=bucket,
+                            customer=customer,
+                        )
             except Exception as e:
                 log.warning(f"LLM unavailable — transcript saved without summary: {e}")
         else:
@@ -689,12 +720,11 @@ class MeetingManager:
         return utterances
 
     async def _get_existing_person_note(self, name: str) -> str:
-        from aurascribe.config import VAULT_PEOPLE
-
-        if VAULT_PEOPLE is None:
-            return ""
-        path = VAULT_PEOPLE / f"{name}.md"
-        if not path.exists():
+        """Return the existing People/<Name>.md content, regardless of which
+        customer folder (or 20-Internal) it lives under. Empty string if
+        the vault isn't configured or the person hasn't been written yet."""
+        path = find_person_path(name)
+        if path is None:
             return ""
         import aiofiles
 

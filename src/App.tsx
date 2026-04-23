@@ -267,6 +267,12 @@ export default function App() {
         state: msg.state,
         confidence: typeof msg.confidence === "number" ? msg.confidence : 0,
         silent_seconds: typeof msg.silent_seconds === "number" ? msg.silent_seconds : 0,
+        stop_silence_seconds: typeof msg.stop_silence_seconds === "number"
+          ? msg.stop_silence_seconds
+          : undefined,
+        countdown_after_silence_sec: typeof msg.countdown_after_silence_sec === "number"
+          ? msg.countdown_after_silence_sec
+          : undefined,
       });
     }
     if (msg.type === "title_updated" && msg.meeting_id === liveMeetingIdRef.current) {
@@ -329,6 +335,7 @@ export default function App() {
         {page === "live" && (
           <LiveFeed
             appStatus={appStatus}
+            autoCaptureState={autoCaptureState}
             meeting={liveMeeting}
             setMeeting={setLiveMeeting}
             meetingId={liveMeetingId}

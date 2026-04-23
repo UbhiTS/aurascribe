@@ -116,8 +116,9 @@ _CONFIG_FIELDS: list[tuple[str, object]] = [
     # Auto-capture (sustained-speech auto-start/stop)
     ("auto_capture_enabled",           True),
     ("auto_capture_start_speech_sec",  1.5),
-    ("auto_capture_stop_silence_sec",  90.0),
+    ("auto_capture_stop_silence_sec",  30.0),
     ("auto_capture_vad_threshold",     0.5),
+    ("auto_capture_countdown_after_silence_sec", 5.0),
 ]
 
 
@@ -158,6 +159,8 @@ def _effective_for(key: str) -> object:
         "auto_capture_start_speech_sec":  config.AUTO_CAPTURE_START_SPEECH_SEC,
         "auto_capture_stop_silence_sec":  config.AUTO_CAPTURE_STOP_SILENCE_SEC,
         "auto_capture_vad_threshold":     config.AUTO_CAPTURE_VAD_THRESHOLD,
+        "auto_capture_countdown_after_silence_sec":
+                                          config.AUTO_CAPTURE_COUNTDOWN_AFTER_SILENCE_SEC,
     }
     return readers[key]
 
@@ -198,6 +201,7 @@ class UserConfigUpdate(BaseModel):
     auto_capture_start_speech_sec: float | None = None
     auto_capture_stop_silence_sec: float | None = None
     auto_capture_vad_threshold: float | None = None
+    auto_capture_countdown_after_silence_sec: float | None = None
 
 
 def _config_response() -> dict:
@@ -227,6 +231,7 @@ _HOT_RELOAD_KEYS = {
     "auto_capture_start_speech_sec",
     "auto_capture_stop_silence_sec",
     "auto_capture_vad_threshold",
+    "auto_capture_countdown_after_silence_sec",
 }
 
 

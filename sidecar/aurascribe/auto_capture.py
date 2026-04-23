@@ -232,10 +232,19 @@ class AutoCaptureMonitor:
             return
         if self._transitioning:
             return
+        prev_silent = self._silent_blocks
         if rms < _STOP_RMS_THRESHOLD:
             self._silent_blocks += 1
         else:
             self._silent_blocks = 0
+        # Throttle the broadcast to ~5 Hz so the countdown ticks smoothly
+        # without flooding WS — but always publish on the silent→speech
+        # edge so the UI hides the countdown the moment someone speaks.
+        now = time.time()
+        speech_resumed = prev_silent > 0 and self._silent_blocks == 0
+        if speech_resumed or (now - self._last_ui_broadcast) > (1.0 / _UI_BROADCAST_HZ):
+            self._last_ui_broadcast = now
+            await self._publish_state()
         if self._silence_block_threshold and self._silent_blocks >= self._silence_block_threshold:
             await self._fire_stop()
 
@@ -425,7 +434,10 @@ class AutoCaptureMonitor:
                 # Mark BEFORE awaiting start_meeting so the status callback
                 # that fires on "recording" sees it as auto-started.
                 self._auto_started_current = True
-            title = f"Auto-captured {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+            # Placeholder title. The live-intelligence refinement loop
+            # replaces this within seconds once there's a transcript; the
+            # filename keeps its own timestamp via meeting_file_path.
+            title = "Auto-captured"
             try:
                 await self._manager.start_meeting(title=title)
             except Exception as e:
@@ -461,6 +473,15 @@ class AutoCaptureMonitor:
                 round(self._silent_blocks * _BLOCK_SECS, 1)
                 if self._state == "recording" and self._auto_started_current
                 else 0.0
+            ),
+            # The deadline. Lets the UI render a "auto-stop in Xs"
+            # countdown without a separate /api/settings round-trip.
+            "stop_silence_seconds": float(config.AUTO_CAPTURE_STOP_SILENCE_SEC),
+            # Silence-duration gate before the UI morphs the Stop button
+            # into a live countdown — keeps the bar quiet during normal
+            # short pauses, warns on sustained silence.
+            "countdown_after_silence_sec": float(
+                config.AUTO_CAPTURE_COUNTDOWN_AFTER_SILENCE_SEC,
             ),
         }
         try:

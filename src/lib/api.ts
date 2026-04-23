@@ -208,6 +208,13 @@ export interface AutoCaptureState {
   // recording. Reaches `auto_capture_stop_silence_sec` → auto-stop fires.
   // Zero for manually-started meetings (they never auto-stop).
   silent_seconds?: number;
+  // The deadline silent_seconds is racing toward — mirrors
+  // `auto_capture_stop_silence_sec`. Lets the UI render a countdown
+  // without a separate settings round-trip.
+  stop_silence_seconds?: number;
+  // Silence-duration threshold before the UI surfaces the countdown
+  // on the Stop button. Mirrors `auto_capture_countdown_after_silence_sec`.
+  countdown_after_silence_sec?: number;
 }
 
 export interface DailyBriefDecision {
@@ -284,7 +291,8 @@ export type ConfigKey =
   | "auto_capture_enabled"
   | "auto_capture_start_speech_sec"
   | "auto_capture_stop_silence_sec"
-  | "auto_capture_vad_threshold";
+  | "auto_capture_vad_threshold"
+  | "auto_capture_countdown_after_silence_sec";
 
 export interface ConfigFieldState {
   // What the running process is actually using. Frozen at sidecar import

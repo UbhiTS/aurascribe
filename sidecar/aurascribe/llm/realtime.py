@@ -45,6 +45,16 @@ from aurascribe.transcription import Utterance
 log = logging.getLogger("aurascribe.realtime")
 
 PROMPT_FILENAME = "live_intelligence.md"
+
+# Filesystem-unsafe characters scrubbed from entity/topic before they
+# become part of a vault filename. Kept in lockstep with the writer's
+# rules so the title we suggest can actually land on disk verbatim.
+_FILENAME_UNSAFE = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+
+# Generic entities the model sometimes emits when it can't identify a
+# real one. Dropped server-side so we compose `{ts} - {topic}` without
+# redundant `Meeting - ` noise.
+_GENERIC_ENTITIES = {"meeting", "call", "sync", "discussion", "n/a", "none", "unknown"}
 # Live edit target — the user-editable copy in APP_DATA/prompts. Seeded
 # from the bundled package default at startup; edits stick.
 _USER_PROMPT = PROMPTS_DIR / PROMPT_FILENAME
@@ -263,11 +273,21 @@ class RealtimeIntelligence:
                 log.warning("Realtime intel run failed: %s", e, exc_info=True)
 
     async def _run_locked(self, meeting_id: str, state: _MeetingState) -> None:
-        # Pull recent transcript window from the DB. The manager has already
-        # written it before invoking us, so this is the source of truth and
-        # also the easy way to handle utterances that arrived between calls.
+        # Pull title state + recent transcript window from the DB in one trip.
+        # `title_locked` controls whether we apply the LLM's suggested title;
+        # `started_at` is what the title-stitcher uses for the date prefix.
         async with aiosqlite.connect(DB_PATH) as db:
             db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                "SELECT title, title_locked, started_at "
+                "FROM meetings WHERE id = ?",
+                (meeting_id,),
+            )
+            meeting_row = await cursor.fetchone()
+            current_title = (meeting_row["title"] if meeting_row else "") or ""
+            title_locked = bool(meeting_row["title_locked"]) if meeting_row else True
+            started_at_raw = meeting_row["started_at"] if meeting_row else None
+
             cursor = await db.execute(
                 "SELECT MAX(end_time) AS max_e FROM utterances WHERE meeting_id = ?",
                 (meeting_id,),
@@ -286,12 +306,20 @@ class RealtimeIntelligence:
             return
         recent = "\n".join(f"[{_fmt_t(r['start_time'])}] {r['speaker']}: {r['text']}" for r in rows)
 
+        try:
+            started_at = (
+                datetime.fromisoformat(started_at_raw) if started_at_raw else None
+            )
+        except Exception:
+            started_at = None
+
         prompt = self._render_prompt(
             self_speaker=MY_SPEAKER_LABEL,
             existing_highlights=state.highlights,
             existing_action_items_self=state.action_items_self,
             existing_action_items_others=state.action_items_others,
             recent_transcript=recent,
+            current_title=current_title,
         )
 
         log.info("realtime intel: %d utterances in window, calling LLM", len(rows))
@@ -308,6 +336,17 @@ class RealtimeIntelligence:
         new_self = _coerce_str_list(parsed.get("new_action_items_self"))
         new_others = _coerce_other_list(parsed.get("new_action_items_others"))
         support = _coerce_str(parsed.get("support_intelligence"))
+
+        # Title slot piggybacks on the same call. Skipped silently when the
+        # user has frozen the title (lock=1 → user owns it).
+        if not title_locked:
+            await self._maybe_update_title(
+                meeting_id=meeting_id,
+                started_at=started_at,
+                current_title=current_title,
+                entity_raw=parsed.get("entity"),
+                topic_raw=parsed.get("topic"),
+            )
 
         added_highlights, added_self, added_others = self._merge(
             state, new_highlights, new_self, new_others
@@ -347,6 +386,7 @@ class RealtimeIntelligence:
         existing_action_items_self: list[str],
         existing_action_items_others: list[dict],
         recent_transcript: str,
+        current_title: str,
     ) -> str:
         prompt_path = _ensure_prompt_file()
         try:
@@ -372,7 +412,63 @@ class RealtimeIntelligence:
             .replace("{existing_action_items_self}", fmt_list(existing_action_items_self))
             .replace("{existing_action_items_others}", fmt_list(existing_action_items_others))
             .replace("{recent_transcript}", recent_transcript)
+            .replace("{current_title}", current_title or "(unset)")
         )
+
+    async def _maybe_update_title(
+        self,
+        *,
+        meeting_id: str,
+        started_at: datetime | None,
+        current_title: str,
+        entity_raw: object,
+        topic_raw: object,
+    ) -> None:
+        """Apply the LLM's suggested entity+topic as a new meeting title.
+
+        Pre-conditions checked by caller (`title_locked == 0`); we still
+        re-read the lock RIGHT before the UPDATE in case the user hit
+        freeze while the LLM call was in flight. Silently no-ops when
+        the suggestion is empty, generic, or identical to what we'd
+        already proposed.
+
+        Broadcasts `title_updated` on success so the UI updates without
+        polling. The new vault filename is picked up by the writer's
+        next chunk-driven write — old file is unlinked there too.
+        """
+        entity = _clean_entity(entity_raw)
+        topic = _clean_topic(topic_raw)
+        if not topic:
+            return  # no usable topic → nothing to compose
+        new_title = _compose_title(started_at, entity, topic)
+        if not new_title or new_title == current_title:
+            return
+
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                "SELECT title_locked FROM meetings WHERE id = ?",
+                (meeting_id,),
+            )
+            row = await cursor.fetchone()
+            if not row or bool(row["title_locked"]):
+                return  # raced with user hitting freeze; bail
+            await db.execute(
+                "UPDATE meetings SET title = ? WHERE id = ?",
+                (new_title, meeting_id),
+            )
+            await db.commit()
+
+        if self._broadcast is not None:
+            try:
+                await self._broadcast({
+                    "type": "title_updated",
+                    "meeting_id": meeting_id,
+                    "title": new_title,
+                    "source": "live_refinement",
+                })
+            except Exception:
+                pass  # broadcast failure isn't fatal; DB write already landed
 
     def _merge(
         self,
@@ -536,3 +632,57 @@ def _coerce_str(v) -> str:
     if isinstance(v, list):
         return "\n".join(f"- {s}" for s in v if isinstance(s, str) and s.strip())
     return ""
+
+
+# ── Title helpers (formerly in llm/title_refinement.py) ──────────────────────
+
+
+def _clean_entity(raw: object) -> str | None:
+    """Normalise a raw entity string into something safe for a title.
+
+    Strips quotes, trailing punctuation, filesystem-unsafe characters,
+    and rejects generic placeholders so the composer can fall back to
+    `{ts} - {topic}` instead of emitting `… - Meeting - …` noise.
+    """
+    if not isinstance(raw, str):
+        return None
+    s = raw.strip().strip('"').strip("'").rstrip(".").strip()
+    if not s:
+        return None
+    if len(s) > 40:
+        s = s[:40].rstrip()
+    s = _FILENAME_UNSAFE.sub(" ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    if not s:
+        return None
+    if s.lower() in _GENERIC_ENTITIES:
+        return None
+    return s
+
+
+def _clean_topic(raw: object) -> str | None:
+    if not isinstance(raw, str):
+        return None
+    s = raw.strip().strip('"').strip("'").rstrip(".").strip()
+    if not s or len(s) > 100:
+        return None
+    s = _FILENAME_UNSAFE.sub(" ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s or None
+
+
+def _compose_title(
+    started_at: datetime | None,
+    entity: str | None,
+    topic: str,
+) -> str:
+    """Stitch `{entity} - {topic}` (or just `{topic}`) from the parts.
+
+    The `started_at` arg is retained for signature compatibility with
+    the post-meeting path in llm/analysis.py but is unused — the
+    timestamp is prepended to the *filename* only (see
+    `obsidian.writer.meeting_file_path`), not the user-visible title.
+    """
+    del started_at  # unused; filename gets its own timestamp
+    parts = [p for p in (entity, topic) if p]
+    return " - ".join(parts)

@@ -1,7 +1,33 @@
 """Writes meetings, people notes, and daily briefs into the Obsidian vault.
 
-If `OBSIDIAN_VAULT` is not configured, the writer returns None and the rest of
-the app continues — transcripts still land in SQLite.
+Layout contract (customer-isolated) — see `project_vault_structure.md`
+in memory for the authoritative spec:
+
+  00-Inbox/YYYY/MM/                       unclassified (recording / low-conf)
+  10-Customers/<Customer>/
+      <Customer>.md                       MOC (seeded on first meeting)
+      People/<Name>.md
+      Projects/<Project>.md
+      Meetings/YYYY/MM/<filename>.md
+      Notes/{Architecture,Stakeholders,Open-Risks,Commercials,Notes}.md
+  20-Internal/
+      People/<Name>.md
+      Meetings/YYYY/MM/<filename>.md
+      Notes/
+  30-Interviews/YYYY/MM/<filename>.md
+  40-Personal/YYYY/MM/<filename>.md
+  50-Daily/YYYY/MM/YYYY-MM-DD.md
+  90-Templates/ (seeded on boot — not written by this module at runtime)
+  99-Archive/   (user moves closed customers here by hand)
+
+Every meeting row carries `vault_bucket` + `vault_customer` in the DB.
+Writer fetches them fresh on every call so a mid-recording reclassify
+(auto-inference OR user override) moves the file to its new home on
+the next write — no separate plumbing needed.
+
+If `OBSIDIAN_VAULT` isn't configured, every writer function returns
+None and the rest of the app carries on — transcripts still land in
+SQLite.
 """
 from __future__ import annotations
 
@@ -15,11 +41,33 @@ from pathlib import Path
 import aiofiles
 import aiosqlite
 
-from aurascribe.config import DB_PATH, VAULT_DAILY, VAULT_MEETINGS, VAULT_PEOPLE
+from aurascribe.config import (
+    DB_PATH,
+    OBSIDIAN_VAULT,
+    VAULT_CUSTOMERS,
+    VAULT_DAILY,
+    VAULT_INBOX,
+    VAULT_INTERNAL,
+    VAULT_INTERVIEWS,
+    VAULT_PERSONAL,
+    VAULT_TEMPLATES,
+)
 from aurascribe.llm.prompts import format_transcript
 from aurascribe.transcription import Utterance
 
 log = logging.getLogger("aurascribe.obsidian")
+
+# ── Bucket enum ─────────────────────────────────────────────────────────────
+
+BUCKET_INBOX = "inbox"
+BUCKET_CUSTOMER = "customer"
+BUCKET_INTERNAL = "internal"
+BUCKET_INTERVIEW = "interview"
+BUCKET_PERSONAL = "personal"
+
+VALID_BUCKETS = frozenset(
+    {BUCKET_INBOX, BUCKET_CUSTOMER, BUCKET_INTERNAL, BUCKET_INTERVIEW, BUCKET_PERSONAL}
+)
 
 # ── Per-meeting write throttle ──────────────────────────────────────────────
 #
@@ -62,34 +110,84 @@ def _note_write(meeting_id: str) -> None:
     _chunks_since_write[meeting_id] = 0
 
 
+# ── Filename sanitization ───────────────────────────────────────────────────
+
+_ILLEGAL_FILENAME_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+
+
+def _safe_filename_part(s: str) -> str:
+    cleaned = _ILLEGAL_FILENAME_CHARS.sub("-", s).strip().rstrip(".")
+    cleaned = re.sub(r"\s+", " ", cleaned)
+    return cleaned or "untitled"
+
+
 def _slug(text: str) -> str:
     text = re.sub(r"[^\w\s-]", "", text)
     text = re.sub(r"[\s_-]+", "-", text)
     return text.strip("-").lower()
 
 
-# Characters forbidden in Windows filenames (plus control chars). Stripped
-# from titles before they land on disk so defaults like
-# `"Transcription 2026-04-18 14:30"` (which contains a colon) don't silently
-# create NTFS alternate-data-stream oddities.
-_ILLEGAL_FILENAME_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+# ── Path resolution ─────────────────────────────────────────────────────────
 
 
-def _safe_filename_part(s: str) -> str:
-    cleaned = _ILLEGAL_FILENAME_CHARS.sub("-", s).strip().rstrip(".")
-    # Collapse runs of dashes/whitespace that the substitution can leave.
-    cleaned = re.sub(r"\s+", " ", cleaned)
-    return cleaned or "untitled"
+def _normalize_bucket(bucket: str | None) -> str:
+    """Coerce a DB-loaded bucket value to one of VALID_BUCKETS; unknown → inbox."""
+    if bucket in VALID_BUCKETS:
+        return bucket  # type: ignore[return-value]
+    return BUCKET_INBOX
 
 
-def meeting_file_path(started_at: datetime, title: str) -> Path | None:
-    """Canonical path for a meeting's vault file:
-    `Meetings/YYYY/MM/YYYY-MM-DD HH-MM-SS <Title>.md`.
+def _bucket_root(bucket: str, customer: str | None) -> Path | None:
+    """Root folder a meeting's .md lives under for this bucket. None if
+    Obsidian isn't configured. Falls back to Inbox for a 'customer'
+    bucket with no customer name — the inference layer shouldn't emit
+    that combo, but the writer is defensive."""
+    if OBSIDIAN_VAULT is None:
+        return None
+    if bucket == BUCKET_CUSTOMER:
+        if not customer:
+            return VAULT_INBOX
+        return VAULT_CUSTOMERS / _safe_filename_part(customer) if VAULT_CUSTOMERS else None
+    if bucket == BUCKET_INTERNAL:
+        return VAULT_INTERNAL
+    if bucket == BUCKET_INTERVIEW:
+        return VAULT_INTERVIEWS
+    if bucket == BUCKET_PERSONAL:
+        return VAULT_PERSONAL
+    return VAULT_INBOX
 
-    Returns None when Obsidian isn't configured. Shared by the writer and
-    by meeting_manager's mid-recording rename cleanup so both agree on
-    where a given meeting lives."""
-    if VAULT_MEETINGS is None:
+
+def _meetings_dir(bucket: str, customer: str | None) -> Path | None:
+    """Folder the YYYY/MM/ tree sits under.
+
+    Customer and Internal both have a `Meetings/` subfolder so that
+    sibling content (People/, Notes/, Projects/) can share the same
+    parent without colliding with a flat list of meeting files. Inbox /
+    Interviews / Personal skip the `Meetings/` wrapper because they
+    don't have sibling subfolders to disambiguate from.
+    """
+    root = _bucket_root(bucket, customer)
+    if root is None:
+        return None
+    if bucket in (BUCKET_CUSTOMER, BUCKET_INTERNAL):
+        return root / "Meetings"
+    return root
+
+
+def meeting_file_path(
+    started_at: datetime,
+    title: str,
+    bucket: str = BUCKET_INBOX,
+    customer: str | None = None,
+) -> Path | None:
+    """Canonical path for a meeting's vault file, given its bucket/customer.
+
+    `YYYY-MM-DD HH-MM-SS <title>.md` nested under `YYYY/MM/`. The title
+    retains the customer name — it's redundant with the path but helps
+    when files leave the vault standalone.
+    """
+    base = _meetings_dir(bucket, customer)
+    if base is None:
         return None
     year = started_at.strftime("%Y")
     month = started_at.strftime("%m")
@@ -97,46 +195,411 @@ def meeting_file_path(started_at: datetime, title: str) -> Path | None:
         f"{started_at.strftime('%Y-%m-%d %H-%M-%S')} "
         f"{_safe_filename_part(title)}"
     )
-    return VAULT_MEETINGS / year / month / f"{stem}.md"
+    return base / year / month / f"{stem}.md"
 
 
-def meeting_vault_link(started_at: datetime, title: str) -> str | None:
-    """Obsidian wikilink target for a meeting (no .md extension, vault-relative).
-    Example: `Meetings/2026/04/2026-04-18 14-30-15 Kickoff`.
-    Returns None when the vault isn't configured."""
-    path = meeting_file_path(started_at, title)
-    if path is None or VAULT_MEETINGS is None:
+def meeting_vault_link(
+    started_at: datetime,
+    title: str,
+    bucket: str = BUCKET_INBOX,
+    customer: str | None = None,
+) -> str | None:
+    """Vault-relative wikilink target (no `.md`) — e.g.
+    `10-Customers/Conviva/Meetings/2026/04/2026-04-22 09-30-00 - Conviva - Kickoff`.
+    """
+    path = meeting_file_path(started_at, title, bucket, customer)
+    if path is None or OBSIDIAN_VAULT is None:
         return None
-    rel = path.relative_to(VAULT_MEETINGS.parent).with_suffix("")
+    try:
+        rel = path.relative_to(OBSIDIAN_VAULT).with_suffix("")
+    except ValueError:
+        # Path isn't under the vault (shouldn't happen but stays defensive).
+        return None
     return rel.as_posix()
 
 
 def daily_brief_file_path(brief_date: str) -> Path | None:
-    """Canonical path for a daily brief: `Daily/YYYY/MM/YYYY-MM-DD.md`.
-    Returns None when Obsidian isn't configured."""
+    """Canonical path for a daily brief: `50-Daily/YYYY/MM/YYYY-MM-DD.md`."""
     if VAULT_DAILY is None:
         return None
     year, month = brief_date[:4], brief_date[5:7]
     return VAULT_DAILY / year / month / f"{brief_date}.md"
 
 
-def _ensure_dirs() -> bool:
-    if VAULT_MEETINGS is None or VAULT_PEOPLE is None:
-        return False
-    VAULT_MEETINGS.mkdir(parents=True, exist_ok=True)
-    VAULT_PEOPLE.mkdir(parents=True, exist_ok=True)
-    return True
+# ── People-note lookup across the vault ────────────────────────────────────
+
+
+def _people_search_roots() -> list[Path]:
+    """All folders where a Person note could live.
+
+    Returns a defensive (possibly empty) list so callers can iterate without
+    None-checking every entry. Order matters for tie-breaking: the first hit
+    wins. Customer folders come before Internal because customer-scoped
+    people are more specific — if the same name exists in both places, prefer
+    the customer attribution.
+    """
+    roots: list[Path] = []
+    if VAULT_CUSTOMERS and VAULT_CUSTOMERS.exists():
+        for customer_dir in VAULT_CUSTOMERS.iterdir():
+            if customer_dir.is_dir():
+                people = customer_dir / "People"
+                if people.exists():
+                    roots.append(people)
+    if VAULT_INTERNAL:
+        internal_people = VAULT_INTERNAL / "People"
+        if internal_people.exists():
+            roots.append(internal_people)
+    return roots
+
+
+def find_person_path(name: str) -> Path | None:
+    """First match for `<name>.md` across customer + internal people folders.
+
+    Returns None if the vault isn't configured or the person hasn't been
+    seen before. Used by the bucket-inference layer — a speaker known to
+    live under `10-Customers/Conviva/People/` pins the meeting to Conviva.
+    """
+    target = f"{_safe_filename_part(name)}.md"
+    for root in _people_search_roots():
+        candidate = root / target
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def find_person_customer(name: str) -> str | None:
+    """Customer folder name the given person sits under, or None.
+
+    None can mean any of: vault off, person not found, person is under
+    `20-Internal/People/` (i.e. a colleague, not a customer contact).
+    Callers use this result + their own logic to choose a bucket.
+    """
+    path = find_person_path(name)
+    if path is None or VAULT_CUSTOMERS is None:
+        return None
+    try:
+        rel = path.relative_to(VAULT_CUSTOMERS)
+    except ValueError:
+        return None
+    # rel = <Customer>/People/<Name>.md — first component is the customer.
+    if len(rel.parts) >= 1:
+        return rel.parts[0]
+    return None
+
+
+def person_file_path(
+    name: str,
+    bucket: str = BUCKET_INTERNAL,
+    customer: str | None = None,
+) -> Path | None:
+    """Where a NEW person note should live given the meeting it came from.
+
+    Auto-written person stubs go into the customer folder when the
+    meeting is customer-scoped, and into Internal otherwise. Interview /
+    personal buckets don't get auto-people notes — caller checks bucket
+    before calling (returns None for those buckets so the caller can't
+    accidentally scatter files).
+    """
+    if OBSIDIAN_VAULT is None:
+        return None
+    safe = _safe_filename_part(name)
+    if bucket == BUCKET_CUSTOMER and customer and VAULT_CUSTOMERS:
+        return VAULT_CUSTOMERS / _safe_filename_part(customer) / "People" / f"{safe}.md"
+    if bucket == BUCKET_INTERNAL and VAULT_INTERNAL:
+        return VAULT_INTERNAL / "People" / f"{safe}.md"
+    return None
+
+
+# ── Vault bootstrap + maintenance ───────────────────────────────────────────
+
+
+def _ensure_path_parent(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+
+def _customer_root(customer: str) -> Path | None:
+    """Path of `10-Customers/<Customer>/`, or None if vault unconfigured."""
+    if VAULT_CUSTOMERS is None:
+        return None
+    return VAULT_CUSTOMERS / _safe_filename_part(customer)
+
+
+# Canonical Notes/ filenames AuraScribe seeds on customer-folder
+# bootstrap. Free-form scratch lives in `Notes.md`; the others give
+# agents known locations to look for specific content.
+_CANONICAL_NOTES: tuple[tuple[str, str], ...] = (
+    (
+        "Architecture.md",
+        "Current state, target state, integration points. "
+        "Architecture decisions and the tradeoffs behind them.",
+    ),
+    (
+        "Stakeholders.md",
+        "Decision makers, technical evaluators, economic buyers. "
+        "Who can say yes, who can say no, who influences either.",
+    ),
+    (
+        "Open-Risks.md",
+        "Things that could derail the engagement — technical, "
+        "commercial, organizational. Each with mitigation status.",
+    ),
+    (
+        "Commercials.md",
+        "Pricing discussions, contract structure, procurement timeline. "
+        "Anything financial or contractual.",
+    ),
+    (
+        "Notes.md",
+        "Free-form scratch space. Anything that doesn't fit the other "
+        "canonical files lands here.",
+    ),
+)
+
+
+async def bootstrap_customer(customer: str) -> Path | None:
+    """Create the per-customer folder skeleton on first contact.
+
+    Idempotent — running on an existing customer folder leaves existing
+    files untouched and only fills in any missing canonical pieces.
+    Safe to call from any code path that has just decided this meeting
+    belongs to a (possibly new) customer.
+
+    Creates:
+      <Customer>/<Customer>.md   — MOC with Dataview queries
+      <Customer>/People/         — empty dir (people files written elsewhere)
+      <Customer>/Projects/       — empty dir
+      <Customer>/Meetings/       — empty dir (writer also creates as needed)
+      <Customer>/Notes/<canonical>.md  — five seeded files (see _CANONICAL_NOTES)
+
+    Returns the customer root path, or None when the vault isn't configured.
+    """
+    root = _customer_root(customer)
+    if root is None:
+        return None
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "People").mkdir(exist_ok=True)
+    (root / "Projects").mkdir(exist_ok=True)
+    (root / "Meetings").mkdir(exist_ok=True)
+    notes_dir = root / "Notes"
+    notes_dir.mkdir(exist_ok=True)
+
+    safe = _safe_filename_part(customer)
+    moc_path = root / f"{safe}.md"
+    if not moc_path.exists():
+        moc_content = _customer_moc_content(customer)
+        async with aiofiles.open(moc_path, "w", encoding="utf-8") as f:
+            await f.write(moc_content)
+        log.info("Bootstrapped customer MOC at %s", moc_path)
+
+    for filename, blurb in _CANONICAL_NOTES:
+        note_path = notes_dir / filename
+        if note_path.exists():
+            continue
+        topic = filename[:-3]  # strip ".md"
+        content = (
+            "---\n"
+            "type: customer-note\n"
+            f"customer: {customer}\n"
+            f"topic: {topic.lower()}\n"
+            "tags: [aurascribe]\n"
+            "---\n\n"
+            f"# {topic}\n\n"
+            f"> {blurb}\n"
+        )
+        async with aiofiles.open(note_path, "w", encoding="utf-8") as f:
+            await f.write(content)
+
+    return root
+
+
+def _customer_moc_content(customer: str) -> str:
+    """Initial Map-of-Content for a customer.
+
+    Frontmatter is minimal-but-extendable so the user can fill in
+    `segment`, `stage`, `account_exec` etc. as the engagement matures —
+    we don't pre-fill those because we'd usually be wrong. The Dataview
+    queries are scoped to the customer's own folder so cross-customer
+    bleed is impossible.
+    """
+    return f"""---
+type: customer
+name: {customer}
+stage: discovery
+tags: [customer, aurascribe]
+---
+
+# {customer}
+
+> Map of Content for everything related to this customer.
+> Edit the frontmatter as the engagement matures (`stage`, `segment`,
+> `account_exec`, `gcp_products`).
+
+## Active projects
+
+```dataview
+LIST FROM "10-Customers/{customer}/Projects"
+```
+
+## Recent meetings
+
+```dataview
+TABLE date, status FROM "10-Customers/{customer}/Meetings"
+SORT date DESC LIMIT 20
+```
+
+## Key contacts
+
+```dataview
+LIST FROM "10-Customers/{customer}/People"
+```
+
+## Open action items (mine)
+
+```dataview
+TASK FROM "10-Customers/{customer}/Meetings"
+WHERE !completed
+```
+
+## Notes
+
+- [[{customer}/Notes/Architecture|Architecture]]
+- [[{customer}/Notes/Stakeholders|Stakeholders]]
+- [[{customer}/Notes/Open-Risks|Open Risks]]
+- [[{customer}/Notes/Commercials|Commercials]]
+- [[{customer}/Notes/Notes|Free-form notes]]
+"""
+
+
+# Template files seeded into 90-Templates/ on first boot. These are
+# reference shapes for the user — they're not consumed by AuraScribe at
+# runtime (the writer composes meeting/person/MOC content directly).
+# Drop them in the vault so the user can clone them when authoring a
+# stub manually.
+_VAULT_TEMPLATES: tuple[tuple[str, str], ...] = (
+    (
+        "customer-meeting.md",
+        """---
+type: meeting
+date: YYYY-MM-DD
+time: HH:MM
+bucket: customer
+customer: <Customer>
+meeting_id: <uuid>
+attendees: ["[[Name]]"]
+status: done
+tags: [aurascribe]
+---
+
+# YYYY-MM-DD HH-MM-SS - <Customer> - <Topic>
+
+> Recorded YYYY-MM-DD at HH:MM · [[Name]]
+
+## Summary
+
+## Action Items
+
+## Transcript
+""",
+    ),
+    (
+        "customer-MOC.md",
+        """---
+type: customer
+name: <Customer>
+stage: discovery
+segment: <industry>
+account_exec: "[[<AE>]]"
+gcp_products: []
+tags: [customer, aurascribe]
+---
+
+# <Customer>
+
+## Active projects
+## Recent meetings
+## Key contacts
+## Open action items
+""",
+    ),
+    (
+        "person.md",
+        """---
+type: person
+name: <Full Name>
+role: <Title>
+email: <email>
+tags: [person, aurascribe]
+---
+
+# <Full Name>
+
+## Notes
+
+## Meetings
+""",
+    ),
+    (
+        "project.md",
+        """---
+type: project
+name: <Project Name>
+customer: <Customer>
+status: active
+gcp_products: []
+tags: [project, aurascribe]
+---
+
+# <Project Name>
+
+## Scope
+## Success criteria
+## Timeline
+## Open risks
+""",
+    ),
+)
+
+
+async def bootstrap_vault_templates() -> int:
+    """Seed `90-Templates/` with reference shapes on first boot.
+
+    Idempotent — existing template files are NEVER overwritten so the
+    user's customizations stick. Returns the count of files newly
+    written. No-op when the vault isn't configured.
+    """
+    if VAULT_TEMPLATES is None:
+        return 0
+    VAULT_TEMPLATES.mkdir(parents=True, exist_ok=True)
+    written = 0
+    for filename, body in _VAULT_TEMPLATES:
+        path = VAULT_TEMPLATES / filename
+        if path.exists():
+            continue
+        async with aiofiles.open(path, "w", encoding="utf-8") as f:
+            await f.write(body)
+        written += 1
+    if written:
+        log.info("Seeded %d vault template(s)", written)
+    return written
 
 
 def cleanup_vault_stragglers() -> int:
     """Delete zero-byte meeting files left behind by crashed/aborted writes.
 
-    Returns the number of files removed. Safe to call on startup — if the
-    vault isn't configured, this is a no-op. Walks recursively now that
-    meetings are nested under YYYY/MM/.
+    Walks every bucket root recursively — meetings can live under any of
+    Inbox / Customers / Internal / Interviews / Personal / Daily. Safe
+    no-op when the vault isn't configured or any root is absent.
     """
     total = 0
-    for root in (VAULT_MEETINGS, VAULT_DAILY):
+    roots: list[Path | None] = [
+        VAULT_INBOX,
+        VAULT_CUSTOMERS,
+        VAULT_INTERNAL,
+        VAULT_INTERVIEWS,
+        VAULT_PERSONAL,
+        VAULT_DAILY,
+    ]
+    for root in roots:
         if root is None or not root.exists():
             continue
         for path in root.rglob("*.md"):
@@ -151,74 +614,155 @@ def cleanup_vault_stragglers() -> int:
     return total
 
 
+# ── Meeting write ───────────────────────────────────────────────────────────
+
+
+async def _fetch_bucket_info(meeting_id: str) -> tuple[str, str | None, str | None]:
+    """Load (bucket, customer, old_vault_path) for a meeting.
+
+    Any of these can be NULL on a brand-new row — callers interpret
+    `bucket=inbox` + `customer=None` + `old_vault_path=None` as "first
+    write, nothing to clean up, land in inbox".
+    """
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            "SELECT vault_bucket, vault_customer, vault_path FROM meetings WHERE id = ?",
+            (meeting_id,),
+        )
+        row = await cursor.fetchone()
+    if not row:
+        return BUCKET_INBOX, None, None
+    return (
+        _normalize_bucket(row["vault_bucket"]),
+        row["vault_customer"],
+        row["vault_path"],
+    )
+
+
+def _attendee_links(speakers: list[str]) -> list[str]:
+    """Wikilinks for real speakers — skip `Me`, `Unknown`, and `Speaker N`
+    provisional placeholders. Unqualified `[[Name]]` links let Obsidian
+    resolve to whichever `<Name>.md` exists under any People/ folder,
+    which means the link keeps working if the person moves between
+    customers later."""
+    links: list[str] = []
+    for s in speakers:
+        if not s or s == "Me" or s == "Unknown":
+            continue
+        if re.match(r"^Speaker \d+$", s):
+            continue
+        links.append(f"[[{s}]]")
+    return links
+
+
 async def write_meeting(
-    meeting_id: int,
+    meeting_id: str,
     title: str,
     started_at: datetime,
     utterances: list[Utterance],
     summary: str,
     action_items: list[str],
 ) -> Path | None:
-    if not _ensure_dirs():
+    """Write/overwrite the vault file for `meeting_id`.
+
+    Pulls bucket + customer + prior vault_path from the DB so callers
+    don't have to plumb them through. If the computed path differs from
+    the stored `vault_path`, the old file is unlinked before the new
+    one is written — that's how a finalize-time reclassify (inbox →
+    customer) or a user rename (customer A → customer B) moves the file
+    to its new home.
+
+    Returns the final path, or None when Obsidian isn't configured.
+    """
+    if OBSIDIAN_VAULT is None:
         return None
-    assert VAULT_MEETINGS is not None
+
+    bucket, customer, old_vault_path = await _fetch_bucket_info(meeting_id)
+    new_path = meeting_file_path(started_at, title, bucket, customer)
+    if new_path is None:
+        log.warning(
+            "write_meeting: could not resolve path (bucket=%s customer=%s) for %s",
+            bucket, customer, meeting_id,
+        )
+        return None
+
+    # Remove the old file if we're writing somewhere else now. Best-effort
+    # — if the unlink fails we still proceed, so Obsidian at least has a
+    # fresh copy at the new path. A stray zero-byte file is cleaner up on
+    # the next startup sweep.
+    if old_vault_path:
+        old_path = Path(old_vault_path)
+        if old_path.exists() and old_path.resolve() != new_path.resolve():
+            try:
+                old_path.unlink()
+            except Exception as e:
+                log.warning("Could not delete stale vault file %s: %s", old_path, e)
+
+    _ensure_path_parent(new_path)
 
     date_str = started_at.strftime("%Y-%m-%d")
     time_str = started_at.strftime("%H:%M")
-    path = meeting_file_path(started_at, title)
-    assert path is not None  # _ensure_dirs guarantees VAULT_MEETINGS
-    path.parent.mkdir(parents=True, exist_ok=True)
-
     speakers = list({u.speaker for u in utterances})
-    # "Speaker N" is a provisional placeholder, not a real person — don't link.
-    people_links = ", ".join(
-        f"[[People/{s}]]" for s in speakers
-        if s != "Me" and not re.match(r"^Speaker \d+$", s) and s != "Unknown"
-    )
-    transcript_md = format_transcript(utterances)
+    attendees = _attendee_links(speakers)
+    attendees_json = "[" + ", ".join(f'"{a}"' for a in attendees) + "]"
 
-    # Live intelligence (highlights, action items, support intelligence
-    # history) is sourced from DB rather than function args so every call site
-    # — record-loop chunk writes, finalize, intel-loop refreshes — picks it up
-    # automatically without plumbing the data through.
+    transcript_md = format_transcript(utterances)
     live_intel_md = await _render_live_intel_section(meeting_id)
 
-    content = f"""---
-date: {date_str}
-time: {time_str}
-meeting_id: {meeting_id}
-tags: [meeting, aurascribe]
-people: [{", ".join(speakers)}]
----
+    # Frontmatter. Keep it flat and agent-friendly — no nested structures.
+    # `type: meeting` distinguishes from `type: daily-brief` / customer MOC.
+    frontmatter_lines = [
+        "---",
+        "type: meeting",
+        f"date: {date_str}",
+        f"time: {time_str}",
+        f"bucket: {bucket}",
+    ]
+    if bucket == BUCKET_CUSTOMER and customer:
+        # Plain string (not a wikilink) — the folder path IS the link.
+        # Keeps frontmatter queryable without double-resolving on render.
+        frontmatter_lines.append(f"customer: {customer}")
+    frontmatter_lines.extend(
+        [
+            f"meeting_id: {meeting_id}",
+            f"attendees: {attendees_json}",
+            "status: done" if summary else "status: in-progress",
+            "tags: [aurascribe]",
+            "---",
+        ]
+    )
 
-# {title}
+    header_line = (
+        f"> Recorded {date_str} at {time_str} · "
+        f"{', '.join(attendees) if attendees else 'Solo'}"
+    )
 
-> Recorded {date_str} at {time_str}
-> Participants: {people_links or "Solo"}
+    content = (
+        "\n".join(frontmatter_lines)
+        + "\n\n"
+        + f"# {title}\n\n"
+        + header_line
+        + "\n\n"
+        + (summary.rstrip() + "\n" if summary else "")
+        + live_intel_md
+        + "\n---\n\n"
+        + "## Transcript\n\n"
+        + transcript_md
+    )
 
-{summary}
-{live_intel_md}
----
-
-## Transcript
-
-{transcript_md}
-"""
-
-    async with aiofiles.open(path, "w", encoding="utf-8") as f:
+    async with aiofiles.open(new_path, "w", encoding="utf-8") as f:
         await f.write(content)
 
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
             "UPDATE meetings SET vault_path = ? WHERE id = ?",
-            (str(path), meeting_id),
+            (str(new_path), meeting_id),
         )
         await db.commit()
 
-    # Mark this meeting as freshly written — both the chunk loop and the
-    # intel loop check this to decide whether to skip a redundant write.
     _note_write(meeting_id)
-    return path
+    return new_path
 
 
 async def _render_live_intel_section(meeting_id: str) -> str:
@@ -281,7 +825,6 @@ async def _render_live_intel_section(meeting_id: str) -> str:
             text = (entry.get("text") or "").strip()
             if not text:
                 continue
-            # Try to parse to HH:MM:SS for display; fall back to whatever we stored.
             display_ts = ts
             try:
                 display_ts = datetime.fromisoformat(ts).strftime("%H:%M:%S")
@@ -307,11 +850,8 @@ def _safe_json_list(raw: str | None) -> list:
 
 async def rewrite_meeting_vault(meeting_id: str) -> Path | None:
     """Reload everything for `meeting_id` from the DB and rewrite its vault
-    file. Used by the realtime intel loop (refresh markdown immediately after
-    a successful run) and by post-edit endpoints in api.py.
-
-    Returns None if Obsidian isn't configured or the meeting doesn't exist.
-    """
+    file. Used by the realtime intel loop, post-edit endpoints, and any
+    caller that mutated the meeting row + wants the file updated."""
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
@@ -349,26 +889,29 @@ async def rewrite_meeting_vault(meeting_id: str) -> Path | None:
     )
 
 
+# ── Daily brief ─────────────────────────────────────────────────────────────
+
+
 async def write_daily_brief(
     brief_date: str,
     brief: dict,
     meetings_meta: list[dict],
     generated_at: str,
 ) -> Path | None:
-    """Write a Daily Brief markdown file into `Daily/YYYY/MM/YYYY-MM-DD.md`.
+    """Write a Daily Brief markdown file into `50-Daily/YYYY/MM/YYYY-MM-DD.md`.
 
     `brief` matches the schema returned by `llm.daily_brief.build_brief` —
     tldr, highlights, decisions, action_items_self, action_items_others,
     open_threads, people, themes, tomorrow_focus, coaching. `meetings_meta`
-    is a list of dicts with keys `title` + `started_at` (ISO) for the
-    meetings this brief covers — used to produce wikilinks back to each
-    meeting file under `Meetings/YYYY/MM/...`.
-
-    No-op when Obsidian isn't configured."""
+    is a list of dicts with keys `title`, `started_at` (ISO), `bucket`,
+    `customer` — used to produce wikilinks back to each meeting file.
+    Callers built before bucket/customer existed can omit those keys; the
+    link falls back to a plain title in that case.
+    """
     path = daily_brief_file_path(brief_date)
     if path is None:
         return None
-    path.parent.mkdir(parents=True, exist_ok=True)
+    _ensure_path_parent(path)
 
     try:
         d = datetime.strptime(brief_date, "%Y-%m-%d")
@@ -390,8 +933,8 @@ async def write_daily_brief(
 
     parts: list[str] = [
         "---",
-        f"date: {brief_date}",
         "type: daily-brief",
+        f"date: {brief_date}",
         f"meetings: {meeting_count}",
         f"generated_at: {generated_at}",
         "tags: [daily-brief, aurascribe]",
@@ -486,8 +1029,9 @@ async def write_daily_brief(
             takeaway = (p.get("takeaway") or "").strip()
             if not name:
                 continue
-            # Link to the People note if the vault is configured.
-            name_link = f"[[People/{name}|{name}]]" if VAULT_PEOPLE else name
+            # Plain `[[Name]]` — Obsidian resolves to whichever People/
+            # folder holds the file, regardless of which customer owns it.
+            name_link = f"[[{name}]]"
             parts.append(f"- **{name_link}** — {takeaway}" if takeaway else f"- **{name_link}**")
         parts.append("")
 
@@ -511,11 +1055,17 @@ async def write_daily_brief(
         for m in meetings_meta:
             title = (m.get("title") or "Untitled").strip()
             started_raw = m.get("started_at") or ""
+            bucket = _normalize_bucket(m.get("bucket"))
+            customer = m.get("customer")
             try:
                 started_dt = datetime.fromisoformat(started_raw)
             except Exception:
                 started_dt = None
-            link = meeting_vault_link(started_dt, title) if started_dt else None
+            link = (
+                meeting_vault_link(started_dt, title, bucket, customer)
+                if started_dt
+                else None
+            )
             if link:
                 parts.append(f"- [[{link}|{title}]]")
             else:
@@ -528,17 +1078,36 @@ async def write_daily_brief(
     return path
 
 
+# ── Person note stub ────────────────────────────────────────────────────────
+
+
 async def update_person_note(
     person_name: str,
     updated_notes: str,
     meeting_title: str,
     meeting_started_at: datetime | None = None,
+    *,
+    bucket: str = BUCKET_INTERNAL,
+    customer: str | None = None,
 ) -> Path | None:
-    if not _ensure_dirs():
-        return None
-    assert VAULT_PEOPLE is not None
+    """Create or update a Person note in the appropriate People/ folder.
 
-    path = VAULT_PEOPLE / f"{person_name}.md"
+    Routing: customer meeting → `10-Customers/<Customer>/People/<Name>.md`,
+    internal → `20-Internal/People/<Name>.md`. Other buckets don't get
+    auto-people notes (inbox because we haven't classified yet; interview
+    / personal because people there aren't worth indexing as contacts).
+
+    `updated_notes` becomes the Notes section; the existing `## Meetings`
+    list is preserved and the new meeting is appended as a wikilink.
+    """
+    if OBSIDIAN_VAULT is None:
+        return None
+    path = person_file_path(person_name, bucket=bucket, customer=customer)
+    if path is None:
+        # Bucket isn't one that hosts people notes — skip silently.
+        return None
+
+    _ensure_path_parent(path)
 
     existing = ""
     if path.exists():
@@ -547,40 +1116,50 @@ async def update_person_note(
 
     meetings_section = ""
     if "## Meetings" in existing:
-        parts = existing.split("## Meetings")
-        meetings_section = "## Meetings" + parts[1] if len(parts) > 1 else ""
+        after = existing.split("## Meetings", 1)[1]
+        meetings_section = "## Meetings" + after
 
     today = date.today().isoformat()
     link_target = (
-        meeting_vault_link(meeting_started_at, meeting_title)
+        meeting_vault_link(meeting_started_at, meeting_title, bucket, customer)
         if meeting_started_at
         else None
     )
     if link_target:
         meeting_link = f"- [[{link_target}|{meeting_title}]]"
     else:
-        # Fallback for callers that didn't pass a started_at — preserves the
-        # pre-restructure link shape so existing notes keep resolving.
-        meeting_link = f"- [[Meetings/{today} {meeting_title}]]"
+        meeting_link = f"- {meeting_title}"
 
     if meetings_section:
         meetings_section = meetings_section.rstrip() + f"\n{meeting_link}\n"
     else:
         meetings_section = f"\n## Meetings\n{meeting_link}\n"
 
-    content = f"""---
-name: {person_name}
-tags: [person, aurascribe]
-last_updated: {today}
----
+    frontmatter = [
+        "---",
+        "type: person",
+        f"name: {person_name}",
+    ]
+    if bucket == BUCKET_CUSTOMER and customer:
+        # The folder path already implies the customer, but a parallel
+        # field keeps Dataview queries one-liner-friendly.
+        frontmatter.append(f"customer: {customer}")
+    frontmatter.extend(
+        [
+            "tags: [person, aurascribe]",
+            f"last_updated: {today}",
+            "---",
+        ]
+    )
 
-# {person_name}
-
-## Notes
-{updated_notes}
-{meetings_section}"""
+    content = (
+        "\n".join(frontmatter)
+        + f"\n\n# {person_name}\n\n"
+        + "## Notes\n"
+        + (updated_notes.rstrip() + "\n" if updated_notes else "")
+        + meetings_section
+    )
 
     async with aiofiles.open(path, "w", encoding="utf-8") as f:
         await f.write(content)
-
     return path

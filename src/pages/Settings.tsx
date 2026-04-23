@@ -39,6 +39,7 @@ const SECTION_KEYS = {
     "auto_capture_start_speech_sec",
     "auto_capture_stop_silence_sec",
     "auto_capture_vad_threshold",
+    "auto_capture_countdown_after_silence_sec",
   ] as ConfigKey[],
 };
 
@@ -71,6 +72,7 @@ const NUMERIC_KEYS = new Set<ConfigKey>([
   "auto_capture_start_speech_sec",
   "auto_capture_stop_silence_sec",
   "auto_capture_vad_threshold",
+  "auto_capture_countdown_after_silence_sec",
 ]);
 
 // Boolean fields render as a three-way select (auto / on / off) and save
@@ -533,6 +535,9 @@ export function Settings({ appStatus, obsidianConfigured }: Props) {
           <ConfigField cfg={cfg} drafts={drafts} onChange={setDraft}
             k="auto_capture_vad_threshold" label="Listening sensitivity (0 – 1)" type="number"
             hint="How confident the voice detector needs to be that a sound is speech. Raise in noisy rooms if the monitor keeps triggering on background chatter; lower if it's missing quiet speech." />
+          <ConfigField cfg={cfg} drafts={drafts} onChange={setDraft}
+            k="auto_capture_countdown_after_silence_sec" label="Show countdown after silence (seconds)" type="number"
+            hint="Once the mic has been silent for this many seconds, the Stop button morphs into a live 'Stop in MM:SS' countdown so you know how long you have until auto-stop fires. Set lower to get the warning sooner; raise to keep the bar quiet during longer natural pauses." />
           <p className="text-[11px] text-amber-200/80 px-2.5 py-2 rounded-lg bg-amber-950/30 border border-amber-900/30">
             Heads-up: while auto-capture is on, your operating system's "microphone in use" indicator stays lit even when you aren't actively recording. Audio never leaves your PC — the monitor only runs Silero VAD locally — but the indicator is there for the normal reason (something has the mic open).
           </p>

@@ -25,6 +25,8 @@ export type WSMessage =
       state: "disabled" | "listening" | "armed" | "recording" | "error";
       confidence: number;
       silent_seconds?: number;
+      stop_silence_seconds?: number;
+      countdown_after_silence_sec?: number;
     }
   // Fired by the live title-refinement loop when it has a better
   // suggestion (only when title_locked is false). The frontend patches

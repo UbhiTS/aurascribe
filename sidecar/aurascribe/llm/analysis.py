@@ -298,23 +298,22 @@ def _compose_titles(
     entity: str | None,
     topics: list[str],
 ) -> list[str]:
-    """Stitch `{timestamp} - {entity} - {topic}` from the parts.
+    """Stitch `{entity} - {topic}` (or just `{topic}`) from the parts.
 
-    - Timestamp format is `YYYY-MM-DD HH-MM-SS` (dashes, not colons, so
-      the string is filename-safe on Windows).
     - If `entity` is None/falsy the entity slot is dropped.
-    - If `started_at` is None the timestamp slot is dropped (tests /
-      future code paths may skip the DB lookup).
-    - Topics are sanitised for filesystem-unsafe characters same as
-      entity — gives every title a clean filename.
+    - Topics are sanitised for filesystem-unsafe characters — gives
+      every title a clean filename.
+    - `started_at` is retained for signature compatibility but unused:
+      the timestamp is prepended to the *filename* only (see
+      `obsidian.writer.meeting_file_path`), not the visible title.
     """
-    ts = started_at.strftime("%Y-%m-%d %H-%M-%S") if started_at else None
+    del started_at  # unused; filename gets its own timestamp
     out: list[str] = []
     for topic in topics:
         clean_topic = _FILENAME_UNSAFE.sub(" ", topic).strip()
         clean_topic = re.sub(r"\s+", " ", clean_topic).strip()
         if not clean_topic:
             continue
-        parts = [p for p in (ts, entity, clean_topic) if p]
+        parts = [p for p in (entity, clean_topic) if p]
         out.append(" - ".join(parts))
     return out

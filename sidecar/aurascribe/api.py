@@ -22,7 +22,7 @@ from aurascribe import config
 from aurascribe.auto_capture import AutoCaptureMonitor
 from aurascribe.db.database import init_db
 from aurascribe.llm.client import get_available_models
-from aurascribe.obsidian.writer import cleanup_vault_stragglers
+from aurascribe.obsidian.writer import bootstrap_vault_templates, cleanup_vault_stragglers
 from aurascribe.routes import (
     daily_brief_router,
     intel_router,
@@ -54,6 +54,12 @@ async def lifespan(app: FastAPI):
     async with aiosqlite.connect(config.DB_PATH) as _db:
         await backfill_voice_colors(_db)
     cleanup_vault_stragglers()
+    # Seed reference templates into 90-Templates/ on first boot. Idempotent —
+    # existing user edits are never overwritten.
+    try:
+        await bootstrap_vault_templates()
+    except Exception as e:
+        log.warning("Could not seed vault templates: %s", e)
 
     async def on_utterance(meeting_id: str, utterances: list[Utterance]) -> None:
         await broadcast(
@@ -122,7 +128,6 @@ async def lifespan(app: FastAPI):
     manager.on_status(on_status)
     manager.on_level(on_level)
     manager.intel.set_broadcast(broadcast)
-    manager.title_refiner.set_broadcast(broadcast)
     asyncio.create_task(manager.initialize())
     yield
     # Shutdown — release the monitor's mic stream cleanly so a restart
