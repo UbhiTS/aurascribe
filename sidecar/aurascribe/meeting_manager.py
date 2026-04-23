@@ -30,7 +30,6 @@ from aurascribe.config import (
     SPECULATIVE_INTERVAL_SEC,
     SPECULATIVE_WINDOW_SEC,
 )
-from aurascribe.llm.bucket_inference import infer_bucket
 from aurascribe.llm.client import LLMTruncatedError, LLMUnavailableError, chat
 from aurascribe.llm.prompts import (
     MEETING_SUMMARY_SYSTEM,
@@ -41,12 +40,8 @@ from aurascribe.llm.prompts import (
 from aurascribe.llm.realtime import RealtimeIntelligence
 from aurascribe.tasks import safe_task
 from aurascribe.obsidian.writer import (
-    BUCKET_CUSTOMER,
-    BUCKET_INBOX,
-    BUCKET_INTERNAL,
-    bootstrap_customer,
-    find_person_path,
     forget_meeting_throttle,
+    get_person_note_body,
     note_chunk_arrived,
     time_since_write,
     update_person_note,
@@ -677,49 +672,13 @@ class MeetingManager:
         async with aiosqlite.connect(DB_PATH) as db:
             db.row_factory = aiosqlite.Row
             cursor = await db.execute(
-                "SELECT title, started_at, vault_bucket, vault_customer "
-                "FROM meetings WHERE id = ?",
+                "SELECT title, started_at FROM meetings WHERE id = ?",
                 (meeting_id,),
             )
             row = await cursor.fetchone()
             assert row is not None
             title = row["title"]
             started_at = datetime.fromisoformat(row["started_at"])
-            bucket = row["vault_bucket"]
-            customer = row["vault_customer"]
-
-        # Bucket inference — only when the meeting hasn't already been
-        # classified (manually via UI or by an earlier finalize). Speaker
-        # lookup is free; LLM fallback runs only when speakers can't
-        # disambiguate. A failure path lands in inbox at low confidence.
-        if not bucket or bucket == BUCKET_INBOX:
-            inferred = await infer_bucket(utterances)
-            log.info(
-                "Bucket inference for %s: %s/%s via %s (conf=%.2f) — %s",
-                meeting_id,
-                inferred.bucket,
-                inferred.customer,
-                inferred.source,
-                inferred.confidence,
-                inferred.reasoning,
-            )
-            bucket = inferred.bucket
-            customer = inferred.customer
-            async with aiosqlite.connect(DB_PATH) as db:
-                await db.execute(
-                    "UPDATE meetings SET vault_bucket = ?, vault_customer = ? WHERE id = ?",
-                    (bucket, customer, meeting_id),
-                )
-                await db.commit()
-
-        # If we landed on a customer, ensure the per-customer folder
-        # skeleton exists before the writer tries to create files inside
-        # it. Idempotent — existing customers reuse their folder.
-        if bucket == BUCKET_CUSTOMER and customer:
-            try:
-                await bootstrap_customer(customer)
-            except Exception as e:
-                log.warning("Customer bootstrap failed for %s: %s", customer, e)
 
         summary_md = ""
         action_items: list[str] = []
@@ -751,33 +710,43 @@ class MeetingManager:
                     action_items=action_items,
                 )
 
-                # Auto-person-notes only for already-classified meetings.
-                # Inbox = unclassified → don't write anywhere yet, the
-                # bucket-inference pass (run after stop) will classify
-                # and a subsequent recompute will produce notes in the
-                # right home.
-                if bucket in (BUCKET_CUSTOMER, BUCKET_INTERNAL):
-                    speakers = list({
-                        u.speaker for u in utterances
-                        if u.speaker != "Me"
-                        and u.speaker != "Unknown"
-                        and not _PROVISIONAL_LABEL_RE.match(u.speaker)
-                    })
+                # Auto-write a People note for every real speaker the
+                # meeting has a voice_id for. Unknowns, `Me`, and
+                # provisional `Speaker N` placeholders are skipped — they
+                # aren't identities we can pin a note to.
+                speakers = list({
+                    u.speaker for u in utterances
+                    if u.speaker != "Me"
+                    and u.speaker != "Unknown"
+                    and not _PROVISIONAL_LABEL_RE.match(u.speaker)
+                })
+                if speakers:
+                    voice_meta = await self._voice_meta_by_name(speakers)
                     for speaker in speakers:
+                        meta = voice_meta.get(speaker)
+                        if not meta:
+                            # No voices row yet — can't key a People note
+                            # to a voice_id, so skip this speaker. The
+                            # next finalize after the user tags a pill
+                            # (which creates the voice row) will pick
+                            # them up.
+                            continue
                         speaker_lines = "\n".join(
                             u.text for u in utterances if u.speaker == speaker
                         )
-                        existing = await self._get_existing_person_note(speaker)
+                        existing = await get_person_note_body(meta["id"])
                         updated = await chat(
                             people_notes_prompt(speaker, existing, speaker_lines)
                         )
                         await update_person_note(
-                            speaker,
-                            updated,
-                            title,
-                            started_at,
-                            bucket=bucket,
-                            customer=customer,
+                            voice_id=meta["id"],
+                            person_name=speaker,
+                            updated_notes=updated,
+                            meeting_title=title,
+                            meeting_started_at=started_at,
+                            email=meta.get("email"),
+                            org=meta.get("org"),
+                            role=meta.get("role"),
                         )
             except LLMTruncatedError as e:
                 # Model hit max_tokens before emitting the full summary —
@@ -838,17 +807,32 @@ class MeetingManager:
                 )
         return utterances
 
-    async def _get_existing_person_note(self, name: str) -> str:
-        """Return the existing People/<Name>.md content, regardless of which
-        customer folder (or 20-Internal) it lives under. Empty string if
-        the vault isn't configured or the person hasn't been written yet."""
-        path = find_person_path(name)
-        if path is None:
-            return ""
-        import aiofiles
+    async def _voice_meta_by_name(self, speakers: list[str]) -> dict[str, dict]:
+        """Look up voice_id + descriptive metadata for each speaker name.
 
-        async with aiofiles.open(path, "r", encoding="utf-8") as f:
-            return await f.read()
+        Returns {name → {id, email, org, role}} — names without a
+        matching voices row are absent from the result. Used by the
+        finalize path to build People notes keyed on voice_id.
+        """
+        if not speakers:
+            return {}
+        out: dict[str, dict] = {}
+        placeholders = ",".join("?" * len(speakers))
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                f"SELECT id, name, email, org, role FROM voices "
+                f"WHERE name IN ({placeholders})",
+                speakers,
+            )
+            async for row in cursor:
+                out[row["name"]] = {
+                    "id": row["id"],
+                    "email": row["email"],
+                    "org": row["org"],
+                    "role": row["role"],
+                }
+        return out
 
     # ── Callbacks ─────────────────────────────────────────────────────────────
 

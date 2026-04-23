@@ -445,6 +445,39 @@ function VoiceDetailPane({ detail, allVoices, onChanged, onDeleted }: DetailProp
         </div>
       </div>
 
+      {/* Descriptive metadata. All optional — email drives People-note
+          filename disambiguation when two voices share a display name;
+          all three surface in the People note's frontmatter. */}
+      <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 text-xs">
+        <MetaField
+          label="Email"
+          placeholder="jane@acme.com"
+          value={detail.email}
+          onSave={async (next) => {
+            await api.voices.update(detail.id, { email: next });
+            await onChanged();
+          }}
+        />
+        <MetaField
+          label="Organization"
+          placeholder="Acme Corp"
+          value={detail.org}
+          onSave={async (next) => {
+            await api.voices.update(detail.id, { org: next });
+            await onChanged();
+          }}
+        />
+        <MetaField
+          label="Role"
+          placeholder="Engineering Lead"
+          value={detail.role}
+          onSave={async (next) => {
+            await api.voices.update(detail.id, { role: next });
+            await onChanged();
+          }}
+        />
+      </div>
+
       {/* Snippets grid */}
       <div>
         <div className="text-[10px] uppercase tracking-wider text-gray-400 font-semibold mb-2">
@@ -635,4 +668,73 @@ function fmtSeconds(s: number): string {
   const m = Math.floor(s / 60);
   const rem = Math.floor(s % 60);
   return `${m}m ${rem.toString().padStart(2, "0")}s`;
+}
+
+// ── MetaField ──────────────────────────────────────────────────────────────
+//
+// Inline-editable text field for Voice descriptive metadata
+// (email / organization / role). Click to edit, Enter / blur to save,
+// Escape to cancel. Empty input clears the field.
+
+interface MetaFieldProps {
+  label: string;
+  placeholder: string;
+  value: string | null;
+  onSave: (next: string) => Promise<void>;
+}
+
+function MetaField({ label, placeholder, value, onSave }: MetaFieldProps) {
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState(value ?? "");
+  const [saving, setSaving] = useState(false);
+
+  useEffect(() => { setDraft(value ?? ""); }, [value]);
+
+  const commit = async () => {
+    const next = draft.trim();
+    if (next === (value ?? "")) { setEditing(false); return; }
+    setSaving(true);
+    try {
+      await onSave(next);
+      setEditing(false);
+    } catch (e: any) {
+      alert(`Update failed: ${e.message ?? e}`);
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <div>
+      <div className="text-[10px] uppercase tracking-wider text-gray-500 font-semibold mb-1">
+        {label}
+      </div>
+      {editing ? (
+        <input
+          autoFocus
+          disabled={saving}
+          value={draft}
+          placeholder={placeholder}
+          onChange={(e) => setDraft(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") commit();
+            if (e.key === "Escape") { setEditing(false); setDraft(value ?? ""); }
+          }}
+          onBlur={commit}
+          className="w-full bg-gray-800 border border-gray-600 rounded px-2 py-1 text-gray-100 outline-none focus:border-brand-500 disabled:opacity-60"
+        />
+      ) : (
+        <button
+          onClick={() => setEditing(true)}
+          className="w-full text-left px-2 py-1 rounded border border-transparent hover:border-gray-700 hover:bg-gray-900/40 transition-colors"
+        >
+          {value ? (
+            <span className="text-gray-200">{value}</span>
+          ) : (
+            <span className="text-gray-500 italic">{placeholder}</span>
+          )}
+        </button>
+      )}
+    </div>
+  );
 }

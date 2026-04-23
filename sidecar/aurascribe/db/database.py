@@ -57,16 +57,7 @@ CREATE TABLE IF NOT EXISTS meetings (
     -- 1 = frozen, user owns the title. Flips to 1 automatically when
     -- the user types a custom title or picks a Sparkles suggestion,
     -- and can be toggled manually via PATCH /title-lock.
-    title_locked        INTEGER DEFAULT 0,
-    -- Vault routing. NULL/empty = inbox (un-classified). Otherwise one of
-    -- inbox / customer / internal / interview / personal. The writer reads
-    -- these on every write and lands the file under the matching bucket
-    -- folder, moving the file if the bucket changes (inference flips it,
-    -- or the user reclassifies).
-    vault_bucket        TEXT,
-    -- Customer name when vault_bucket = 'customer'. Becomes the folder
-    -- name under 10-Customers/. NULL for any other bucket.
-    vault_customer      TEXT
+    title_locked        INTEGER DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS utterances (
@@ -89,6 +80,13 @@ CREATE TABLE IF NOT EXISTS voices (
     -- File extension of an uploaded voice avatar (e.g. "png", "jpg").
     -- NULL = use the generated initials circle.
     avatar_ext  TEXT,
+    -- Descriptive metadata surfaced in Voices.tsx and mirrored into the
+    -- People note frontmatter. All optional, user-editable. `email` also
+    -- drives filename disambiguation when two voices share a display name
+    -- (e.g. "John Smith (acme)" vs. "John Smith (google)").
+    email       TEXT,
+    org         TEXT,
+    role        TEXT,
     created_at  TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at  TEXT NOT NULL DEFAULT (datetime('now'))
 );
@@ -141,7 +139,7 @@ CREATE INDEX IF NOT EXISTS idx_meetings_started_status
 # Bump this any time the SCHEMA block above changes shape. On mismatch,
 # `init_db` drops every table and recreates from scratch — see the
 # policy note at the top of this module.
-_CURRENT_SCHEMA_VERSION = "perf-indices-1"
+_CURRENT_SCHEMA_VERSION = "generic-vault-1"
 
 
 async def init_db() -> None:

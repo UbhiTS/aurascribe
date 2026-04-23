@@ -28,7 +28,6 @@ _PROMPT_LABELS = {
     "live_intelligence.md": "Live Intelligence (highlights + live title)",
     "daily_brief.md": "Daily Brief",
     "meeting_analysis.md": "Meeting Analysis (title + summary)",
-    "meeting_bucket.md": "Meeting Bucket Classifier",
 }
 
 

@@ -182,16 +182,17 @@ _SEEDED_PROMPTS: tuple[str, ...] = (
     "live_intelligence.md",
     "daily_brief.md",
     "meeting_analysis.md",
-    "meeting_bucket.md",
 )
 
 # One-shot cleanup of prompt files we used to ship but no longer support.
 # Live title refinement was folded into live_intelligence.md (one LLM call
 # now returns highlights + entity + topic), so the standalone prompt is
 # dead weight that would otherwise confuse a user editing it expecting
-# it to do something.
+# it to do something. `meeting_bucket.md` drove the customer-isolated
+# vault layout; the generic layout doesn't need bucket inference.
 _RETIRED_PROMPTS: tuple[str, ...] = (
     "meeting_title_refinement.md",
+    "meeting_bucket.md",
 )
 
 # Prompts whose APP_DATA copy gets nuked AND re-seeded from the bundled
@@ -432,31 +433,19 @@ LLM_CONTEXT_TOKENS: int = _cfg_int("llm_context_tokens", 4096)
 # Obsidian vault root. None = integration disabled (transcripts still saved to DB).
 OBSIDIAN_VAULT: Path | None = _expand(_cfg_optional_str("obsidian_vault"))
 
-# Top-level buckets land at the vault root with numeric prefixes so they sort
-# predictably in Obsidian's file tree and don't collide with the user's own
-# folders. Layout contract is captured in memory file
-# `project_vault_structure.md`.
+# Generic vault layout — three top-level folders, no taxonomy beyond date +
+# person. Users add their own tags / folders for customers / projects /
+# teams in Obsidian if they want; AuraScribe doesn't impose a hierarchy.
 #
-#   00-Inbox/         staging + low-confidence meetings awaiting triage
-#   10-Customers/     <Customer>/{MOC.md, People/, Projects/, Meetings/, Notes/}
-#   20-Internal/      non-customer Google work (1-1s, team syncs, internal demos)
-#   30-Interviews/    candidate / panel interviews
-#   40-Personal/      misc (support calls, household, anything non-work)
-#   50-Daily/         YYYY/MM/YYYY-MM-DD.md — generated daily briefs
-#   90-Templates/     seeded on first boot
-#   99-Archive/       closed customers get moved here by hand
+#   Meetings/YYYY/YYYY-MM-DD/<HH-MM> - <title>.md
+#   People/<Display Name>.md         (voice_id in frontmatter is the real key)
+#   Daily/YYYY-MM-DD.md              (generated daily briefs, flat by date)
 if OBSIDIAN_VAULT:
-    VAULT_INBOX: Path | None = OBSIDIAN_VAULT / "00-Inbox"
-    VAULT_CUSTOMERS: Path | None = OBSIDIAN_VAULT / "10-Customers"
-    VAULT_INTERNAL: Path | None = OBSIDIAN_VAULT / "20-Internal"
-    VAULT_INTERVIEWS: Path | None = OBSIDIAN_VAULT / "30-Interviews"
-    VAULT_PERSONAL: Path | None = OBSIDIAN_VAULT / "40-Personal"
-    VAULT_DAILY: Path | None = OBSIDIAN_VAULT / "50-Daily"
-    VAULT_TEMPLATES: Path | None = OBSIDIAN_VAULT / "90-Templates"
-    VAULT_ARCHIVE: Path | None = OBSIDIAN_VAULT / "99-Archive"
+    VAULT_MEETINGS: Path | None = OBSIDIAN_VAULT / "Meetings"
+    VAULT_PEOPLE: Path | None = OBSIDIAN_VAULT / "People"
+    VAULT_DAILY: Path | None = OBSIDIAN_VAULT / "Daily"
 else:
-    VAULT_INBOX = VAULT_CUSTOMERS = VAULT_INTERNAL = VAULT_INTERVIEWS = None
-    VAULT_PERSONAL = VAULT_DAILY = VAULT_TEMPLATES = VAULT_ARCHIVE = None
+    VAULT_MEETINGS = VAULT_PEOPLE = VAULT_DAILY = None
 
 # ── ASR (faster-whisper) — device-adaptive defaults ──────────────────────────
 #

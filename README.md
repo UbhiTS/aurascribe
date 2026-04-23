@@ -62,30 +62,22 @@ First launch shows a welcome dialog with your detected hardware and the chosen W
 
 **Live AI coaching** — debounced LLM call (~20s after last utterance, hard-cap 60s) extracts highlights + action items (yours and others'). A 2–5 bullet support-intelligence card suggests what to say next: tools to mention, counterarguments to pre-empt, clarifying questions. Live title refinement: same call returns an entity + topic so the meeting title sharpens as it progresses (freeze with the lock icon to stop overrides). A progress bar shows when the next refresh fires.
 
-**Customer-organized vault** — Obsidian writer routes each finished meeting into a bucket under `<vault>/`:
+**Obsidian vault** — flat, generic layout. AuraScribe owns three folders; taxonomy beyond that is yours (add `#customer/acme`, folder conventions, MOCs — whatever fits your PKM):
 
 ```
-00-Inbox/YYYY/MM/                     unclassified / low-confidence
-10-Customers/<Customer>/
-    <Customer>.md                     MOC, seeded on first meeting
-    Meetings/YYYY/MM/<filename>.md
-    People/<Name>.md
-    Notes/{Architecture,Stakeholders,Open-Risks,Commercials,Notes}.md
-20-Internal/   (Meetings/, People/, Notes/)
-30-Interviews/YYYY/MM/
-40-Personal/YYYY/MM/
-50-Daily/YYYY/MM/YYYY-MM-DD.md
-90-Templates/  (seeded on boot)
-99-Archive/    (manual)
+<vault>/
+  Meetings/YYYY/YYYY-MM-DD/HH-MM - <title>.md
+  People/<Display Name>.md            # voice_id in frontmatter is the real identity key
+  Daily/YYYY-MM-DD.md                 # generated daily briefs, flat by date
 ```
 
-Bucket + customer are inferred at finalize: cheap speaker-folder lookup first (every named speaker → who they belong to → majority wins), LLM fallback gated at 0.5 confidence (`meeting_bucket.md`). Low-confidence routes land in Inbox for triage. The customer name in `vault_customer` triggers a one-time bootstrap of the MOC + canonical Notes/ files.
+People notes are keyed by `voice_id` in frontmatter, not filename — rename a note in Obsidian and AuraScribe still finds it on the next write. Two voices with the same display name get a disambiguation suffix on creation (`John Smith (acme).md` — from email domain → org → short voice_id hash). Attendee wikilinks in meeting notes use alias syntax when disambiguated: `[[John Smith (acme)|John Smith]]`.
 
 **Daily Brief** — end-of-day rollup of every meeting on a date: tl;dr, highlights, decisions, open threads, action items, per-person takeaways, themes, tomorrow's focus. Marked stale and rebuilt in the background when a meeting finishes (toggleable).
 
 **Meeting editing** — rename (Obsidian file moves to match), trim before/after a timestamp, split at a timestamp (both halves get their own files), bulk-delete by id list or "last N days", click-to-play any utterance into the Opus recording at that exact offset, summarize + suggest title in one LLM pass.
 
-**Editable prompts** — `live_intelligence.md`, `daily_brief.md`, `meeting_analysis.md`, `meeting_bucket.md` live under `APP_DATA/prompts/` (seeded from bundled defaults). One-click open from Settings; edits picked up on the next call.
+**Editable prompts** — `live_intelligence.md`, `daily_brief.md`, `meeting_analysis.md` live under `APP_DATA/prompts/` (seeded from bundled defaults). One-click open from Settings; edits picked up on the next call.
 
 **Diagnostics** — React error boundary catches blank-screen renders; sidecar `sys.excepthook` writes `crash-YYYYMMDD-HHMMSS.log`; Rust panic hook writes `crash-<unix>-rust.log`; rotating file log (5 × 5 MB). Heartbeat polls `/api/status` every 30s — header flips to `Sidecar unreachable` if the process dies.
 
@@ -146,8 +138,8 @@ Tauri shell (Rust + WebView2 / WKWebView)
     │                                    ├── sounddevice / soxr  (mic capture, Speex-AEC)
     │                                    ├── soundfile           (Opus recorder)
     │                                    ├── LLM client          (OpenAI-compat)
-    │                                    ├── SQLite (aiosqlite)  (meetings, voices, embeddings, vault routing)
-    │                                    └── Obsidian writer     (bucket-routed markdown)
+    │                                    ├── SQLite (aiosqlite)  (meetings, voices, embeddings)
+    │                                    └── Obsidian writer     (flat Meetings/People/Daily markdown)
     │
     ├── spawns/kills sidecar subprocess
     └── panics → APPDATA\AuraScribe\logs\crash-*-rust.log
@@ -183,9 +175,9 @@ aurascribe/
 │       ├── audio/                        sounddevice capture, Silero VAD, Opus recorder
 │       ├── transcription/                faster-whisper + pyannote, voice-pool matching
 │       ├── llm/                          client, prompts, analysis, realtime (live intel
-│       │                                 + title refinement), daily_brief, bucket_inference,
+│       │                                 + title refinement), daily_brief,
 │       │                                 plus user-editable .md prompts
-│       ├── obsidian/writer.py            Bucket-routed markdown writer + customer bootstrap
+│       ├── obsidian/writer.py            Meetings / People / Daily markdown writer
 │       └── db/database.py                SQLite schema + drop-and-recreate version gate
 ├── package.json                          Scripts: dev, tauri:dev, tauri:build, build:sidecar, package
 └── vite.config.ts                        Dev proxy + manual vendor chunks

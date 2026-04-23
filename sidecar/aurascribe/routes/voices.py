@@ -48,7 +48,9 @@ async def list_voices() -> list[dict]:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
             """
-            SELECT v.id, v.name, v.color, v.avatar_ext, v.created_at, v.updated_at,
+            SELECT v.id, v.name, v.color, v.avatar_ext,
+                   v.email, v.org, v.role,
+                   v.created_at, v.updated_at,
                    COUNT(ve.id) AS snippet_count,
                    COALESCE(SUM(COALESCE(ve.end_time, 0) - COALESCE(ve.start_time, 0)), 0) AS total_seconds,
                    MAX(ve.created_at) AS last_tagged_at
@@ -69,7 +71,8 @@ async def get_voice(voice_id: str) -> dict:
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
-            "SELECT id, name, color, avatar_ext, created_at, updated_at FROM voices WHERE id = ?",
+            "SELECT id, name, color, avatar_ext, email, org, role, "
+            "created_at, updated_at FROM voices WHERE id = ?",
             (voice_id,),
         )
         row = await cursor.fetchone()
@@ -100,13 +103,21 @@ async def get_voice(voice_id: str) -> dict:
 class VoicePatch(BaseModel):
     name: str | None = None
     color: str | None = None
+    # Descriptive metadata. "" clears the field (persisted as NULL);
+    # None leaves it untouched. Surfaced in Voices.tsx as inline-editable
+    # fields and mirrored into the People-note frontmatter on next write.
+    email: str | None = None
+    org: str | None = None
+    role: str | None = None
 
 
 @router.patch("/{voice_id}")
 async def update_voice(voice_id: str, req: VoicePatch) -> dict:
-    """Rename and/or recolor. Rename cascades into utterances.speaker across
-    every meeting so the pills update everywhere. Caller should follow up
-    with a rewrite of affected vault files if that matters."""
+    """Rename, recolor, or edit descriptive metadata. Rename cascades into
+    utterances.speaker across every meeting so the pills update everywhere.
+    Caller should follow up with a rewrite of affected vault files if
+    those need to reflect the new metadata."""
+    now = datetime.now().isoformat()
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute("SELECT name FROM voices WHERE id = ?", (voice_id,))
@@ -125,7 +136,7 @@ async def update_voice(voice_id: str, req: VoicePatch) -> dict:
                 raise HTTPException(409, f"A voice named '{new_name}' already exists")
             await db.execute(
                 "UPDATE voices SET name = ?, updated_at = ? WHERE id = ?",
-                (new_name, datetime.now().isoformat(), voice_id),
+                (new_name, now, voice_id),
             )
             await db.execute(
                 "UPDATE utterances SET speaker = ? WHERE speaker = ?",
@@ -148,8 +159,20 @@ async def update_voice(voice_id: str, req: VoicePatch) -> dict:
                 )
             await db.execute(
                 "UPDATE voices SET color = ?, updated_at = ? WHERE id = ?",
-                (req.color, datetime.now().isoformat(), voice_id),
+                (req.color, now, voice_id),
             )
+
+        # Metadata fields — "" clears (stored as NULL so downstream
+        # code has a single "missing" sentinel), None leaves as-is.
+        for field, value in (("email", req.email), ("org", req.org), ("role", req.role)):
+            if value is None:
+                continue
+            stripped = value.strip()
+            await db.execute(
+                f"UPDATE voices SET {field} = ?, updated_at = ? WHERE id = ?",
+                (stripped or None, now, voice_id),
+            )
+
         await db.commit()
 
     await manager.engine.reload_voices()

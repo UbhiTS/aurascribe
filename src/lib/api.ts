@@ -185,6 +185,13 @@ export interface Voice {
   // hasn't uploaded one. Non-null means GET /api/voices/:id/avatar will
   // serve the image; null means render the generated initials circle.
   avatar_ext: string | null;
+  // Descriptive metadata — surfaced inline on the Voices detail pane
+  // and mirrored into the People-note frontmatter. All optional; email
+  // also drives filename disambiguation when two voices share a display
+  // name (e.g. "John Smith (acme)" vs. "John Smith (google)").
+  email: string | null;
+  org: string | null;
+  role: string | null;
   created_at: string;
   updated_at: string;
   // Aggregates returned by /api/voices list view.
@@ -213,6 +220,9 @@ export interface VoiceDetail {
   name: string;
   color: string | null;
   avatar_ext: string | null;
+  email: string | null;
+  org: string | null;
+  role: string | null;
   created_at: string;
   updated_at: string;
   snippet_count: number;
@@ -601,7 +611,18 @@ export const api = {
   voices: {
     list: () => request<Voice[]>("/voices"),
     get: (id: string) => request<VoiceDetail>(`/voices/${id}`),
-    update: (id: string, patch: { name?: string; color?: string | null }) =>
+    update: (
+      id: string,
+      patch: {
+        name?: string;
+        color?: string | null;
+        // Empty string clears the field (persisted as NULL on the
+        // backend); undefined leaves it untouched.
+        email?: string;
+        org?: string;
+        role?: string;
+      },
+    ) =>
       request<{ ok: boolean }>(`/voices/${id}`, {
         method: "PATCH",
         body: JSON.stringify(patch),
