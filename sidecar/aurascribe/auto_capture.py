@@ -204,15 +204,24 @@ class AutoCaptureMonitor:
 
         When a meeting starts (by any path — our auto-fire or a manual
         click), we close our listening stream so the recording pipeline
-        owns the mic. When it ends, we re-open ours if still enabled.
+        owns the mic. When it ends, we re-open ours if still enabled —
+        otherwise we return to the disabled state so the UI toggle isn't
+        stuck on "recording" after the user's manual stop.
         """
         if event == "recording":
             async with self._lock:
                 await self._stop_listening_locked()
-                self._state = "recording"
-                # If `_fire_start` set the flag, it stays True. A manual
-                # click leaves it False — which suppresses auto-stop.
-                self._silent_blocks = 0
+                # Only advertise "recording" while we're enabled. If the
+                # user disabled auto-capture before manually starting a
+                # meeting, the monitor should stay at "disabled" so the
+                # chip's toggle doesn't lock (switchDisabled gates on
+                # `kind === "recording"` in AutoCaptureChip). Manager
+                # still owns the mic regardless of our state.
+                if self._enabled:
+                    self._state = "recording"
+                    # If `_fire_start` set the flag, it stays True. A manual
+                    # click leaves it False — which suppresses auto-stop.
+                    self._silent_blocks = 0
                 await self._publish_state()
         elif event in ("done", "error"):
             async with self._lock:
@@ -221,6 +230,13 @@ class AutoCaptureMonitor:
                     self._auto_started_current = False
                 if self._enabled:
                     await self._start_listening_locked()
+                else:
+                    # Monitor wasn't enabled — make sure we advertise
+                    # the true disabled state so the UI toggle recovers.
+                    # Previously we left `_state = "recording"` from the
+                    # matching "recording" event, which locked the chip.
+                    self._state = "disabled"
+                    await self._publish_state()
 
     # ── Manager level callback — silence detection while recording ──────
 
