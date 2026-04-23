@@ -86,32 +86,94 @@ def save_bootstrap_data_dir(value: str | None) -> None:
     BOOTSTRAP_FILE.write_text(json.dumps(current, indent=2), encoding="utf-8")
 
 
-APP_DATA: Path = _expand(load_bootstrap_data_dir()) or DEFAULT_APP_DATA
-APP_DATA.mkdir(parents=True, exist_ok=True)
+def _resolve_app_data() -> Path:
+    """Pick APP_DATA: the user's bootstrap override if it's usable,
+    otherwise DEFAULT_APP_DATA. Falls back to a temp dir as a last
+    resort if both are inaccessible (e.g. bootstrap points at an
+    offline network share AND %APPDATA% is locked down — rare but
+    fatal on startup if we don't recover).
+
+    Writes a loud stderr breadcrumb on fallback; the sidecar's log
+    handler isn't set up yet at import time so we can't use logging.
+    """
+    import sys as _sys
+    import tempfile as _tempfile
+
+    candidates: list[Path] = []
+    override = _expand(load_bootstrap_data_dir())
+    if override is not None:
+        candidates.append(override)
+    candidates.append(DEFAULT_APP_DATA)
+    # Last-resort: a temp dir. If this fails too, we let the exception
+    # propagate — there's genuinely nowhere to write.
+    candidates.append(Path(_tempfile.gettempdir()) / "AuraScribe-fallback")
+
+    for i, path in enumerate(candidates):
+        try:
+            path.mkdir(parents=True, exist_ok=True)
+            # Probe write access — mkdir can succeed on a read-only
+            # network mount but a subsequent file open fails. Better
+            # to discover this now.
+            _probe = path / ".write_probe"
+            _probe.write_text("", encoding="utf-8")
+            _probe.unlink()
+            if i > 0:
+                print(
+                    f"[AuraScribe] data dir {candidates[i - 1]!s} is unusable; "
+                    f"falling back to {path!s}. Check your bootstrap.json / "
+                    "disk permissions / network connectivity.",
+                    file=_sys.stderr,
+                )
+            return path
+        except Exception as e:
+            print(
+                f"[AuraScribe] data dir {path!s} is unusable ({e!r}); "
+                "trying next fallback.",
+                file=_sys.stderr,
+            )
+            continue
+    # All candidates failed — surface the original exception by retrying
+    # the default, which will raise and leave a real traceback in stderr.
+    DEFAULT_APP_DATA.mkdir(parents=True, exist_ok=True)
+    return DEFAULT_APP_DATA
+
+
+APP_DATA: Path = _resolve_app_data()
+
+
+def _ensure_dir(path: Path, label: str) -> Path:
+    """mkdir with a stderr breadcrumb on failure. Never raises — callers
+    get a best-effort path and downstream code handles the miss."""
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+    except Exception as e:
+        import sys as _sys
+        print(
+            f"[AuraScribe] could not create {label} dir {path!s}: {e!r}. "
+            "Feature will be disabled until the directory is writable.",
+            file=_sys.stderr,
+        )
+    return path
+
 
 DB_PATH: Path = APP_DATA / "aurascribe.db"
-MODELS_DIR: Path = APP_DATA / "models"
-MODELS_DIR.mkdir(parents=True, exist_ok=True)
+MODELS_DIR: Path = _ensure_dir(APP_DATA / "models", "models")
 # Per-meeting raw-audio recordings (OGG Opus, 24 kbps mono). One file per
 # meeting, named <meeting_id>.opus. Deleted alongside the meeting row.
-AUDIO_DIR: Path = APP_DATA / "audio"
-AUDIO_DIR.mkdir(parents=True, exist_ok=True)
+AUDIO_DIR: Path = _ensure_dir(APP_DATA / "audio", "audio")
 # Logs + crash dumps. Survives uninstall (it's under APP_DATA, which the
 # user owns), which is exactly what we want — if the sidecar dies on
 # startup the log is still there for diagnosis.
-LOGS_DIR: Path = APP_DATA / "logs"
-LOGS_DIR.mkdir(parents=True, exist_ok=True)
+LOGS_DIR: Path = _ensure_dir(APP_DATA / "logs", "logs")
 # Per-voice avatar images. File name is `<voice_id>.<ext>` where `ext` is
 # mirrored on voices.avatar_ext so we can serve the right MIME without
 # re-probing the file. Images are scrubbed from disk on voice delete.
-AVATARS_DIR: Path = APP_DATA / "avatars"
-AVATARS_DIR.mkdir(parents=True, exist_ok=True)
+AVATARS_DIR: Path = _ensure_dir(APP_DATA / "avatars", "avatars")
 
 # User-editable LLM prompt templates. Seeded from the package-bundled copies
 # on first run (or whenever the user deletes a file — the default returns).
 # Existing files are NEVER overwritten, so edits are sticky.
-PROMPTS_DIR: Path = APP_DATA / "prompts"
-PROMPTS_DIR.mkdir(parents=True, exist_ok=True)
+PROMPTS_DIR: Path = _ensure_dir(APP_DATA / "prompts", "prompts")
 
 _BUNDLED_PROMPTS_DIR: Path = Path(__file__).resolve().parent / "llm"
 # Known prompts we own. New prompts can be dropped in PROMPTS_DIR at any
@@ -469,7 +531,50 @@ def _probe_hardware() -> dict:
     return info
 
 
-HARDWARE_PROBE: dict = _probe_hardware()
+def _probe_hardware_with_timeout(timeout_sec: float = 5.0) -> dict:
+    """Run `_probe_hardware` on a worker thread with a hard timeout.
+
+    On a wedged NVIDIA driver, `torch.cuda.is_available()` can block
+    inside the driver for tens of seconds — which would freeze the
+    splash before any logging is set up. We can't interrupt C-level
+    driver calls, but we CAN time-bound the probe and fall back to
+    safe CPU defaults if it doesn't return. The probe thread is left
+    running (daemon=True) and its eventual return value is ignored;
+    a subsequent process restart picks up the working config once
+    the driver is healed.
+    """
+    import threading
+
+    result: dict = {"device": "cpu", "device_name": None, "vram_gb": None}
+    done = threading.Event()
+
+    def _worker() -> None:
+        nonlocal result
+        try:
+            result = _probe_hardware()
+        except Exception:
+            # Already handled internally, but belt-and-braces.
+            pass
+        finally:
+            done.set()
+
+    t = threading.Thread(target=_worker, name="hardware-probe", daemon=True)
+    t.start()
+    finished = done.wait(timeout=timeout_sec)
+    if not finished:
+        # Stderr because logging isn't configured yet at module-import
+        # time. The user at least gets a breadcrumb in the attached console.
+        import sys as _sys
+        print(
+            f"[AuraScribe] Hardware probe exceeded {timeout_sec:.0f}s — "
+            "falling back to CPU defaults. Your GPU driver may be hung; "
+            "try restarting the app or updating the NVIDIA driver.",
+            file=_sys.stderr,
+        )
+    return result
+
+
+HARDWARE_PROBE: dict = _probe_hardware_with_timeout()
 
 
 def _default_whisper_device() -> str:

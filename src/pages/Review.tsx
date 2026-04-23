@@ -6,6 +6,7 @@ import { TranscriptView } from "../components/TranscriptView";
 import { TitleSuggestPopover } from "../components/TitleSuggestPopover";
 import { Avatar } from "../components/Avatar";
 import { avatarSrcFor, colorForSpeaker } from "../lib/speakerColors";
+import { useEscapeKey } from "../lib/useEscapeKey";
 
 interface Props {
   meeting: Meeting | null;
@@ -32,6 +33,7 @@ export function Review({
   // Tauri webview silently returns falsy for it.
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [deleting, setDeleting] = useState(false);
+  useEscapeKey(() => setConfirmDelete(false), confirmDelete && !deleting);
   // Anchor + visibility for the AI title-suggestion popover. The anchor
   // is the sparkles button's bounding box so the popover lands right
   // underneath it regardless of where the title is on screen.

@@ -255,6 +255,29 @@ export function Settings({ appStatus, obsidianConfigured }: Props) {
     }
   };
 
+  // Show an explicit loading state while /api/settings/config hasn't
+  // returned yet. Previously the form just rendered with every input
+  // disabled (`cfg === null` disables the field components), which
+  // looked indistinguishable from a hung app on a slow machine.
+  if (cfg === null) {
+    return (
+      <div className="h-full overflow-y-auto scrollbar-thin">
+        <div className="max-w-5xl mx-auto px-6 py-6 space-y-5">
+          <div>
+            <h1 className="text-lg font-semibold text-gray-100">Settings &amp; System Status</h1>
+            <p className="text-sm text-gray-400 mt-1">
+              Loading current settings from the sidecar…
+            </p>
+          </div>
+          <div className="flex items-center gap-2 py-12 justify-center text-gray-500 text-xs">
+            <span className="inline-block w-3 h-3 rounded-full border-2 border-gray-700 border-t-gray-400 animate-spin" />
+            Reading config
+          </div>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="h-full overflow-y-auto scrollbar-thin">
       <div className="max-w-5xl mx-auto px-6 py-6 space-y-5">

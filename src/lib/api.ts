@@ -1,8 +1,86 @@
 // Dev: Vite proxies /api → sidecar, so relative URLs work.
 // Prod: Tauri webview origin is `tauri://localhost` (or similar) with no
-// proxy — we must hit the sidecar by its absolute URL. Keep this in sync
-// with `SIDECAR_WS_BASE` in lib/useWebSocket.ts.
-export const SIDECAR_HTTP_BASE = import.meta.env.DEV ? "" : "http://127.0.0.1:8765";
+// proxy — we must hit the sidecar by its absolute URL. The port matches
+// the sidecar's chosen port (8765 by default, falling back up to 8774
+// when another process holds the preferred port). Discovery runs once
+// on first module load and memoizes the winner in sessionStorage. Keep
+// in sync with `sidecarWsUrl()` in lib/useWebSocket.ts.
+
+const _SIDECAR_DEFAULT_PORT = 8765;
+const _SIDECAR_PORT_RANGE = 10;  // try 8765..8774 inclusive
+const _SIDECAR_PORT_STORAGE_KEY = "aurascribe.sidecar.port";
+
+function _cachedSidecarPort(): number {
+  if (import.meta.env.DEV) return _SIDECAR_DEFAULT_PORT;
+  try {
+    const raw = window.sessionStorage.getItem(_SIDECAR_PORT_STORAGE_KEY);
+    const n = raw ? parseInt(raw, 10) : NaN;
+    if (Number.isFinite(n) && n >= _SIDECAR_DEFAULT_PORT
+        && n < _SIDECAR_DEFAULT_PORT + _SIDECAR_PORT_RANGE) {
+      return n;
+    }
+  } catch {
+    // sessionStorage unavailable — fall through
+  }
+  return _SIDECAR_DEFAULT_PORT;
+}
+
+export function sidecarHttpBase(): string {
+  if (import.meta.env.DEV) return "";
+  return `http://127.0.0.1:${_cachedSidecarPort()}`;
+}
+
+// Probe for the actual sidecar port — called once on app boot. If the
+// preferred port doesn't respond within a short timeout, walks the
+// fallback range until /api/status answers. Memoizes the winner so the
+// rest of the app can keep using the synchronous `sidecarHttpBase()`.
+// Safe to call multiple times; subsequent calls short-circuit on the
+// cached value.
+let _sidecarDiscoveryPromise: Promise<number> | null = null;
+export async function discoverSidecarPort(): Promise<number> {
+  if (import.meta.env.DEV) return _SIDECAR_DEFAULT_PORT;
+  if (_sidecarDiscoveryPromise) return _sidecarDiscoveryPromise;
+
+  _sidecarDiscoveryPromise = (async () => {
+    const cached = _cachedSidecarPort();
+    const tryPort = async (port: number): Promise<boolean> => {
+      const ctrl = new AbortController();
+      const timer = window.setTimeout(() => ctrl.abort(), 2000);
+      try {
+        const res = await fetch(`http://127.0.0.1:${port}/api/status`, { signal: ctrl.signal });
+        return res.ok;
+      } catch {
+        return false;
+      } finally {
+        window.clearTimeout(timer);
+      }
+    };
+
+    // Try cached first — fast-path when the sidecar stayed on its usual port.
+    if (await tryPort(cached)) return cached;
+
+    // Walk the fallback range. Starts at the preferred port even if the
+    // cache was stale, so a sidecar that moved BACK to 8765 is found fast.
+    for (let i = 0; i < _SIDECAR_PORT_RANGE; i++) {
+      const p = _SIDECAR_DEFAULT_PORT + i;
+      if (p === cached) continue;
+      if (await tryPort(p)) {
+        try {
+          window.sessionStorage.setItem(_SIDECAR_PORT_STORAGE_KEY, String(p));
+        } catch {
+          // sessionStorage unavailable — subsequent calls will re-probe.
+        }
+        return p;
+      }
+    }
+    // Give up — the rest of the app will surface the failure through
+    // normal fetch errors / the WS reconnect banner.
+    return cached;
+  })();
+  return _sidecarDiscoveryPromise;
+}
+
+export const SIDECAR_HTTP_BASE = sidecarHttpBase();
 const BASE = `${SIDECAR_HTTP_BASE}/api`;
 
 export interface Utterance {
@@ -376,7 +454,9 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   // default so every caller doesn't have to set it explicitly.
   const isFormData = typeof FormData !== "undefined" && init?.body instanceof FormData;
   const headers: HeadersInit = isFormData ? {} : { "Content-Type": "application/json" };
-  const res = await fetch(BASE + path, {
+  // Resolve the base URL per-call so a discover-port flow that updates
+  // sessionStorage mid-session is picked up without a page reload.
+  const res = await fetch(`${sidecarHttpBase()}/api${path}`, {
     headers,
     cache: "no-store",
     ...init,
@@ -513,7 +593,7 @@ export const api = {
         `/meetings/${id}/recompute`,
         { method: "POST" },
       ),
-    audioUrl: (id: string) => `${BASE}/meetings/${id}/audio`,
+    audioUrl: (id: string) => `${sidecarHttpBase()}/api/meetings/${id}/audio`,
   },
   voices: {
     list: () => request<Voice[]>("/voices"),
@@ -538,7 +618,7 @@ export const api = {
     // reliably fetches the new image after an upload. Works fine against
     // the server's 10s Cache-Control max-age.
     avatarUrl: (id: string, cacheKey?: string | null) =>
-      `${BASE}/voices/${id}/avatar${cacheKey ? `?v=${encodeURIComponent(cacheKey)}` : ""}`,
+      `${sidecarHttpBase()}/api/voices/${id}/avatar${cacheKey ? `?v=${encodeURIComponent(cacheKey)}` : ""}`,
     uploadAvatar: (id: string, file: File) => {
       const fd = new FormData();
       fd.append("file", file);

@@ -1,9 +1,18 @@
 import { useEffect, useRef, useState } from "react";
+import { sidecarHttpBase } from "./api";
 
 // Dev: Vite proxies /ws to the sidecar, so a same-origin URL works.
 // Prod: Tauri webview origin is `tauri://localhost` — connect to the sidecar
-// directly. Must match `SIDECAR_HTTP_BASE` in lib/api.ts.
-const SIDECAR_WS_URL = import.meta.env.DEV ? null : "ws://127.0.0.1:8765/ws";
+// directly. Port is shared with lib/api.ts (picked by `discoverSidecarPort()`
+// on boot, fallback-range 8765..8774).
+function _sidecarWsUrl(): string {
+  if (import.meta.env.DEV) {
+    const proto = window.location.protocol === "https:" ? "wss" : "ws";
+    return `${proto}://${window.location.host}/ws`;
+  }
+  // sidecarHttpBase returns http://127.0.0.1:<port>; swap the scheme.
+  return sidecarHttpBase().replace(/^http/, "ws") + "/ws";
+}
 
 export type WSMessage =
   | { type: "utterances"; meeting_id: string; data: { id?: string; speaker: string; text: string; start_time: number; end_time: number; match_distance?: number | null }[] }
@@ -73,11 +82,10 @@ export function useWebSocket(onMessage: Handler): { connected: boolean; failedAt
 
     const connect = () => {
       if (cancelled) return;
-      const url = SIDECAR_WS_URL ?? (() => {
-        const proto = window.location.protocol === "https:" ? "wss" : "ws";
-        return `${proto}://${window.location.host}/ws`;
-      })();
-      socket = new WebSocket(url);
+      // Resolve per-attempt — if the sidecar moved to a fallback port
+      // after we connected, sessionStorage is updated and the next
+      // reconnect lands on the right URL without a page reload.
+      socket = new WebSocket(_sidecarWsUrl());
 
       socket.onopen = () => {
         if (!cancelled) {

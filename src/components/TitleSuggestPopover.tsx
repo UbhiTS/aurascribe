@@ -42,6 +42,11 @@ export function TitleSuggestPopover({ meetingId, onRenamed, onAnalyzed, onClose,
   const initialFetchedRef = useRef(false);
 
   const fetchSuggestions = async () => {
+    // Re-entry guard — both the initial-mount effect and the Try-again
+    // button call this. A rapid-fire retry during an LLM outage would
+    // queue parallel requests against a slow provider; bail if one's
+    // already in flight.
+    if (loading) return;
     setLoading(true);
     setError(null);
     setSuggestions([]);

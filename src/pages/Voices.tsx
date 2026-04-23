@@ -170,6 +170,12 @@ function VoiceDetailPane({ detail, allVoices, onChanged, onDeleted }: DetailProp
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const stopAtRef = useRef<number | null>(null);
   const [playingSnippetId, setPlayingSnippetId] = useState<string | null>(null);
+  // Keeps the id → error-message map so a failed .play() (typically a
+  // missing .opus file on disk) can surface inline next to THAT snippet,
+  // instead of silently going to console.warn. Cleared on next successful
+  // play of the same snippet. Only one error is shown at a time because
+  // the user can only play one snippet at a time.
+  const [playError, setPlayError] = useState<{ id: string; message: string } | null>(null);
 
   useEffect(() => {
     const el = audioRef.current;
@@ -202,13 +208,23 @@ function VoiceDetailPane({ detail, allVoices, onChanged, onDeleted }: DetailProp
     const duration = Math.max(0.5, (snippet.end_time ?? 0) - (snippet.start_time ?? 0));
     stopAtRef.current = snippet.audio_start + duration;
     setPlayingSnippetId(snippet.id);
+    setPlayError(null);
     try {
       el.currentTime = snippet.audio_start;
       await el.play();
     } catch (e) {
+      // Most common cause: the .opus recording has been deleted outside
+      // the app (user cleaned up %APPDATA% manually, or a meeting that
+      // predates audio capture). Previously this went to console.warn
+      // only and the Play button just did nothing — no signal to the
+      // user about what's wrong.
       console.warn("snippet playback failed", e);
       setPlayingSnippetId(null);
       stopAtRef.current = null;
+      setPlayError({
+        id: snippet.id,
+        message: "Audio file not found — it may have been deleted.",
+      });
     }
   }, [playingSnippetId]);
 
@@ -441,13 +457,19 @@ function VoiceDetailPane({ detail, allVoices, onChanged, onDeleted }: DetailProp
         ) : (
           <ul className="space-y-2">
             {detail.snippets.map((s) => (
-              <SnippetRow
-                key={s.id}
-                snippet={s}
-                playing={playingSnippetId === s.id}
-                onPlay={() => playSnippet(s)}
-                onDelete={() => handleDeleteSnippet(s.id)}
-              />
+              <li key={s.id}>
+                <SnippetRow
+                  snippet={s}
+                  playing={playingSnippetId === s.id}
+                  onPlay={() => playSnippet(s)}
+                  onDelete={() => handleDeleteSnippet(s.id)}
+                />
+                {playError?.id === s.id && (
+                  <p className="mt-1 ml-2 text-[11px] text-amber-300">
+                    {playError.message}
+                  </p>
+                )}
+              </li>
             ))}
           </ul>
         )}

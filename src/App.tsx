@@ -37,6 +37,22 @@ const Settings = lazy(() =>
   import("./pages/Settings").then((m) => ({ default: m.Settings })),
 );
 
+// Inline spinner for the lazy page boundary. Appears when the user
+// navigates to a page whose chunk hasn't been fetched yet. Previously
+// the Suspense fallback was `null`, which blanked the main area for
+// 1–3 seconds on a cold cache — the click felt swallowed and users
+// re-clicked, queuing more navigation work.
+function PageLoadingFallback() {
+  return (
+    <div className="flex items-center justify-center h-full text-gray-500">
+      <div className="flex items-center gap-2 text-xs">
+        <span className="inline-block w-3 h-3 rounded-full border-2 border-gray-700 border-t-gray-400 animate-spin" />
+        Loading…
+      </div>
+    </div>
+  );
+}
+
 type StatusEvent =
   | "loading" | "ready" | "recording" | "processing" | "done" | "error";
 
@@ -367,7 +383,7 @@ export default function App() {
           }}
         />
       )}
-      <Suspense fallback={null}>
+      <Suspense fallback={<PageLoadingFallback />}>
         {page === "live" && (
           <LiveFeed
             appStatus={appStatus}

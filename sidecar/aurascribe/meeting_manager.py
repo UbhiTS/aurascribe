@@ -31,7 +31,7 @@ from aurascribe.config import (
     SPECULATIVE_WINDOW_SEC,
 )
 from aurascribe.llm.bucket_inference import infer_bucket
-from aurascribe.llm.client import chat
+from aurascribe.llm.client import LLMTruncatedError, LLMUnavailableError, chat
 from aurascribe.llm.prompts import (
     MEETING_SUMMARY_SYSTEM,
     format_transcript,
@@ -63,6 +63,12 @@ log = logging.getLogger("aurascribe")
 # drifting more permissive with every added embedding. Edit here if speakers
 # merge too eagerly (lower) or split across many labels (raise).
 _PROVISIONAL_THRESH = PROVISIONAL_THRESHOLD
+# FIFO cap on per-label embedding lists. Each embedding is ~3KB (768
+# float32s); without a cap, a 3-hour 20-speaker meeting could pin ~200MB
+# of pyannote vectors. The centroid stays accurate long before we hit
+# this cap — 100 embeddings is already a very stable mean — so eviction
+# is essentially lossless for clustering quality.
+_PROVISIONAL_MAX_EMBEDDINGS = 100
 _PROVISIONAL_LABEL_RE = re.compile(r"^Speaker \d+$")
 
 # Vault-write throttle for the live recording loop. We want the file to look
@@ -218,8 +224,11 @@ class MeetingManager:
         loopback_device: int | None = None,
         capture_mic: bool = True,
     ) -> str:
-        if self._running:
-            raise RuntimeError("Already recording")
+        # Readiness check is cheap and doesn't need a lock. The `_running`
+        # check needs one — see below — because capture.start() can take
+        # 1–2s on WASAPI and two concurrent start requests (double-click,
+        # network retry, two UI tabs) would both pass a lockless pre-check
+        # and then race on capture initialisation.
         if not self._ready:
             raise RuntimeError("Models still loading — try again in a moment")
 
@@ -229,26 +238,35 @@ class MeetingManager:
             # via meeting_file_path, so no date needed here.
             title = "Untitled recording"
 
+        # Capture transition + recording-state transition are serialized
+        # by `_monitor_lock`:
+        #   - the `_running` check AND set happen inside the lock, so a
+        #     second concurrent caller sees `True` and bails with a clean
+        #     RuntimeError instead of racing on capture.start();
+        #   - any late /monitor/start can't sneak in between the monitor
+        #     teardown and our capture.start();
+        #   - on capture failure we roll back every piece of state AND
+        #     delete the DB row before releasing the lock, so the next
+        #     caller sees `_running = False` and a clean DB.
         meeting_id = str(uuid.uuid4())
-        async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute(
-                "INSERT INTO meetings (id, title, started_at, status) VALUES (?, ?, ?, 'recording')",
-                (meeting_id, title, datetime.now().isoformat()),
-            )
-            await db.commit()
-
-        self._current_meeting_id = meeting_id
-        self._provisional_pools[meeting_id] = {}
-        self._provisional_next_n[meeting_id] = 1
-        # Capture transition is locked so a late /monitor/start can't
-        # sneak in between the monitor teardown and our capture.start().
-        # We also set `_running` inside the lock, so any monitor request
-        # that waits for the lock sees the "recording" state when it
-        # finally runs and bails early instead of opening a duplicate
-        # stream.
         async with self._monitor_lock:
+            if self._running:
+                raise RuntimeError("Already recording")
             await self._stop_monitor_locked()
+
+            # Commit the DB row inside the lock — rollback is easier when
+            # the row's lifetime is entirely owned by this critical section.
+            async with aiosqlite.connect(DB_PATH) as db:
+                await db.execute(
+                    "INSERT INTO meetings (id, title, started_at, status) VALUES (?, ?, ?, 'recording')",
+                    (meeting_id, title, datetime.now().isoformat()),
+                )
+                await db.commit()
+
             self._running = True
+            self._current_meeting_id = meeting_id
+            self._provisional_pools[meeting_id] = {}
+            self._provisional_next_n[meeting_id] = 1
             try:
                 await self.capture.start(
                     device=device,
@@ -256,12 +274,23 @@ class MeetingManager:
                     capture_mic=capture_mic,
                 )
             except Exception:
-                # Roll back state so the next click doesn't get "Already recording".
+                # Full rollback: state, in-memory pools, DB row. Without
+                # this a transient capture failure (mic unplugged mid-start,
+                # PortAudio hiccup) would leave the row stuck in 'recording'
+                # forever and the next click would get "Already recording".
                 self._running = False
                 self._current_meeting_id = None
-                async with aiosqlite.connect(DB_PATH) as db:
-                    await db.execute("DELETE FROM meetings WHERE id = ?", (meeting_id,))
-                    await db.commit()
+                self._provisional_pools.pop(meeting_id, None)
+                self._provisional_next_n.pop(meeting_id, None)
+                try:
+                    async with aiosqlite.connect(DB_PATH) as db:
+                        await db.execute("DELETE FROM meetings WHERE id = ?", (meeting_id,))
+                        await db.commit()
+                except Exception as cleanup_err:
+                    log.warning(
+                        "Could not clean up failed-start meeting row %s: %s",
+                        meeting_id, cleanup_err,
+                    )
                 raise
         # Only surface a mic name when we actually opened the mic. In
         # system-only mode `_resolve_device_name` would still pick up a
@@ -569,6 +598,11 @@ class MeetingManager:
         if best_label is not None and best_dist < _PROVISIONAL_THRESH:
             if add:
                 pool[best_label].append(emb)
+                # FIFO-evict oldest embeddings once the cap is hit so the
+                # pool doesn't grow monotonically during a long meeting.
+                # Centroid stability past 100 samples is a rounding error.
+                if len(pool[best_label]) > _PROVISIONAL_MAX_EMBEDDINGS:
+                    pool[best_label] = pool[best_label][-_PROVISIONAL_MAX_EMBEDDINGS:]
                 log.info(
                     "provisional: matched %s dist=%.3f (all=%s) thresh=%.2f",
                     best_label, best_dist,
@@ -745,8 +779,27 @@ class MeetingManager:
                             bucket=bucket,
                             customer=customer,
                         )
+            except LLMTruncatedError as e:
+                # Model hit max_tokens before emitting the full summary —
+                # actionable for the user (raise llm_context_tokens or use
+                # a bigger model). Distinct from "LLM unavailable" so the
+                # log points at the right fix.
+                log.warning(
+                    "Summary truncated at the model's output budget for %s — "
+                    "saving transcript without summary. Raise `llm_context_tokens` "
+                    "in Settings or switch to a model with a bigger budget. (%s)",
+                    meeting_id, e,
+                )
+            except LLMUnavailableError as e:
+                log.warning(
+                    "LLM unreachable — transcript saved without summary for %s: %s",
+                    meeting_id, e,
+                )
             except Exception as e:
-                log.warning(f"LLM unavailable — transcript saved without summary: {e}")
+                log.exception(
+                    "Unexpected error during summary for %s — transcript saved without summary: %s",
+                    meeting_id, e,
+                )
         else:
             log.info("LLM summarization disabled — saving transcript only")
 

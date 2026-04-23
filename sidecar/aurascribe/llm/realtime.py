@@ -39,7 +39,7 @@ from aurascribe.config import (
     RT_HIGHLIGHTS_MAX_INTERVAL_SEC,
     RT_HIGHLIGHTS_WINDOW_SEC,
 )
-from aurascribe.llm.client import LLMUnavailableError, chat
+from aurascribe.llm.client import LLMTruncatedError, LLMUnavailableError, chat
 from aurascribe.tasks import safe_task
 from aurascribe.transcription import Utterance
 
@@ -290,6 +290,18 @@ class RealtimeIntelligence:
                 state.consecutive_failures += 1
                 log.info("Realtime intel skipped (LLM unavailable, attempt %d): %s",
                          state.consecutive_failures, e)
+            except LLMTruncatedError as e:
+                # Response was cut off at max_tokens — distinct from a
+                # provider outage. Surface it plainly so the user knows
+                # to raise `llm_context_tokens` rather than assume the
+                # provider is down and keep waiting.
+                state.consecutive_failures += 1
+                log.warning(
+                    "Realtime intel response truncated at max_tokens for %s "
+                    "(attempt %d) — raise `llm_context_tokens` in Settings or "
+                    "switch to a model with a bigger output budget. (%s)",
+                    meeting_id, state.consecutive_failures, e,
+                )
             except Exception as e:
                 state.consecutive_failures += 1
                 log.warning("Realtime intel run failed: %s", e, exc_info=True)

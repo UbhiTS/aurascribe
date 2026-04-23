@@ -140,11 +140,54 @@ def main() -> None:
         )
 
     host = os.environ.get("SIDECAR_HOST", "127.0.0.1")
-    port = int(os.environ.get("SIDECAR_PORT", "8765"))
+    port = _pick_free_port(log, host, int(os.environ.get("SIDECAR_PORT", "8765")))
     # `log_config=None` stops uvicorn from installing its own logging config
     # (which would clobber our handlers and double-log). Uvicorn's access
     # logger falls back to the root logger instead.
     uvicorn.run(app, host=host, port=port, log_level="info", log_config=None)
+
+
+def _pick_free_port(log: logging.Logger, host: str, preferred: int) -> int:
+    """Return `preferred` if it binds, otherwise scan 10 ports above it.
+
+    Writes the winning port to ``APP_DATA/sidecar-port`` so the Tauri
+    shell can read it and point the frontend at the right URL. Previously
+    the port was hard-coded to 8765 everywhere; a user with a lingering
+    TIME_WAIT socket from a previous run, or another process holding
+    8765 (VNC relays, Synergy, AV proxies), hit a 30s hang followed by
+    a silent sidecar crash. Now we log the fallback and persist it so
+    the UI converges on the live port.
+    """
+    import socket
+
+    for candidate in range(preferred, preferred + 10):
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            s.bind((host, candidate))
+        except OSError:
+            continue
+        finally:
+            s.close()
+        if candidate != preferred:
+            log.warning(
+                "sidecar: port %d in use — falling back to %d",
+                preferred, candidate,
+            )
+        # Write the chosen port for the Tauri shell to read. Best-effort:
+        # a failure here doesn't block startup, just means the shell
+        # stays on its default probe sequence.
+        try:
+            port_file = LOGS_DIR.parent / "sidecar-port"
+            port_file.write_text(str(candidate), encoding="utf-8")
+        except Exception as e:
+            log.warning("sidecar: could not write port file: %s", e)
+        return candidate
+
+    raise RuntimeError(
+        f"sidecar: no free port in {preferred}-{preferred + 9}. "
+        "Another process is holding the range — close other AuraScribe "
+        "instances or unusual services and try again."
+    )
 
 
 if __name__ == "__main__":

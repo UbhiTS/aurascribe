@@ -2,6 +2,7 @@ import { memo, useEffect, useState, useRef, useCallback } from "react";
 import { Clock, FileText, Loader, CheckSquare, Square, Trash2 } from "lucide-react";
 import { api, tagsPending } from "../lib/api";
 import type { Meeting } from "../lib/api";
+import { useEscapeKey } from "../lib/useEscapeKey";
 
 const PAGE_SIZE = 20;
 const DAY_OPTIONS = [1, 2, 3, 5, 7];
@@ -23,6 +24,7 @@ export function MeetingList({ selectedId, activeMeetingId, onSelect, onDeleted, 
   const [loading, setLoading]         = useState(false);
   const [confirmMode, setConfirmMode] = useState<ConfirmMode>(null);
   const [deleting, setDeleting]       = useState(false);
+  useEscapeKey(() => setConfirmMode(null), confirmMode !== null && !deleting);
 
   // Refs so loadPage is stable and never goes stale
   const loadingRef  = useRef(false);

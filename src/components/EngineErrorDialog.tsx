@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { AlertTriangle, RefreshCw, X } from "lucide-react";
 import { api } from "../lib/api";
+import { useEscapeKey } from "../lib/useEscapeKey";
 
 interface Props {
   error: string;
@@ -23,6 +24,7 @@ interface Props {
 //   - Missing CUDA DLL (clean reinstall fixes)
 export function EngineErrorDialog({ error, reloading, onDismiss }: Props) {
   const [retrying, setRetrying] = useState(false);
+  useEscapeKey(onDismiss);
 
   const handleRetry = async () => {
     if (retrying || reloading) return;

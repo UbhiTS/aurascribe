@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { Mic, MicOff, Square, Clock, ExternalLink, X, Volume2, Hourglass } from "lucide-react";
 import { api, ApiError } from "../lib/api";
 import type { AutoCaptureState } from "../lib/api";
+import { useEscapeKey } from "../lib/useEscapeKey";
 import { MicAudioProvider } from "../lib/MicAudioContext";
 import { VuMeter } from "./VuMeter";
 import { Waveform } from "./Waveform";
@@ -62,6 +63,7 @@ export function RecordingBar({
   const [elapsed, setElapsed] = useState(0);
   const [micError, setMicError] = useState<MicError | null>(null);
   const [openingSettings, setOpeningSettings] = useState(false);
+  useEscapeKey(() => setMicError(null), micError !== null);
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const selectedDeviceName = devices.find((d) => d.index === deviceIndex)?.name ?? null;
 
