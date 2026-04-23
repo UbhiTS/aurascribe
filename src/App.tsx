@@ -272,6 +272,20 @@ export default function App() {
         setAppStatus((s) => s ? { ...s, is_recording: true, current_meeting_id: meetingId } : s);
         // Refresh for `active_audio_device` (not carried on the WS event).
         api.status().then(setAppStatus).catch(() => {});
+        // If a DIFFERENT meeting just started (post manual-stop auto-fire,
+        // a second manual start, HMR re-adopt landing on a new id), reset
+        // the Live Feed slot to the new id and clear the previous
+        // meeting's transcript/intel. When the same id is re-broadcast
+        // (idempotent WS), the guard skips the reset so we don't wipe a
+        // running session. handleMeetingStarted performs the same reset
+        // synchronously for manual starts, so running both is harmless.
+        if (liveMeetingIdRef.current !== meetingId) {
+          setLiveMeetingId(meetingId);
+          setLiveMeeting(null);
+          setLiveUtterances([]);
+          setLivePartial(null);
+          setLiveIntel(EMPTY_LIVE_INTEL);
+        }
       }
       if (msg.event === "done" && msg.meeting_id) {
         // Clear is_recording immediately — otherwise an auto-capture
@@ -282,6 +296,9 @@ export default function App() {
         setRefreshKey((k) => k + 1);
         // Refresh the live meeting card with its finalized data (summary, action items, vault_path).
         // Only the live pane gets updated — review's meeting is untouched.
+        // The transcript, intel, and id stay populated — the Live Feed
+        // keeps showing the stopped meeting until a new recording
+        // starts and the status:"recording" handler below resets them.
         if (msg.meeting_id === liveMeetingIdRef.current) {
           api.meetings.get(msg.meeting_id).then(setLiveMeeting).catch(() => {});
         }
@@ -337,6 +354,10 @@ export default function App() {
 
   const handleMeetingStopped = () => {
     setAppStatus((s) => s ? { ...s, is_recording: false, current_meeting_id: null, active_audio_device: null } : s);
+    // The Live Feed intentionally keeps the finalized transcript,
+    // summary, and intel on screen after stop — clearing only happens
+    // when the NEXT recording starts (see the status:"recording" WS
+    // handler below, and handleMeetingStarted for the manual path).
   };
 
   // Authoritative — sourced from /api/status (config.OBSIDIAN_VAULT). This

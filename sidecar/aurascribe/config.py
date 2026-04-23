@@ -707,7 +707,7 @@ DAILY_BRIEF_AUTO_REFRESH: bool = _cfg_bool("daily_brief_auto_refresh", False)
 AUTO_CAPTURE_ENABLED: bool = _cfg_bool("auto_capture_enabled", True)
 # Seconds of sustained speech before we auto-fire start_meeting. Lower =
 # snappier (but may fire on a cough); higher = slower + more conservative.
-AUTO_CAPTURE_START_SPEECH_SEC: float = _cfg_float("auto_capture_start_speech_sec", 1.5)
+AUTO_CAPTURE_START_SPEECH_SEC: float = _cfg_float("auto_capture_start_speech_sec", 3.0)
 # Seconds of sustained silence during an auto-started recording before we
 # auto-fire stop_meeting. Manually-started recordings ignore this — they
 # always run until the user clicks Stop. Default 30s — short enough that
@@ -743,7 +743,7 @@ def reload_auto_capture_from_file() -> None:
     _user_config.clear()
     _user_config.update(fresh)
     AUTO_CAPTURE_ENABLED = _cfg_bool("auto_capture_enabled", True)
-    AUTO_CAPTURE_START_SPEECH_SEC = _cfg_float("auto_capture_start_speech_sec", 1.5)
+    AUTO_CAPTURE_START_SPEECH_SEC = _cfg_float("auto_capture_start_speech_sec", 3.0)
     AUTO_CAPTURE_STOP_SILENCE_SEC = _cfg_float("auto_capture_stop_silence_sec", 30.0)
     AUTO_CAPTURE_VAD_THRESHOLD = _cfg_float("auto_capture_vad_threshold", VAD_THRESHOLD)
     AUTO_CAPTURE_COUNTDOWN_AFTER_SILENCE_SEC = _cfg_float(

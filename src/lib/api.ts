@@ -497,8 +497,14 @@ export const api = {
       }),
   },
   meetings: {
-    list: (days = 2, limit = 20, offset = 0) =>
-      request<Meeting[]>(`/meetings?days=${days}&limit=${limit}&offset=${offset}`),
+    list: (days = 2, limit = 20, offset = 0, date?: string) => {
+      const params = new URLSearchParams();
+      if (date) params.set("date", date);
+      else params.set("days", String(days));
+      params.set("limit", String(limit));
+      params.set("offset", String(offset));
+      return request<Meeting[]>(`/meetings?${params.toString()}`);
+    },
     bulkDelete: (ids: string[]) =>
       request<{ ok: boolean; deleted: number }>("/meetings/bulk-delete", {
         method: "POST",

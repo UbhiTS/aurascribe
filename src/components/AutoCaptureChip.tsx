@@ -72,7 +72,10 @@ export function AutoCaptureChip({ state, setState }: Props) {
 
   const { enabled, state: kind } = state;
   const duringRecording = kind === "recording";
-  const switchDisabled = busy || duringRecording;
+  // Mid-recording we still allow toggling: turning it off means "once this
+  // recording stops, don't auto-start again" (the active recording itself
+  // keeps going). `busy` is only about the in-flight HTTP round-trip.
+  const switchDisabled = busy;
 
   const { subStatus, iconClass, subStatusClass, title } = (() => {
     if (!enabled) {
@@ -109,7 +112,7 @@ export function AutoCaptureChip({ state, setState }: Props) {
         subStatus: null,
         iconClass: "text-red-400",
         subStatusClass: "",
-        title: "Recording in progress. Auto-capture will resume listening after you stop.",
+        title: "Recording in progress. Toggle to control whether auto-capture resumes once this recording ends — the active recording itself keeps running until you stop it.",
       };
     }
     // listening

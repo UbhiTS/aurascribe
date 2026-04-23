@@ -33,6 +33,7 @@ import aiosqlite
 
 from aurascribe.config import (
     DB_PATH,
+    LLM_CONTEXT_TOKENS,
     MY_SPEAKER_LABEL,
     PROMPTS_DIR,
     RT_HIGHLIGHTS_DEBOUNCE_SEC,
@@ -66,6 +67,15 @@ _BUNDLED_DEFAULT = Path(__file__).resolve().parent / PROMPT_FILENAME
 # JSON code-fence stripper — local LLMs frequently wrap output in ```json...```
 # even when the prompt forbids it. We tolerate both fenced and naked output.
 _FENCE_RE = re.compile(r"^```(?:json)?\s*|\s*```$", re.IGNORECASE | re.MULTILINE)
+
+# Output budget for each realtime-intel call. `chat()`'s default of 2048 is
+# too tight for structured JSON carrying several highlights plus a support
+# paragraph — modern mid-sized local models blow through it and every run
+# dies with LLMTruncatedError (no broadcast = the UI never updates). We
+# scale the cap with the configured context window so small-context setups
+# still leave room for the prompt, while large-context setups get enough
+# headroom that truncation is rare.
+_REALTIME_INTEL_MAX_TOKENS = max(4096, min(8192, int(LLM_CONTEXT_TOKENS * 0.04)))
 
 
 BroadcastFn = Callable[[dict], Awaitable[None]]
@@ -357,7 +367,7 @@ class RealtimeIntelligence:
         )
 
         log.info("realtime intel: %d utterances in window, calling LLM", len(rows))
-        raw = await chat(prompt)
+        raw = await chat(prompt, max_tokens=_REALTIME_INTEL_MAX_TOKENS)
         state.last_run_ts = time.monotonic()
         state.consecutive_failures = 0
 

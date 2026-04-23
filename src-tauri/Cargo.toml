@@ -21,6 +21,11 @@ serde_json = "1"
 # Native error dialogs for pre-window startup failures (sidecar spawn, Tauri
 # context build). On Windows this resolves to MessageBoxW — no extra deps.
 rfd = "0.15"
+# Cross-platform process enumeration. Used at startup to detect and kill
+# orphan Python sidecars left behind by a prior AuraScribe crash, so the
+# fresh sidecar is guaranteed the canonical port (8765) and the frontend
+# doesn't end up talking to stale code.
+sysinfo = { version = "0.33", default-features = false, features = ["system"] }
 
 [profile.release]
 panic = "abort"

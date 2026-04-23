@@ -127,16 +127,31 @@ async def monitor_stop() -> dict:
 
 
 @router.get("")
-async def list_meetings(limit: int = 20, offset: int = 0, days: int = 2) -> list[dict]:
-    cutoff = (datetime.now() - timedelta(days=days)).isoformat()
+async def list_meetings(
+    limit: int = 20,
+    offset: int = 0,
+    days: int = 2,
+    date: str | None = None,
+) -> list[dict]:
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
-        cursor = await db.execute(
-            "SELECT id, title, started_at, ended_at, status, vault_path, "
-            "       last_tagged_at, last_recomputed_at "
-            "FROM meetings WHERE started_at >= ? ORDER BY started_at DESC LIMIT ? OFFSET ?",
-            (cutoff, limit, offset),
-        )
+        if date:
+            cursor = await db.execute(
+                "SELECT id, title, started_at, ended_at, status, vault_path, "
+                "       last_tagged_at, last_recomputed_at "
+                "FROM meetings WHERE started_at LIKE ? "
+                "ORDER BY started_at DESC LIMIT ? OFFSET ?",
+                (f"{date}%", limit, offset),
+            )
+        else:
+            cutoff = (datetime.now() - timedelta(days=days)).isoformat()
+            cursor = await db.execute(
+                "SELECT id, title, started_at, ended_at, status, vault_path, "
+                "       last_tagged_at, last_recomputed_at "
+                "FROM meetings WHERE started_at >= ? "
+                "ORDER BY started_at DESC LIMIT ? OFFSET ?",
+                (cutoff, limit, offset),
+            )
         rows = await cursor.fetchall()
     return [dict(r) for r in rows]
 

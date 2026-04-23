@@ -250,6 +250,11 @@ fn spawn_sidecar(app: &AppHandle) -> Result<Child, String> {
         ));
     }
 
+    // Clear any orphan sidecars from a prior crashed/force-killed run before
+    // spawning our own. Otherwise the oldest zombie keeps port 8765 and the
+    // frontend happily talks to stale code without the user ever knowing.
+    kill_orphan_sidecars();
+
     let mut cmd = if let Some(py) = launch.python {
         let mut c = Command::new(py);
         c.arg(&launch.target);
@@ -263,4 +268,65 @@ fn spawn_sidecar(app: &AppHandle) -> Result<Child, String> {
         .stderr(Stdio::inherit())
         .spawn()
         .map_err(|e| format!("Could not spawn sidecar process: {e}"))
+}
+
+/// Scan the OS process table and terminate every live process that looks
+/// like an AuraScribe sidecar — matching either the bundled binary
+/// (`aurascribe-sidecar[.exe]`) or a Python interpreter running
+/// `sidecar/main.py`. Called before each fresh spawn so a crashed shell's
+/// zombies can't linger on 8765–8774 and confuse the frontend proxy.
+///
+/// Best-effort: a failure to kill (permissions, already exited) is logged
+/// and ignored. Never blocks startup on errors.
+fn kill_orphan_sidecars() {
+    use sysinfo::{Pid, ProcessesToUpdate, System};
+
+    let mut sys = System::new();
+    sys.refresh_processes(ProcessesToUpdate::All, true);
+    let self_pid = Pid::from_u32(std::process::id());
+
+    let mut killed = 0usize;
+    for (pid, proc) in sys.processes() {
+        if *pid == self_pid {
+            continue;
+        }
+        let name = proc.name().to_string_lossy().to_lowercase();
+        let cmdline = proc
+            .cmd()
+            .iter()
+            .map(|s| s.to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_lowercase();
+
+        // The bundled release binary is named aurascribe-sidecar[.exe];
+        // in dev mode it's python.exe running a path ending in
+        // sidecar/main.py (or sidecar\main.py on Windows).
+        let looks_like_sidecar = name.contains("aurascribe-sidecar")
+            || cmdline.contains("aurascribe-sidecar")
+            || cmdline.contains("sidecar/main.py")
+            || cmdline.contains("sidecar\\main.py");
+
+        if looks_like_sidecar {
+            if proc.kill() {
+                killed += 1;
+                eprintln!(
+                    "[aurascribe] killed orphan sidecar pid={} name={}",
+                    pid, name
+                );
+            } else {
+                eprintln!(
+                    "[aurascribe] could not kill orphan sidecar pid={} name={}",
+                    pid, name
+                );
+            }
+        }
+    }
+
+    if killed > 0 {
+        // TCP sockets land in TIME_WAIT briefly after a process exits.
+        // Give them a beat so the fresh sidecar binds to 8765 cleanly
+        // instead of falling through to 8766/8767/...
+        std::thread::sleep(std::time::Duration::from_millis(300));
+    }
 }

@@ -661,13 +661,21 @@ class MeetingManager:
     async def _finalize_meeting(self, meeting_id: str, summarize: bool = False) -> dict:
         utterances = await self._load_utterances(meeting_id)
         if not utterances:
+            # No transcript pills = nothing worth keeping. Drop the meeting
+            # row entirely (instead of leaving a `status=done` orphan the
+            # user has to tidy up by hand) and unlink the audio file the
+            # capture pipeline recorded in case silence was captured.
             async with aiosqlite.connect(DB_PATH) as db:
-                await db.execute(
-                    "UPDATE meetings SET status='done', ended_at=? WHERE id=?",
-                    (datetime.now().isoformat(), meeting_id),
-                )
+                await db.execute("DELETE FROM utterances WHERE meeting_id = ?", (meeting_id,))
+                await db.execute("DELETE FROM meetings WHERE id = ?", (meeting_id,))
                 await db.commit()
-            return {"meeting_id": meeting_id, "error": "No speech detected"}
+            audio_path = AUDIO_DIR / f"{meeting_id}.opus"
+            if audio_path.exists():
+                try:
+                    audio_path.unlink()
+                except Exception as e:
+                    log.warning("could not delete empty-meeting audio %s: %s", audio_path, e)
+            return {"meeting_id": meeting_id, "error": "No speech detected", "dropped": True}
 
         async with aiosqlite.connect(DB_PATH) as db:
             db.row_factory = aiosqlite.Row
