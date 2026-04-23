@@ -1,212 +1,159 @@
 # AuraScribe
 
-Windows-native, always-on meeting transcription with speaker identification, live AI coaching, and Obsidian integration. Everything runs locally — audio, models, and summaries never leave the machine.
+Always-on, fully-local meeting transcription for Windows and macOS. Hands-free start/stop on sustained speech, live AI coaching while you talk, customer-organized notes in Obsidian. Audio, models, and summaries never leave your machine.
 
-Built as a Tauri 2 desktop app with a Python sidecar. ASR via [faster-whisper](https://github.com/SYSTRAN/faster-whisper) (CTranslate2 with a CUDA or CPU backend). Speaker diarization via [pyannote.audio](https://github.com/pyannote/pyannote-audio) 3.1. LLM calls go to any OpenAI-compatible endpoint — [LM Studio](https://lmstudio.ai) locally by default, or OpenAI / OpenRouter / Gemini / Anthropic-compat proxies for frontier models.
-
-Runs on any modern Windows PC — GPU recommended, but **it works on CPU too**. The app probes your hardware at startup and picks appropriate Whisper defaults (model size, device, precision).
+Tauri 2 desktop app + Python sidecar. ASR via [faster-whisper](https://github.com/SYSTRAN/faster-whisper). Diarization via [pyannote.audio](https://github.com/pyannote/pyannote-audio) 3.1. LLM via any OpenAI-compatible endpoint — [LM Studio](https://lmstudio.ai) by default, or OpenAI / Gemini / OpenRouter / Anthropic-compat for frontier models. The sidecar probes hardware at startup and picks Whisper defaults that fit; CPU-only machines work too.
 
 ---
 
 ## Install
 
-Two ways in, depending on who you are.
-
-### As a user — grab an installer
+### As a user
 
 Releases: https://github.com/UbhiTS/aurascribe/releases
 
-Two flavors per release, pick one:
-
-| Installer | When to pick it | Installer size | On disk after first launch |
+| Installer | Pick if | Installer | On disk |
 |---|---|---|---|
-| **AuraScribe-CUDA-setup.exe** | You have an NVIDIA GPU (any RTX card). Fastest transcription + GPU-accelerated diarization. On first launch the sidecar streams a ~6 GB CUDA DLL bundle (four zip parts + a manifest) from the GitHub Release into its install dir. Plan ~10–20 min on typical broadband before the app is usable. | ~140 MB | ~6 GB |
-| **AuraScribe-CPU-setup.exe** | No GPU, or you want the smaller install. Transcription is ~5–10× slower but still usable. | ~260 MB | ~700–900 MB |
+| **AuraScribe-CUDA-setup.exe** | NVIDIA GPU. Streams a ~6 GB CUDA bundle on first launch (~10–20 min on broadband). | ~140 MB | ~6 GB |
+| **AuraScribe-CPU-setup.exe** | No GPU, or smaller install. ~5–10× slower transcription, still usable. | ~260 MB | ~700–900 MB |
 
-Both install per-user to `%LOCALAPPDATA%\Programs\AuraScribe` — no admin rights needed. User data (DB, audio, logs, models) lives under `%APPDATA%\AuraScribe` and survives uninstall.
+Per-user install at `%LOCALAPPDATA%\Programs\AuraScribe` (no admin). Data lives at `%APPDATA%\AuraScribe` and survives uninstall.
 
-Not sure? Install CUDA — it works on machines without a GPU too, but you'll still pay for the ~6 GB DLL download on first launch.
+The CUDA bundle is split + streamed (not shipped in the installer) because the full CUDA payload is ~6 GB — NSIS can't mmap that on the CI runner, and GitHub release assets cap at 2 GB. CI bin-packs heavy files into `<version>.partN.zip` files; the sidecar reads `<version>.manifest.txt` on first launch and reassembles the original layout.
 
-**Why the CUDA variant streams its DLLs on first launch instead of shipping them in the installer**: the full CUDA payload (PyTorch cu128 + cuBLAS/cuDNN wheels + CUDA kernel DLLs) is ~6 GB. NSIS's 32-bit makensis (and WiX's light.exe) both crash / OOM when asked to mmap >1 GB of data on the GitHub runner, and GitHub release assets are capped at 2 GB per file. The split step in CI bin-packs every file ≥ 50 MB plus the `_internal/nvidia/` tree into multiple `<version>.partN.zip` files (each <1.8 GB) listed in `<version>.manifest.txt`. The sidecar reads the manifest on first launch, downloads + extracts each part, and restores the original PyInstaller layout.
-
-### As a developer — from source
+### As a developer
 
 ```powershell
-# 1. Tauri CLI (one-time, global)
 cargo install tauri-cli --version "^2.0"
-
-# 2. Frontend + Rust deps
 npm install
-
-# 3. Python sidecar — 3.13 venv at repo root
 py -3.13 -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -e ".\sidecar[all]"
 
-# 4. If you have an NVIDIA GPU, grab CUDA torch (pyannote diarization
-#    only goes to GPU with a CUDA-enabled torch wheel — ctranslate2 has
-#    its own CUDA path and is independent):
+# NVIDIA GPU? Swap in the CUDA torch wheel (pyannote needs it; ctranslate2 has its own CUDA path):
 pip install --upgrade --force-reinstall --index-url https://download.pytorch.org/whl/cu128 torch torchaudio
 
-# 5. Run dev
 npm run tauri:dev
 ```
 
-On first launch you'll see a welcome dialog describing what hardware was detected and which defaults were chosen. Open **Settings** to configure the LLM endpoint, HuggingFace token, Obsidian vault, or override any of the ASR defaults. Everything persists in `config.json` inside the data directory.
+First launch shows a welcome dialog with your detected hardware and the chosen Whisper defaults. Open **Settings** to configure the LLM endpoint, HuggingFace token, Obsidian vault, or override anything.
 
 ### Requirements
 
-- **OS** — Windows 11 with WebView2 runtime (preinstalled on current builds).
-- **GPU** — *optional*. Any NVIDIA RTX card (20/30/40/50 series) is ideal. GTX 10-series works with `int8` compute. No NVIDIA card → CPU fallback.
-- **Rust** — [rustup](https://rustup.rs) + MSVC Build Tools (only if building from source).
-- **Node.js** — 20+ (only if building from source).
-- **Python** — 3.13 (sidecar targets `>=3.13`; only if building from source).
-- **An OpenAI-compatible LLM endpoint** — LM Studio at `http://127.0.0.1:1234/v1` is the default, but anything that speaks `/v1/chat/completions` works. Long-context models (100k+) unlock richer Daily Briefs.
-- **HuggingFace token** — free; required to download the pyannote pipeline. Accept the licences on `pyannote/speaker-diarization-3.1`, `pyannote/segmentation-3.0`, and `pyannote/wespeaker-voxceleb-resnet34-LM` with the same account. A 401/"GatedRepo" error at load time means a licence still needs accepting.
+- **OS** — Windows 11 (WebView2 preinstalled) or macOS 12+ (arm64).
+- **GPU** — *optional*. Any NVIDIA RTX is ideal; GTX 10-series works on `int8`; no GPU → CPU.
+- **HuggingFace token** — free, required for pyannote. Accept the gate on `pyannote/speaker-diarization-3.1`, `pyannote/segmentation-3.0`, and `pyannote/wespeaker-voxceleb-resnet34-LM`.
+- **OpenAI-compat LLM endpoint** — LM Studio at `http://127.0.0.1:1234/v1` is the default. Long-context models (100k+) make Daily Briefs richer.
+- From source: Rust + MSVC Build Tools, Node 20+, Python 3.13.
 
 ---
 
 ## Features
 
-### Adaptive hardware use
-- **Auto-detect at startup** — the sidecar probes `ctranslate2.get_cuda_device_count()` and `torch.cuda.is_available()` at import and picks defaults that fit: `large-v3-turbo + cuda + float16` on ≥8 GB VRAM, `int8_float16` on 4-8 GB, `medium + int8` on <4 GB, `small + cpu + int8` if no GPU.
-- **Header chips** show exactly where each pipeline is running — `Whisper · large-v3-turbo · GPU` and `Diarize · GPU` (emerald) or `CPU` (amber). You always know where the compute is happening.
-- **Override anything** — Settings → Speech & Transcription has dropdowns for `whisper_device`, `whisper_compute_type`, and a free-text model field. Auto-detect comes back when you clear the override.
+**Adaptive hardware** — sidecar probes `ctranslate2` + `torch.cuda` at boot; picks `large-v3-turbo + cuda + float16` on ≥8 GB VRAM, scales down to `small + cpu + int8` if no GPU. Header chips show where each pipeline runs (Whisper, Diarize). Override any default in Settings.
 
-### Audio capture
-- **Three source modes** — **Microphone**, **System Audio** (WASAPI loopback off your speakers, captures remote participants in Zoom/Teams/Meet), or **Mix (Mic + System Audio)** with Speex-AEC cancelling the loopback echo out of the mic signal so you don't get doubled transcripts when running speakers-in-room. Last-used mode + mic + speaker are remembered by device name across restarts, with graceful fallback to the OS defaults when a device disappears.
-- **Pre-recording monitor** — the VU meter and live waveform animate against the *selected* source before you hit Start, so you can verify the right mic/speaker is picked and that the signal looks healthy. The sidecar broadcasts `audio_level` frames at ~30Hz over the WebSocket; the renderer uses them directly when fresh, falling back to the browser `AnalyserNode` when the sidecar is idle.
-- **Mic-permission detection** — `PortAudioError` on stream-open is translated to a structured 403 with `kind=permission`. The frontend shows a modal with a one-click "Open Windows mic settings" button that launches `ms-settings:privacy-microphone`.
+**Hands-free auto-capture** — opens a lightweight VAD stream when idle; auto-starts a meeting on sustained speech, auto-stops after sustained silence. Once silence has lasted past a configurable gate (default 5s), the Stop button morphs into a live `Stop in MM:SS` countdown so you know exactly how long until auto-stop fires — click to stop now, or let it run out. Manual recordings ignore auto-stop.
 
-### Transcription
-- **Live transcription** — ~10s VAD-gated chunks through faster-whisper. Silence between utterances is skipped.
-- **Speculative partials** — a 1.5s speculative loop transcribes the tail of the audio buffer so a partial line appears while you speak, updated until the next chunk finalizes.
-- **Session re-adoption** — if the UI reloads mid-recording (HMR, window refresh, dev restart), the frontend re-attaches to the sidecar's in-flight meeting instead of dropping the stream.
-- **Live-tail scroll pinning** — auto-scrolls the transcript only when you're parked at the live edge. Scrolled up reading? The viewport stays put. `overflow-anchor` stabilises layout shifts from the growing live partial bubble.
+**Three audio sources** — **Microphone**, **System Audio** (WASAPI loopback / BlackHole captures Zoom/Teams/Meet participants), or **Mix** with Speex-AEC cancelling the loopback echo out of the mic so speakers-in-room don't double up. Last-used source persists by device name. Pre-recording VU + waveform animate the *selected* source so you can verify before hitting Start. Mic-permission failures surface a one-click "Open mic settings" modal.
 
-### Speakers (Voices)
-- **Diarization** — pyannote 3.1 segments each chunk into turns and emits a 256-dim speaker embedding per utterance.
-- **Tag-as-you-go** — no upfront enrollment. Click a pill, pick or create a Voice; the embedding folds into that Voice's pool, and future chunks match via cosine distance against the whole pool.
-- **Provisional clustering** — unknown speakers in a live meeting are clustered in-memory into `Speaker 1`, `Speaker 2`... rather than a single "Unknown" bucket. Renaming a provisional label folds every matched embedding into the real Voice.
-- **Per-utterance re-assignment** — fix a mistag on any line; the old embedding is removed from its prior pool and moved to the new one, so mistakes are fully lossless.
-- **Recompute** — after tagging, re-run diarization over a saved meeting to relabel every utterance against the current Voices DB.
-- **Voice library** — Voices page shows every tagged speaker with sample count (≥3 samples = active in auto-match), playable snippets, merge, delete, rename, recolour.
+**Live transcription** — VAD-gated chunks through faster-whisper. A 1.5s speculative loop transcribes the audio tail so partial lines appear while you speak. UI re-adopts in-flight recordings across HMR / dev restarts. Live-tail scroll pinning: scrolled up reading? viewport stays put.
 
-### Real-time intelligence
-- **Live highlights panel** — debounced LLM call (~20s after the last utterance, hard-capped at 60s) extracts new highlights, action items for you, and action items for other speakers.
-- **Support intelligence** — a 2-5 bullet side-panel card suggesting what to say next: specific tools/numbers to mention, counterarguments to pre-empt, clarifying questions to ask. Refreshed on every tick.
-- **Progress bar** — the Live Intelligence panel visualises both timers (20s debounce + 60s max) so you can see when the next refresh will fire.
-- **Editable prompts** — `live_intelligence.md` and `daily_brief.md` live under `APP_DATA/prompts/` (seeded from bundled copies on first run). One-click "open in editor" from Settings; edits are picked up on the next LLM call, no restart needed.
+**Speakers / Voices** — pyannote 3.1 emits a 256-dim embedding per utterance. Tag-as-you-go (no upfront enrollment); the embedding folds into the Voice's pool, future chunks match via cosine distance. Unknowns are clustered live into `Speaker 1/2/…` rather than dumped into one bucket. Per-utterance re-assignment is fully lossless. Recompute re-runs diarization over a saved meeting against the current Voices DB. The Voices page lists every speaker with samples, snippets, merge / delete / rename / recolour.
 
-### Daily Brief
-- **End-of-day rollup** — aggregates every meeting on a given date into a single briefing: tl;dr, highlights, decisions, open threads, action items (yours + others'), per-person takeaways, themes, tomorrow's focus, coaching notes.
-- **Auto-refresh** — marked stale and rebuilt in the background whenever a meeting on that date finishes. A `daily_brief_updated` WS event pushes the UI when the refresh lands.
-- **Long-context aware** — input budget is tuned to the configured LLM context window; long-context models let a full day of transcripts fit in one call.
+**Live AI coaching** — debounced LLM call (~20s after last utterance, hard-cap 60s) extracts highlights + action items (yours and others'). A 2–5 bullet support-intelligence card suggests what to say next: tools to mention, counterarguments to pre-empt, clarifying questions. Live title refinement: same call returns an entity + topic so the meeting title sharpens as it progresses (freeze with the lock icon to stop overrides). A progress bar shows when the next refresh fires.
 
-### Meeting editing
-- **Rename** — mid-recording or post-hoc; Obsidian file is moved to match.
-- **Trim** — drop everything before or after a timestamp. Remaining utterances rebase to 0; `started_at` shifts accordingly.
-- **Split** — cut a meeting in two at a timestamp. Both halves get their own Obsidian file and cleared summaries.
-- **Bulk delete** — clear by ID list or "everything in the last N days".
-- **Summarize + suggest title** — one LLM call produces both. Placeholder-titled meetings (`Transcription 2026-04-18 14:22`) auto-rename to the suggested title; user-chosen titles are never overwritten.
-- **Click-to-play** — every utterance has a Play icon that seeks into the Opus recording at that exact offset.
+**Customer-organized vault** — Obsidian writer routes each finished meeting into a bucket under `<vault>/`:
 
-### First-run UX
-- **Welcome dialog** (one-time, per install) — shown after models load, explains the detected hardware and the three defaults chosen (model, device, precision), with an Open Settings shortcut.
-- **Staged load progress** — splash shows `Downloading Whisper model 'large-v3-turbo'... (1-5 min, one-time)` on first run, `Loading...` on subsequent, then `Loading speaker diarization pipeline...`. No opaque "Loading..." silences for 2 minutes.
-- **CPU-mode chip** — amber `CPU mode` badge + tooltip with the fix hint if Whisper is stuck on CPU despite the app expecting a GPU.
+```
+00-Inbox/YYYY/MM/                     unclassified / low-confidence
+10-Customers/<Customer>/
+    <Customer>.md                     MOC, seeded on first meeting
+    Meetings/YYYY/MM/<filename>.md
+    People/<Name>.md
+    Notes/{Architecture,Stakeholders,Open-Risks,Commercials,Notes}.md
+20-Internal/   (Meetings/, People/, Notes/)
+30-Interviews/YYYY/MM/
+40-Personal/YYYY/MM/
+50-Daily/YYYY/MM/YYYY-MM-DD.md
+90-Templates/  (seeded on boot)
+99-Archive/    (manual)
+```
 
-### Error handling / diagnostics
-- **React error boundary** — a blank-screen render error becomes a recoverable card with the message, component stack, and a Reload button. Your recording keeps running in the sidecar.
-- **Sidecar crash dumps** — `sys.excepthook` writes `crash-YYYYMMDD-HHMMSS.log` under `APP_DATA/logs/` with full traceback before exit.
-- **Rust panic hook** — panics during Tauri startup write `crash-<unix-secs>-rust.log` to `%APPDATA%\AuraScribe\logs\` alongside the Python crashes.
-- **Rotating file log** — `APP_DATA/logs/sidecar.log` keeps 5× 5 MB files of everything the sidecar logs — plenty for debugging recent issues.
-- **Startup heartbeat poll** — the UI pings `/api/status` every 30s after the engine is ready. If the sidecar crashes, the header flips to `Sidecar unreachable` instead of looking healthy but being dead.
-- **Startup extras check** — on boot the sidecar logs which optional extras (`asr` / `diarization` / `llm`) are installed vs missing, with install-command hints for the missing ones.
+Bucket + customer are inferred at finalize: cheap speaker-folder lookup first (every named speaker → who they belong to → majority wins), LLM fallback gated at 0.5 confidence (`meeting_bucket.md`). Low-confidence routes land in Inbox for triage. The customer name in `vault_customer` triggers a one-time bootstrap of the MOC + canonical Notes/ files.
 
-### Storage & integrations
-- **SQLite** — meetings, utterances (with pyannote embeddings), voices, voice-embedding snippets. Lives in `%APPDATA%\AuraScribe\aurascribe.db` by default (override via Settings → Data directory).
-- **Opus audio** — every meeting records a per-meeting `.opus` file (16 kHz, 24 kbps mono) under `APP_DATA/audio/`. Powers click-to-play and the Recompute endpoint.
-- **Obsidian vault** — meeting notes, people notes, and daily briefs written under `<vault>/AuraScribe/{Meetings,People,Daily}`, organized `YYYY/MM/*.md`. Throttled live-updates during recording (15s or every 5 chunks, whichever trips first) so Obsidian sync watchers don't thrash.
-- **WebSocket feed** — single `/ws` channel broadcasts utterances, partials, status events, real-time intelligence, and daily-brief state changes.
+**Daily Brief** — end-of-day rollup of every meeting on a date: tl;dr, highlights, decisions, open threads, action items, per-person takeaways, themes, tomorrow's focus. Marked stale and rebuilt in the background when a meeting finishes (toggleable).
+
+**Meeting editing** — rename (Obsidian file moves to match), trim before/after a timestamp, split at a timestamp (both halves get their own files), bulk-delete by id list or "last N days", click-to-play any utterance into the Opus recording at that exact offset, summarize + suggest title in one LLM pass.
+
+**Editable prompts** — `live_intelligence.md`, `daily_brief.md`, `meeting_analysis.md`, `meeting_bucket.md` live under `APP_DATA/prompts/` (seeded from bundled defaults). One-click open from Settings; edits picked up on the next call.
+
+**Diagnostics** — React error boundary catches blank-screen renders; sidecar `sys.excepthook` writes `crash-YYYYMMDD-HHMMSS.log`; Rust panic hook writes `crash-<unix>-rust.log`; rotating file log (5 × 5 MB). Heartbeat polls `/api/status` every 30s — header flips to `Sidecar unreachable` if the process dies.
 
 ---
 
 ## Configuration
 
-Everything lives under a single **data directory** — pick it in Settings (default `%APPDATA%\AuraScribe`). The folder holds the SQLite database, per-meeting Opus recordings, Whisper model cache, logs, editable prompts, and `config.json` with your user settings. Copy that folder to a new machine or pass it to a fresh install to pick up where you left off.
-
-User-editable knobs (all in Settings UI, persisted to `config.json`):
+Everything sits under one **data directory** (default `%APPDATA%\AuraScribe`). The folder holds the SQLite DB, per-meeting `.opus` files, Whisper model cache, logs, editable prompts, and `config.json`. Copy it to migrate.
 
 | Key | Default | Purpose |
 |---|---|---|
-| `hf_token` | — | HuggingFace token for pyannote downloads |
-| `llm_base_url` | `http://127.0.0.1:1234/v1` | Root of the `/v1/chat/completions` endpoint |
-| `llm_api_key` | `lm-studio` | Provider API key (any non-empty string for LM Studio) |
-| `llm_model` | `local-model` | Model id the provider expects (`gpt-4o`, `gemini-2.0-flash`, etc.) |
-| `llm_context_tokens` | `4096` | Total context budget of the chosen model |
-| `whisper_model` | auto-detected | `large-v3-turbo` (GPU) or `small` (CPU). Any faster-whisper model id accepted. |
-| `whisper_device` | auto-detected | `cuda` if CUDA GPU present, else `cpu`. User-overridable. |
-| `whisper_compute_type` | auto-detected | `float16` (≥8 GB VRAM), `int8_float16` (4-8 GB), `int8` (CPU or <4 GB) |
-| `whisper_language` | `en` | ISO code or empty for auto-detect |
-| `my_speaker_label` | `Me` | How your voice is labelled in transcripts |
+| `hf_token` | — | HuggingFace token for pyannote |
+| `llm_base_url` | `http://127.0.0.1:1234/v1` | OpenAI-compat root |
+| `llm_api_key` | `lm-studio` | Provider key (any non-empty for LM Studio) |
+| `llm_model` | `local-model` | Model id (`gpt-4o`, `gemini-2.0-flash`, etc.) |
+| `llm_context_tokens` | `4096` | Total context budget |
+| `whisper_model` / `whisper_device` / `whisper_compute_type` | auto | Override the hardware-aware defaults |
+| `whisper_language` | `en` | ISO code; empty for auto-detect |
+| `my_speaker_label` | `Me` | How your voice is labelled |
 | `obsidian_vault` | — | Vault root; empty disables Obsidian writes |
-| `rt_highlights_debounce_sec` | `20` | Seconds after last utterance before an intel call fires |
-| `rt_highlights_max_interval_sec` | `60` | Hard cap between intel calls during continuous speech |
-| `rt_highlights_window_sec` | `180` | Transcript window the intel LLM sees |
+| `rt_highlights_debounce_sec` / `_max_interval_sec` / `_window_sec` | `20` / `60` / `180` | Live-intel cadence + transcript window |
+| `auto_capture_enabled` | `true` | Master switch for hands-free start/stop |
+| `auto_capture_start_speech_sec` | `1.5` | Sustained speech before auto-start |
+| `auto_capture_stop_silence_sec` | `30` | Sustained silence before auto-stop |
+| `auto_capture_countdown_after_silence_sec` | `5` | Silence before the Stop button shows the countdown |
+| `auto_capture_vad_threshold` | `0.5` | Listening sensitivity (raise in noisy rooms) |
 
-### Advanced Settings
-
-Expert-level knobs exposed via the **Advanced Settings** block at the bottom of the Settings page. Defaults match the values that shipped hard-coded before these became user-tunable — you shouldn't need to touch any of them unless you hit a specific behavior you want to tune.
+**Advanced** (Advanced Settings block — defaults match the old hard-coded values):
 
 | Key | Default | Purpose |
 |---|---|---|
-| `chunk_duration` | `10.0` | Seconds of audio per transcription chunk. Shorter = faster partials, more Whisper calls. |
-| `silence_duration` | `0.6` | Seconds of silence before VAD ends an utterance. Lower for fast talkers. |
-| `vad_threshold` | `0.5` | Silero VAD confidence gate [0–1]. Raise in noisy rooms; lower for quiet mics. |
-| `aec_tail_ms` | `200` | Echo-canceller tail length (ms) in Mix mode. Longer handles more room reverb; shorter converges faster. |
-| `voice_match_threshold_multi` | `0.55` | Cosine-distance gate for speaker match in group meetings. Lower = stricter. |
-| `voice_match_threshold_solo` | `0.70` | Same, but used when only one speaker has been heard so far. |
-| `voice_ratio_margin` | `0.80` | Best match must beat runner-up by this factor. Lower = pickier. |
-| `min_voice_samples` | `3` | Samples a Voice needs before it joins auto-matching. |
-| `provisional_threshold` | `0.50` | Cosine gate for clustering in-meeting unknowns into `Speaker 1/2/…`. |
-| `speculative_interval_sec` | `1.5` | How often the live-partial loop re-transcribes the current sentence. |
-| `speculative_window_sec` | `30.0` | Max seconds the partial bubble can show. It grows from the last committed chunk boundary up to this cap, so the bubble accumulates what's been said since the last full line — giving the user visible confirmation that nothing's been lost. |
-| `obsidian_write_interval_sec` | `15.0` | Update the live vault file at least this often during a meeting. |
-| `obsidian_write_chunks` | `5` | Or every N new chunks — whichever fires first. |
-| `daily_brief_auto_refresh` | `false` | When `true`, every finished meeting kicks off a Daily Brief regen in the background. Off by default — regen is a long LLM call; use the Refresh button on the Daily Brief page when you want it fresh. |
+| `chunk_duration` / `silence_duration` / `vad_threshold` | `10.0` / `0.6` / `0.5` | Audio chunk + VAD gating |
+| `aec_tail_ms` | `200` | Echo-canceller tail in Mix mode |
+| `voice_match_threshold_multi` / `_solo` / `voice_ratio_margin` / `min_voice_samples` | `0.55` / `0.70` / `0.80` / `3` | Speaker-match tuning |
+| `provisional_threshold` | `0.50` | Live `Speaker 1/2/…` clustering gate |
+| `speculative_interval_sec` / `_window_sec` | `1.5` / `30.0` | Live-partial loop |
+| `obsidian_write_interval_sec` / `_chunks` | `15.0` / `5` | Throttle live vault writes (whichever fires first) |
+| `daily_brief_auto_refresh` | `false` | Auto-regen brief when a meeting finishes |
 
-Settings UI shows the detected hardware next to the Speech section (e.g. `Detected: cuda · NVIDIA GeForce RTX 4090 · 24 GB VRAM`) and marks each override with a `custom` or `default` chip so you can see at a glance which values came from you vs the auto-detect.
+Settings UI shows the detected hardware (`Detected: cuda · NVIDIA RTX 4090 · 24 GB VRAM`) and tags each value `custom` / `default`. Most values need a sidecar restart; auto-capture knobs hot-reload. Sidecar bind: `SIDECAR_HOST` / `SIDECAR_PORT` env (default `127.0.0.1:8765`).
 
-A value change isn't live until the sidecar restarts — the Settings UI shows a "restart to apply" banner when a save diverges from the running process.
-
-Sidecar bind address is `SIDECAR_HOST` / `SIDECAR_PORT` env vars read by `main.py` (deployment concern, not a user setting) — defaults to `127.0.0.1:8765`.
+**DB policy** — pre-GA. Schema changes drop and recreate (no migrations). `db/database.py` bumps a `_CURRENT_SCHEMA_VERSION` string; mismatch → fresh DB on next boot.
 
 ---
 
 ## Architecture
 
 ```
-Tauri shell (Rust + WebView2)
+Tauri shell (Rust + WebView2 / WKWebView)
     │
-    ├── renders → React 19 UI (Vite + Tailwind + lucide-react + @fontsource/inter)
-    │                 │
-    │                 └── HTTP + WebSocket → Python sidecar (127.0.0.1:8765)
-    │                                              │
-    │                                              ├── faster-whisper       (ASR, CTranslate2; CUDA or CPU)
-    │                                              ├── pyannote.audio 3.1   (diarization + 256-dim embeddings)
-    │                                              ├── sounddevice / scipy  (mic capture, VAD, chunking)
-    │                                              ├── soundfile            (Opus wall-clock recorder)
-    │                                              ├── LLM client           (OpenAI-compat)
-    │                                              ├── SQLite (aiosqlite)   (meetings, voices, utterances, embeddings)
-    │                                              └── Obsidian writer      (Meetings/People/Daily markdown)
+    ├── React 19 UI (Vite + Tailwind + lucide-react)
+    │       │
+    │       └── HTTP + WebSocket → Python sidecar (127.0.0.1:8765)
+    │                                    │
+    │                                    ├── faster-whisper      (ASR; CUDA or CPU)
+    │                                    ├── pyannote.audio 3.1  (diarization + 256-dim embeddings)
+    │                                    ├── Silero VAD          (auto-capture + chunking)
+    │                                    ├── sounddevice / soxr  (mic capture, Speex-AEC)
+    │                                    ├── soundfile           (Opus recorder)
+    │                                    ├── LLM client          (OpenAI-compat)
+    │                                    ├── SQLite (aiosqlite)  (meetings, voices, embeddings, vault routing)
+    │                                    └── Obsidian writer     (bucket-routed markdown)
     │
-    ├── spawns/kills Python sidecar subprocess
-    ├── panics → %APPDATA%\AuraScribe\logs\crash-*-rust.log
-    └── rfd::MessageDialog on startup failure (sidecar spawn, Tauri init)
+    ├── spawns/kills sidecar subprocess
+    └── panics → APPDATA\AuraScribe\logs\crash-*-rust.log
 ```
 
-The sidecar binds to `127.0.0.1` only. CORS is locked to the Vite dev origin + Tauri webview schemes — external clients can't reach it. On Windows, the `nvidia-*-cu12` pip packages' `bin/` directories are registered via `os.add_dll_directory` at import time so CTranslate2 finds CUDA 12 runtimes without touching the system PATH.
+Sidecar binds to `127.0.0.1` only; CORS is locked to the Vite dev origin + Tauri webview schemes. On Windows, `nvidia-*-cu12` `bin/` directories are registered via `os.add_dll_directory` at import so CTranslate2 finds CUDA 12 runtimes without touching system PATH.
 
 ---
 
@@ -214,201 +161,91 @@ The sidecar binds to `127.0.0.1` only. CORS is locked to the Vite dev origin + T
 
 ```
 aurascribe/
-├── .github/workflows/
-│   └── release.yml                   CI: matrix CUDA/CPU builds → draft release
-├── src-tauri/                        Rust shell (Tauri 2)
-│   ├── src/lib.rs                    Sidecar spawn/kill, dev/prod path resolution,
-│   │                                 panic hook → crash log, fatal error dialogs
-│   └── tauri.conf.json               Window + NSIS bundle config
-├── src/                              React 19 + Vite + Tailwind
-│   ├── App.tsx                       Root state, heartbeat poll, WS dispatch, page router
-│   ├── main.tsx                      Vite entry → <ErrorBoundary><App /></ErrorBoundary>
-│   ├── components/
-│   │   ├── Shell.tsx                 Sidebar + Header layout
-│   │   ├── Sidebar.tsx               Memoised nav
-│   │   ├── Header.tsx                Status chips (WS, LLM, Obsidian, Whisper/Diarize devices)
-│   │   ├── RecordingBar.tsx          Start/Stop + mic picker + VU/Waveform + mic-perm modal
-│   │   ├── TranscriptView.tsx        Bubble list, follow-tail scroll, click-to-play, assign
-│   │   ├── MeetingList.tsx           Virtualised library list (memoised rows)
-│   │   ├── TitleSuggestPopover.tsx   AI title + summary piggyback
-│   │   ├── VuMeter.tsx / Waveform.tsx Mic-level + waveform (WebAudio)
-│   │   ├── Avatar.tsx / Logo.tsx     Pure presentational (React.memo)
-│   │   ├── ErrorBoundary.tsx         Class-component render-error catcher
-│   │   └── WelcomeDialog.tsx         First-run hardware summary (once per install)
-│   ├── pages/                        LiveFeed, MeetingLibrary, Review, Voices, DailyBrief, Settings
-│   └── lib/
-│       ├── api.ts                    Typed REST client + ApiError + types
-│       ├── useWebSocket.ts           Reconnecting WS with cancellation-safe effect
-│       ├── useLLMHealth.ts           Slow poll /api/models
-│       ├── useClockTick.ts           Interval-based re-render helper
-│       └── MicAudioContext.tsx       Shared WebAudio AnalyserNode for VU/Waveform
-├── sidecar/                          Python 3.13 backend
-│   ├── main.py                       uvicorn entry + logging config + crash excepthook
-│   ├── build.ps1                     PyInstaller driver (auto-aligns torch wheel to host GPU)
-│   ├── aurascribe-sidecar.spec       PyInstaller onedir config (bundles torch, pyannote, CUDA DLLs)
+├── .github/workflows/release.yml         CI: matrix CUDA/CPU builds → draft release
+├── src-tauri/                            Rust shell (Tauri 2)
+├── src/                                  React 19 + Vite + Tailwind
+│   ├── App.tsx                           Root state, heartbeat poll, WS dispatch, page router
+│   ├── components/                       Shell, Header, RecordingBar, TranscriptView,
+│   │                                     VuMeter, Waveform, AutoCaptureChip, …
+│   ├── pages/                            LiveFeed, MeetingLibrary, Review, Voices,
+│   │                                     DailyBrief, Settings
+│   └── lib/                              api.ts, useWebSocket, useLLMHealth, MicAudioContext
+├── sidecar/                              Python 3.13 backend
+│   ├── main.py                           uvicorn entry + crash excepthook
+│   ├── build.ps1                         PyInstaller driver (auto-aligns torch wheel to host GPU)
 │   └── aurascribe/
-│       ├── __init__.py               CUDA DLL wiring, torchcodec warning silence
-│       ├── api.py                    FastAPI app, CORS, lifespan, /ws, /api/status, /api/models,
-│       │                             /api/system/open-mic-settings, router mounting
-│       ├── config.py                 Hardware probe, data-dir + config.json loader,
-│       │                             auto-detected defaults
-│       ├── meeting_manager.py        Recording lifecycle, speculative loop, provisional clustering,
-│       │                             action-item extractor
-│       ├── routes/
-│       │   ├── _shared.py            manager singleton, ws_clients, broadcast_lock,
-│       │   │                         vault/analysis/deletion/voice helpers
-│       │   ├── meetings.py           CRUD + summarize + suggest-title + trim + split + transcript
-│       │   │                         + audio + rename-speaker + assign + recompute + intel-refresh
-│       │   ├── voices.py             Voice CRUD + merge + snippet-delete
-│       │   ├── settings.py           Data-dir + user-config (with auto-detect defaults surfaced)
-│       │   ├── daily_brief.py        GET + refresh + `regen_brief_for_meeting` hook
-│       │   └── intel.py              Prompt-file list + open + prompt-path
-│       ├── audio/capture.py          sounddevice capture, Silero VAD, Opus recorder,
-│       │                             MicUnavailableError translation
-│       ├── transcription/
-│       │   ├── engine.py             Protocol + StubEngine + StageCallback type
-│       │   └── whisper.py            faster-whisper + pyannote, voice pool matching,
-│       │                             runtime device introspection
-│       ├── llm/
-│       │   ├── client.py             OpenAI-compat chat wrapper + LLMUnavailableError
-│       │   ├── prompts.py            Prompt template loader (seeds APP_DATA/prompts)
-│       │   ├── analysis.py           Combined title + summary pass
-│       │   ├── realtime.py           Debounced live-intel loop
-│       │   ├── daily_brief.py        Daily rollup generator
-│       │   ├── sampling.py           Utterance window sampling
-│       │   ├── live_intelligence.md  User-editable
-│       │   └── daily_brief.md        User-editable
-│       ├── obsidian/writer.py        Meeting / people / daily-brief markdown writers
-│       └── db/database.py            SQLite schema + migrations
-├── package.json                      Node (frontend + Tauri CLI)
-│                                     Scripts: dev, build, tauri:dev, tauri:build,
-│                                     build:sidecar, package (= build:sidecar + tauri:build)
-└── vite.config.ts                    Dev proxy + manual vendor chunks (react, icons, fonts)
+│       ├── api.py                        FastAPI app, CORS, lifespan, /ws, /api/status
+│       ├── config.py                     Hardware probe, data-dir + config.json loader
+│       ├── auto_capture.py               VAD-driven start/stop monitor + state machine
+│       ├── meeting_manager.py            Recording lifecycle, speculative loop, finalize
+│       ├── routes/                       meetings, voices, settings, daily_brief, intel,
+│       │                                 plus _shared (singletons + helpers)
+│       ├── audio/                        sounddevice capture, Silero VAD, Opus recorder
+│       ├── transcription/                faster-whisper + pyannote, voice-pool matching
+│       ├── llm/                          client, prompts, analysis, realtime (live intel
+│       │                                 + title refinement), daily_brief, bucket_inference,
+│       │                                 plus user-editable .md prompts
+│       ├── obsidian/writer.py            Bucket-routed markdown writer + customer bootstrap
+│       └── db/database.py                SQLite schema + drop-and-recreate version gate
+├── package.json                          Scripts: dev, tauri:dev, tauri:build, build:sidecar, package
+└── vite.config.ts                        Dev proxy + manual vendor chunks
 ```
 
 ---
 
 ## REST / WebSocket surface
 
-The sidecar exposes a JSON API plus a single WebSocket for push events. Each feature area lives under its own router module — see [sidecar/aurascribe/routes/](sidecar/aurascribe/routes/) for the authoritative list. The headlines:
+Authoritative list lives in [sidecar/aurascribe/routes/](sidecar/aurascribe/routes/). Headlines:
 
-### Meetings (`/api/meetings/*`)
-- `POST /start` `{ title, device }` — begin recording (`403 {kind:"permission"|"unknown"}` on mic failure)
-- `POST /stop` `{ summarize }` — stop, finalize, optionally summarize
-- `GET /` `?limit=&offset=&days=` — recent meetings
-- `POST /bulk-delete` `{ ids }` · `DELETE /all?days=` — clear
-- `GET /{id}` · `DELETE /{id}` · `PATCH /{id}` — read / remove / rename
-- `GET /{id}/transcript` — utterances only
-- `GET /{id}/audio` — Opus stream (HTTP Range supported)
-- `POST /{id}/summarize` · `POST /{id}/suggest-title` — analysis passes
-- `POST /{id}/trim` `{ before, after }` · `POST /{id}/split` `{ at, new_title }`
-- `POST /{id}/rename-speaker` — bulk rename + embedding fold-in
-- `POST /{id}/utterances/{uid}/assign` — tag one line
-- `POST /{id}/intel/refresh` — force a real-time intel pass
-- `POST /{id}/recompute` — re-diarize a past meeting against current Voices
+**Meetings** (`/api/meetings/*`) — `POST /start`, `POST /stop`, `GET /` (paged), `GET/DELETE/PATCH /{id}`, `/{id}/transcript`, `/{id}/audio` (Opus, Range), `/summarize`, `/suggest-title`, `/title-lock`, `/trim`, `/split`, `/rename-speaker`, `/utterances/{uid}/assign`, `/intel/refresh`, `/recompute`, `POST /bulk-delete`, `DELETE /all?days=`.
 
-### Voices (`/api/voices/*`)
-- `GET /` · `GET /{id}` — list / detail
-- `PATCH /{id}` · `DELETE /{id}` — rename / recolour / delete
-- `DELETE /{id}/snippets/{sid}` — remove one embedding from the pool
-- `POST /merge` `{ from_id, into_id }` — fold one Voice into another
+**Voices** (`/api/voices/*`) — list, detail, rename / recolour / delete, snippet-delete, `POST /merge`.
 
-### Settings (`/api/settings/*`)
-- `GET/PUT /data-dir` — the APP_DATA pointer
-- `GET/PUT /config` — all user-editable knobs; response includes `requires_restart`
+**Settings** (`/api/settings/*`) — `GET/PUT /data-dir`, `GET/PUT /config` (response carries `requires_restart`).
 
-### Daily Brief (`/api/daily-brief/*`)
-- `GET /?date=YYYY-MM-DD` — cached brief + meeting list for the day
-- `POST /refresh?date=` — force regen (blocks until done)
+**Daily Brief** (`/api/daily-brief/*`) — `GET /?date=`, `POST /refresh?date=`.
 
-### Intel (`/api/intel/*`)
-- `GET /prompts` · `POST /open-prompt` `{ filename }` — list + open user-editable prompt files
-- `GET /prompt-path` — absolute path of the realtime-intel prompt
+**Intel** (`/api/intel/*`) — `GET /prompts`, `POST /open-prompt`, `GET /prompt-path`.
 
-### System
-- `GET /status` — engine readiness + audio devices + hardware probe + `asr` + `diarization`
-- `GET /models` — models the configured LLM provider reports
-- `POST /system/open-mic-settings` — launches `ms-settings:privacy-microphone`
+**System** — `GET /api/status`, `GET /api/models`, `GET/PUT /api/auto-capture`, `POST /api/system/open-mic-settings`.
 
-### WebSocket
-- `WS /ws` — push channel: `utterances`, `partial_utterance`, `status`, `realtime_intelligence`, `daily_brief_updated`
+**WebSocket** `/ws` — push channel: `utterances`, `partial_utterance`, `status`, `audio_level`, `realtime_intelligence`, `title_updated`, `auto_capture`, `daily_brief_updated`.
 
 ---
 
 ## Building installers
 
-### Locally
-
 ```powershell
-npm run build:sidecar   # PyInstaller onedir bundle (10-15 min, ~1.5 GB output)
+npm run build:sidecar   # PyInstaller onedir bundle (10-15 min, ~1.5 GB)
 npm run tauri:build     # Tauri build + NSIS installer
-# or both in sequence:
-npm run package
+npm run package         # both, in sequence
 ```
 
-`build:sidecar` auto-aligns your venv's torch wheel to the host GPU before running PyInstaller — `nvidia-smi` detects the GPU; `torch.__version__` is parsed for the current variant; mismatches trigger a `pip install --index-url cu128` (or `cpu`). Skipped in CI (where the matrix step pins the wheel upfront).
+`build:sidecar` auto-aligns your venv's torch wheel to the host GPU before PyInstaller runs (`nvidia-smi` detects GPU; mismatches trigger a `pip install --index-url cu128` or `cpu`). CI pins the wheel upfront and skips this step.
 
-### Via CI (recommended)
-
-Push a tag: `git tag v0.2.0 && git push origin v0.2.0`. [.github/workflows/release.yml](.github/workflows/release.yml) then:
-
-1. Builds **both** variants in parallel on `windows-latest` (matrix `[cuda, cpu]`).
-2. For the CUDA variant only: moves all files ≥ 50 MB and the nvidia-cu12 wheel tree out of the PyInstaller output into a sibling `AuraScribe-CUDA-runtime-v<version>.zip` (~1 GB). That keeps the installer slim enough for NSIS.
-3. Renames outputs to stable filenames — `AuraScribe-CUDA-setup.exe` / `AuraScribe-CPU-setup.exe`.
-4. Uploads installers + CUDA runtime zip as CI artifacts.
-5. A follow-up `release` job (tag-only) drafts a GitHub Release with both installers + the runtime zip attached + a picker table in the body.
-
-You review the draft, click Publish.
-
-`workflow_dispatch` (manual trigger) runs the builds but skips release creation — useful for testing the pipeline without cutting a tag.
+**CI** — push a tag (`git tag v0.2.0 && git push origin v0.2.0`). [.github/workflows/release.yml](.github/workflows/release.yml) builds CUDA + CPU variants in parallel, splits the CUDA bundle into release-asset-sized parts, drafts a GitHub Release with both installers + the runtime zip + a picker table. You review and click Publish. `workflow_dispatch` runs builds without releasing.
 
 ---
 
-## Logs & diagnostics
+## Logs
 
-Everything the sidecar logs — including uvicorn's request log — goes to two places:
-
-- **stdout** — picked up by the Tauri dev console and the packaged `.exe`'s attached console window.
-- **file** — `%APPDATA%\AuraScribe\logs\sidecar.log`, rotating at 5 × 5 MB.
-
-Unhandled exceptions on either side drop a crash file in the same folder:
-
-- `crash-YYYYMMDD-HHMMSS.log` — Python sidecar (traceback + timestamp).
-- `crash-<unix-secs>-rust.log` — Rust shell (panic payload + source location).
-
-Common prefixes to grep for:
-- `provisional:` — in-memory speaker clustering decisions.
-- `voice-match:` — enrolled-voice matching (distance, second-best, threshold).
-- `diarize:` — pyannote turn boundaries per chunk.
-- `asr:` — device + model + compute summary at startup.
-- `daily_brief:` — daily-brief regen lifecycle.
-- `extras:` — optional-extras availability at boot.
-
-Frontend console: DevTools in the Tauri webview (right-click → Inspect in dev; devtools enabled in debug builds).
+Sidecar logs (incl. uvicorn) → stdout *and* `%APPDATA%\AuraScribe\logs\sidecar.log` (5 × 5 MB rotating). Crashes drop a sibling `crash-YYYYMMDD-HHMMSS.log` (Python) or `crash-<unix>-rust.log` (Rust). Useful grep prefixes: `provisional:`, `voice-match:`, `diarize:`, `asr:`, `daily_brief:`, `auto-capture:`, `extras:`. Frontend console: right-click → Inspect (devtools enabled in debug).
 
 ---
 
 ## Roadmap
 
-- **Done** — Tauri + React + sidecar scaffold; SQLite + config + LLM client + Obsidian writer; live transcription with speculative partials; pyannote 3.1 diarization; tag-as-you-go Voices + provisional clustering + per-utterance re-assignment; recompute; real-time intelligence (highlights, action items, support coaching); editable prompts; daily brief aggregation; YYYY/MM vault structure; meeting trim + split; mid-recording re-adoption; NSIS installer + PyInstaller sidecar bundling; CI matrix for CUDA/CPU variants; hardware auto-detect + user-configurable device/compute; first-run welcome dialog; file-based logs + crash dumps; mic-permission detection; error boundaries; follow-tail scroll pinning; speaker tag popover with contains-query search + meeting roster chips; persistent globally-unique speaker colors (palette slot stored on `voices.color`); Voices-page color swatch picker + custom avatar upload; WASAPI-loopback system-audio capture with Speex-AEC-cancelled mic mix (captures remote participants in Zoom/Teams/Meet alongside the local speaker without doubled transcripts on speakers).
-- **Next** — Code-signing for the installer (kill the "Unknown publisher" SmartScreen warning).
-- **Backlog** — NVIDIA Parakeet-TDT 0.6B v3 as an optional ASR backend (currently #1 on Open ASR Leaderboard). Needs NeMo, which is painful on Windows — deferred.
-- **Backlog** — Multi-vault / per-meeting vault routing.
-- **Backlog** — Scheduled meeting pre-briefs (pull upcoming calendar entries + relevant prior meetings into a pre-meeting card).
-- **Backlog** — Structured telemetry (opt-in Sentry or local crash reporter upload).
-- **Backlog** — MCP server — expose meetings / voices / intel over Model Context Protocol so external agents (Claude Desktop, coding assistants, etc.) can query the local corpus and pull relevant context on demand.
-- **Backlog** — Mic test panel — live input-level meter + short record/playback loop in Settings (or the first-run dialog) so the user can verify device + gain before starting a meeting.
+- **Done** — Tauri + React + sidecar; SQLite + Obsidian writer; live transcription + speculative partials; pyannote 3.1 diarization; tag-as-you-go Voices + provisional clustering + per-utterance re-assignment; recompute; live intel (highlights + action items + support coaching) with same-call title refinement + freeze; daily brief with auto-refresh; meeting trim / split; mid-recording re-adoption; NSIS installer + PyInstaller bundling; CI matrix for CUDA/CPU; hardware auto-detect + user-overridable; first-run welcome dialog; file-based logs + crash dumps; mic-permission detection; error boundaries; follow-tail scroll pinning; persistent globally-unique speaker colors + custom avatar upload; WASAPI loopback + Speex-AEC mix; macOS arm64 support; **auto-capture (sustained-speech start, sustained-silence stop) with countdown-on-Stop-button**; **customer-isolated vault layout with bucket inference at finalize + customer MOC bootstrap**.
+- **Next** — Code-signing for the installer (kill the SmartScreen "Unknown publisher" warning).
+- **Backlog** — NVIDIA Parakeet-TDT 0.6B v3 as an optional ASR backend (NeMo on Windows is painful; deferred). Multi-vault routing. Scheduled meeting pre-briefs (calendar + prior-meeting context). Opt-in telemetry / crash uploader. MCP server (expose meetings / voices / intel to external agents). In-Settings mic test panel.
 
 ---
 
 ## Development notes
 
-- **Sidecar-only work** — `.venv\Scripts\python sidecar\main.py` brings up the FastAPI server without Tauri. Hit `http://127.0.0.1:8765/api/status` to verify.
-- **Frontend-only work** — `npm run dev` runs Vite standalone on port 1420 with a `/api` + `/ws` proxy to 8765. The WS client reconnects automatically when a sidecar appears.
-- **Routes refactor** — `api.py` is now just FastAPI wiring (CORS + lifespan + WebSocket + `/api/status` + `/api/models`). All feature endpoints live in `sidecar/aurascribe/routes/*.py`; shared state + cross-router helpers live in `routes/_shared.py`. Add a new feature area by creating `routes/<name>.py` with an `APIRouter` named `router` and importing it in `routes/__init__.py`.
-- **CUDA torch locally** — your dev venv defaults to the CPU torch wheel from PyPI. For GPU-accelerated pyannote (ctranslate2 / faster-whisper have their own CUDA path), run `npm run build:sidecar` once to auto-swap, or do it manually:
-  ```
-  .venv\Scripts\pip install --upgrade --force-reinstall --index-url https://download.pytorch.org/whl/cu128 torch torchaudio
-  ```
-- **Rust panics in dev** — show up as an error dialog + a crash file under `%APPDATA%\AuraScribe\logs\`. Release builds exit cleanly on panic after showing the dialog.
-- **Adding a new config key** — four edits: `_CONFIG_KEYS` in `config.py`, module-level getter in same file, `_CONFIG_FIELDS` + `_effective_for` + `UserConfigUpdate` in `routes/settings.py`, `ConfigKey` union + Settings UI field in the frontend.
+- **Sidecar-only** — `.venv\Scripts\python sidecar\main.py`; check `http://127.0.0.1:8765/api/status`.
+- **Frontend-only** — `npm run dev` (Vite on 1420, proxies `/api` + `/ws` to 8765).
+- **Routes** — `api.py` is just FastAPI wiring. Add a feature area: new `routes/<name>.py` with `router = APIRouter(...)`, import in `routes/__init__.py`. Cross-router state lives in `routes/_shared.py`.
+- **Adding a config key** — four edits: module-level getter in `config.py`, `_CONFIG_KEYS` in same file, `_CONFIG_FIELDS` + `_effective_for` + `UserConfigUpdate` in `routes/settings.py`, `ConfigKey` union + Settings UI field in the frontend.
+- **CUDA torch in dev** — your venv defaults to the CPU torch wheel from PyPI. Run `npm run build:sidecar` once to auto-swap, or do it manually with the `--index-url cu128` line above.
+- **Rust panics in dev** — show as an error dialog + a crash file under `%APPDATA%\AuraScribe\logs\`. Release builds exit cleanly after the dialog.
