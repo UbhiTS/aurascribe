@@ -40,6 +40,7 @@ from aurascribe.routes._shared import (
     ws_clients,
 )
 from aurascribe.routes.daily_brief import regen_brief_for_meeting
+from aurascribe.tasks import BlockingCallTimeout, run_sync_with_timeout, safe_task
 from aurascribe.transcription import Utterance
 
 log = logging.getLogger("aurascribe")
@@ -96,12 +97,15 @@ async def lifespan(app: FastAPI):
         # listening stream on "recording" and re-open on "done". Fire-and-
         # forget — the monitor's own lock serialises the resulting mic
         # transitions.
-        asyncio.create_task(auto_capture.on_manager_status(event, data))
+        safe_task(
+            auto_capture.on_manager_status(event, data),
+            name=f"auto_capture.on_manager_status[{event}]",
+        )
         # Auto-enable the monitor the first time the engine reports ready.
         # We don't enable during "loading" because start_meeting() would
         # reject any trigger with "Models still loading" anyway.
         if event == "ready" and config.AUTO_CAPTURE_ENABLED and not auto_capture.enabled:
-            asyncio.create_task(auto_capture.enable())
+            safe_task(auto_capture.enable(), name="auto_capture.enable")
         # Meeting finished → the Daily Brief for that meeting's date is now
         # stale. Mark + regenerate in the background so the user's next
         # visit to the Daily Briefs page is already fresh. Skipped when the
@@ -112,7 +116,10 @@ async def lifespan(app: FastAPI):
             and data.get("meeting_id")
             and config.DAILY_BRIEF_AUTO_REFRESH
         ):
-            asyncio.create_task(regen_brief_for_meeting(data["meeting_id"]))
+            safe_task(
+                regen_brief_for_meeting(data["meeting_id"]),
+                name=f"daily_brief.regen[{data['meeting_id']}]",
+            )
 
     async def on_level(rms: float, peak: float) -> None:
         # ~30Hz during recording. Small-payload broadcast, no coalescing —
@@ -128,7 +135,12 @@ async def lifespan(app: FastAPI):
     manager.on_status(on_status)
     manager.on_level(on_level)
     manager.intel.set_broadcast(broadcast)
-    asyncio.create_task(manager.initialize())
+    # Engine load runs in the background so the FastAPI lifespan can
+    # return and the UI can reach /api/status (which surfaces loading
+    # progress and any fatal load_error). Exceptions inside initialize()
+    # are already caught there and converted to a "status: error" event;
+    # safe_task is belt-and-braces in case the catch itself breaks.
+    safe_task(manager.initialize(), name="manager.initialize")
     yield
     # Shutdown — release the monitor's mic stream cleanly so a restart
     # doesn't trip over a lingering PortAudio handle on Windows.
@@ -201,15 +213,35 @@ async def get_status() -> dict:
     engine = manager.engine
     diar_device = getattr(engine, "diarization_device", None) if manager.is_ready else None
     diar_enabled = manager.is_ready and diar_device is not None
+
+    # Device enumeration hits WASAPI / soundcard and can stall the event
+    # loop on a wedged audio driver (seen on Windows with a disconnected
+    # USB endpoint). Run it in a worker thread with a hard timeout —
+    # empty list on timeout, so the picker falls back to "Default mic"
+    # rather than freezing the whole /api/status poll.
+    async def _safe_list(fn, name: str) -> list[dict]:
+        try:
+            return await run_sync_with_timeout(fn, timeout=3.0, name=name)
+        except BlockingCallTimeout:
+            log.warning("%s timed out — returning empty device list", name)
+            return []
+        except Exception:
+            log.exception("%s failed", name)
+            return []
+    audio_devices = await _safe_list(manager.list_audio_devices, "list_audio_devices")
+    audio_output_devices = await _safe_list(
+        manager.list_audio_output_devices, "list_audio_output_devices",
+    )
     return {
         "ok": True,
         "version": __version__,
         "platform": sys.platform,   # "win32" | "darwin" | "linux" — lets the frontend adapt UI text
         "engine_ready": manager.is_ready,
+        "engine_load_error": manager.load_error,
         "is_recording": manager.is_recording,
         "current_meeting_id": manager.current_meeting_id,
-        "audio_devices": manager.list_audio_devices(),
-        "audio_output_devices": manager.list_audio_output_devices(),
+        "audio_devices": audio_devices,
+        "audio_output_devices": audio_output_devices,
         "active_audio_device": manager.active_device_name,
         "obsidian_configured": config.OBSIDIAN_VAULT is not None,
         # Hardware the sidecar probed at import. Frozen for the lifetime of
@@ -281,6 +313,24 @@ async def put_auto_capture(req: AutoCaptureToggle) -> dict:
 @app.get("/api/models")
 async def list_models() -> dict:
     return {"models": await get_available_models()}
+
+
+@app.post("/api/system/retry-init")
+async def retry_engine_init() -> dict:
+    """Retry a failed engine load. Called from the splash's error card
+    after the user has fixed the underlying problem (re-pasted HF token,
+    reconnected network, freed VRAM).
+
+    Rejected if the engine is already ready or currently loading (status
+    transitions are surfaced via WS; the UI can tell).
+    """
+    if manager.is_ready:
+        return {"ok": True, "message": "Engine already ready"}
+    if manager.load_error is None:
+        # No prior error to retry from — either still loading or never tried.
+        raise HTTPException(409, "Engine load is not in an error state")
+    safe_task(manager.initialize(), name="manager.initialize[retry]")
+    return {"ok": True, "message": "Engine reload started"}
 
 
 @app.post("/api/system/open-mic-settings")

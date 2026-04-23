@@ -40,6 +40,7 @@ from aurascribe.config import (
     RT_HIGHLIGHTS_WINDOW_SEC,
 )
 from aurascribe.llm.client import LLMUnavailableError, chat
+from aurascribe.tasks import safe_task
 from aurascribe.transcription import Utterance
 
 log = logging.getLogger("aurascribe.realtime")
@@ -144,10 +145,30 @@ class RealtimeIntelligence:
 
     # ── Lifecycle ────────────────────────────────────────────────────────────
 
+    # Hard cap on how many live meeting states we keep in memory. Even
+    # with flush_and_clear called faithfully, edge cases (record-loop
+    # crash that skips stop_meeting, sidecar not receiving the stop
+    # event, rapid create/drop) can pin entries forever. This keeps the
+    # working set bounded: on prepare, if we're already at the cap we
+    # drop the oldest entry that isn't the meeting being prepared.
+    _MAX_LIVE_MEETING_STATES = 16
+
     async def prepare_meeting(self, meeting_id: str) -> None:
         """Initialize empty state for a new meeting and ensure the prompt file
         exists (seeded on first run)."""
         _ensure_prompt_file()
+        # Evict oldest states if the dict has grown past the cap (dict
+        # insertion order acts as our LRU). Protects against leaked
+        # entries from crashed meetings.
+        while len(self._states) >= self._MAX_LIVE_MEETING_STATES:
+            stale_id, stale_state = next(iter(self._states.items()))
+            if stale_state.pending_task and not stale_state.pending_task.done():
+                stale_state.pending_task.cancel()
+            del self._states[stale_id]
+            log.warning(
+                "realtime intel: evicted stale meeting state %s (cap=%d)",
+                stale_id, self._MAX_LIVE_MEETING_STATES,
+            )
         self._states[meeting_id] = _MeetingState()
 
     async def hydrate(self, meeting_id: str) -> None:
@@ -226,8 +247,9 @@ class RealtimeIntelligence:
             else:
                 delay = 0.0
 
-        state.pending_task = asyncio.create_task(
-            self._delayed_run(meeting_id, delay)
+        state.pending_task = safe_task(
+            self._delayed_run(meeting_id, delay),
+            name=f"realtime_intel.delayed_run[{meeting_id}]",
         )
 
     async def trigger_now(self, meeting_id: str) -> None:

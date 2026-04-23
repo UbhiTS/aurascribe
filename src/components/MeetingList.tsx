@@ -1,4 +1,4 @@
-import { useEffect, useState, useRef, useCallback } from "react";
+import { memo, useEffect, useState, useRef, useCallback } from "react";
 import { Clock, FileText, Loader, CheckSquare, Square, Trash2 } from "lucide-react";
 import { api, tagsPending } from "../lib/api";
 import type { Meeting } from "../lib/api";
@@ -74,18 +74,23 @@ export function MeetingList({ selectedId, activeMeetingId, onSelect, onDeleted, 
 
   // ── Selection helpers ────────────────────────────────────────────────────────
 
-  const deletable = (id: string) => id !== activeMeetingId;
+  const deletable = useCallback(
+    (id: string) => id !== activeMeetingId,
+    [activeMeetingId],
+  );
   const deletableMeetings = meetings.filter(m => deletable(m.id));
   const allSelected = deletableMeetings.length > 0 && selected.size === deletableMeetings.length;
 
-  const toggleSelect = (id: string) => {
-    if (!deletable(id)) return;
+  // Stable ref so memoized MeetingRow can trust the callback identity.
+  const toggleSelect = useCallback((id: string) => {
+    if (id === activeMeetingId) return;
     setSelected(prev => {
       const next = new Set(prev);
-      next.has(id) ? next.delete(id) : next.add(id);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
       return next;
     });
-  };
+  }, [activeMeetingId]);
 
   const toggleAll = () =>
     setSelected(allSelected ? new Set() : new Set(deletableMeetings.map(m => m.id)));
@@ -205,48 +210,15 @@ export function MeetingList({ selectedId, activeMeetingId, onSelect, onDeleted, 
               </div>
 
               {grouped[date].map(m => (
-                <div
+                <MeetingRow
                   key={m.id}
-                  className={`flex items-stretch border-l-2 transition-colors hover:bg-gray-900 ${
-                    selectedId === m.id ? "border-brand-500 bg-gray-900" : "border-transparent"
-                  } ${selected.has(m.id) ? "bg-gray-900/50" : ""}`}
-                >
-                  {/* Checkbox — disabled for the active recording */}
-                  <button
-                    onClick={(e) => { e.stopPropagation(); toggleSelect(m.id); }}
-                    disabled={!deletable(m.id)}
-                    title={!deletable(m.id) ? "Cannot delete active recording" : undefined}
-                    className="pl-3 pr-1.5 flex items-center transition-colors flex-shrink-0 disabled:opacity-30 disabled:cursor-not-allowed text-gray-600 hover:text-gray-400 disabled:hover:text-gray-600"
-                  >
-                    {selected.has(m.id)
-                      ? <CheckSquare size={13} className="text-brand-400" />
-                      : <Square size={13} />}
-                  </button>
-
-                  {/* Meeting row */}
-                  <button
-                    onClick={() => onSelect(m.id)}
-                    className="flex-1 text-left px-2 py-2 min-w-0"
-                  >
-                    <div className="flex items-center gap-1.5">
-                      {m.status === "recording"  && <div className="w-1.5 h-1.5 rounded-full bg-red-500 animate-pulse flex-shrink-0" />}
-                      {m.status === "processing" && <Loader size={10} className="animate-spin text-amber-400 flex-shrink-0" />}
-                      {m.status === "done"       && <FileText size={10} className="text-gray-600 flex-shrink-0" />}
-                      <span className="text-sm text-gray-200 truncate font-medium">{m.title}</span>
-                      {tagsPending(m) && (
-                        <span
-                          title="Tags pending — open and click Recompute voices"
-                          className="w-1.5 h-1.5 rounded-full bg-amber-400 flex-shrink-0"
-                        />
-                      )}
-                    </div>
-                    <div className="flex items-center gap-1 mt-0.5 text-xs text-gray-500">
-                      <Clock size={10} />
-                      {m.started_at.slice(11, 16)}
-                      {m.ended_at && ` – ${m.ended_at.slice(11, 16)}`}
-                    </div>
-                  </button>
-                </div>
+                  meeting={m}
+                  isSelected={selectedId === m.id}
+                  isChecked={selected.has(m.id)}
+                  deletable={deletable(m.id)}
+                  onToggleSelect={toggleSelect}
+                  onSelect={onSelect}
+                />
               ))}
             </div>
           ))}
@@ -305,3 +277,66 @@ export function MeetingList({ selectedId, activeMeetingId, onSelect, onDeleted, 
     </>
   );
 }
+
+
+// Memoized row — keeps unrelated rows off the render path when one cell
+// updates (e.g. the user checks a box). Without this, selecting one
+// meeting re-renders every row in the list. Props are all primitive or
+// stable-by-ref (`onToggleSelect`, `onSelect` are useCallback'd upstream)
+// so default shallow compare is sufficient.
+interface MeetingRowProps {
+  meeting: Meeting;
+  isSelected: boolean;
+  isChecked: boolean;
+  deletable: boolean;
+  onToggleSelect: (id: string) => void;
+  onSelect: (id: string) => void;
+}
+
+const MeetingRow = memo(function MeetingRow({
+  meeting: m, isSelected, isChecked, deletable, onToggleSelect, onSelect,
+}: MeetingRowProps) {
+  return (
+    <div
+      className={`flex items-stretch border-l-2 transition-colors hover:bg-gray-900 ${
+        isSelected ? "border-brand-500 bg-gray-900" : "border-transparent"
+      } ${isChecked ? "bg-gray-900/50" : ""}`}
+    >
+      {/* Checkbox — disabled for the active recording */}
+      <button
+        onClick={(e) => { e.stopPropagation(); onToggleSelect(m.id); }}
+        disabled={!deletable}
+        title={!deletable ? "Cannot delete active recording" : undefined}
+        className="pl-3 pr-1.5 flex items-center transition-colors flex-shrink-0 disabled:opacity-30 disabled:cursor-not-allowed text-gray-600 hover:text-gray-400 disabled:hover:text-gray-600"
+      >
+        {isChecked
+          ? <CheckSquare size={13} className="text-brand-400" />
+          : <Square size={13} />}
+      </button>
+
+      {/* Meeting row */}
+      <button
+        onClick={() => onSelect(m.id)}
+        className="flex-1 text-left px-2 py-2 min-w-0"
+      >
+        <div className="flex items-center gap-1.5">
+          {m.status === "recording"  && <div className="w-1.5 h-1.5 rounded-full bg-red-500 animate-pulse flex-shrink-0" />}
+          {m.status === "processing" && <Loader size={10} className="animate-spin text-amber-400 flex-shrink-0" />}
+          {m.status === "done"       && <FileText size={10} className="text-gray-600 flex-shrink-0" />}
+          <span className="text-sm text-gray-200 truncate font-medium">{m.title}</span>
+          {tagsPending(m) && (
+            <span
+              title="Tags pending — open and click Recompute voices"
+              className="w-1.5 h-1.5 rounded-full bg-amber-400 flex-shrink-0"
+            />
+          )}
+        </div>
+        <div className="flex items-center gap-1 mt-0.5 text-xs text-gray-500">
+          <Clock size={10} />
+          {m.started_at.slice(11, 16)}
+          {m.ended_at && ` – ${m.ended_at.slice(11, 16)}`}
+        </div>
+      </button>
+    </div>
+  );
+});

@@ -46,6 +46,7 @@ import numpy as np
 
 from aurascribe import config
 from aurascribe.audio.vad_model import get_vad_model
+from aurascribe.tasks import BlockingCallTimeout, run_sync_with_timeout, safe_task
 
 log = logging.getLogger("aurascribe")
 
@@ -268,7 +269,13 @@ class AutoCaptureMonitor:
             return
 
         try:
-            info = sd.query_devices(kind="input")
+            # Thread-offload the sync PortAudio calls — on a wedged driver
+            # they can hang indefinitely and freeze the event loop (and
+            # therefore the UI, which hits /api/status every 30s).
+            info = await run_sync_with_timeout(
+                sd.query_devices, kind="input",
+                timeout=3.0, name="auto_capture.query_devices",
+            )
             native_sr = int(info.get("default_samplerate") or _SAMPLE_RATE)
             if native_sr == _SAMPLE_RATE:
                 self._resampler = None
@@ -283,15 +290,25 @@ class AutoCaptureMonitor:
             self._recent.clear()
             self._ui_confidence = 0.0
 
-            stream = sd.InputStream(
-                samplerate=native_sr,
-                channels=1,
-                dtype="float32",
-                blocksize=blocksize,
-                callback=self._audio_callback,
+            def _open_stream() -> Any:
+                s = sd.InputStream(
+                    samplerate=native_sr,
+                    channels=1,
+                    dtype="float32",
+                    blocksize=blocksize,
+                    callback=self._audio_callback,
+                )
+                s.start()
+                return s
+            self._stream = await run_sync_with_timeout(
+                _open_stream, timeout=5.0, name="auto_capture.open_stream",
             )
-            stream.start()
-            self._stream = stream
+        except BlockingCallTimeout as e:
+            log.warning("auto-capture: mic open timed out, will retry: %s", e)
+            self._stream = None
+            self._resampler = None
+            await self._enter_error_and_schedule_retry_locked()
+            return
         except Exception as e:
             # Most common causes: OS mic permission denied, no default mic,
             # another app holds the device exclusively. All worth retrying.
@@ -324,7 +341,10 @@ class AutoCaptureMonitor:
         self._cancel_retry_locked()
         delay = _RETRY_BACKOFF[min(self._retry_idx, len(_RETRY_BACKOFF) - 1)]
         self._retry_idx += 1
-        self._retry_task = asyncio.create_task(self._retry_after(delay))
+        self._retry_task = safe_task(
+            self._retry_after(delay),
+            name=f"auto_capture.retry[{delay}s]",
+        )
 
     def _cancel_retry_locked(self) -> None:
         if self._retry_task is not None:
@@ -356,8 +376,11 @@ class AutoCaptureMonitor:
 
     def _schedule_process(self, samples: np.ndarray) -> None:
         # Runs on the event loop — fan out VAD evaluation without blocking
-        # the audio callback.
-        asyncio.ensure_future(self._process_samples(samples))
+        # the audio callback. Uses safe_task so a torch failure doesn't
+        # silently kill the VAD evaluator (the stream keeps delivering
+        # samples, but nothing processes them → auto-capture appears
+        # "stuck" in listening).
+        safe_task(self._process_samples(samples), name="auto_capture.process_samples")
 
     async def _process_samples(self, samples: np.ndarray) -> None:
         if self._resampler is not None:

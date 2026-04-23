@@ -35,7 +35,7 @@ from aurascribe.llm.analysis import (
     AnalysisResult,
     analyze_meeting,
 )
-from aurascribe.llm.client import LLMUnavailableError
+from aurascribe.llm.client import LLMTruncatedError, LLMUnavailableError
 from aurascribe.llm.prompts import format_transcript
 from aurascribe.meeting_manager import MeetingManager, extract_action_items
 from aurascribe.obsidian.writer import rewrite_meeting_vault
@@ -67,13 +67,37 @@ def set_auto_capture_monitor(monitor: object) -> None:
 
 
 async def broadcast(payload: dict) -> None:
+    """Push `payload` to every connected WS client.
+
+    Sends fan out concurrently with a short per-send timeout — one slow
+    or hung client cannot block other clients from receiving the message.
+    Dead/timed-out clients are pruned after the gather completes.
+
+    The broadcast_lock only guards the snapshot of `ws_clients` we send
+    to and the prune step; the awaits on individual sockets happen
+    outside it so the lock is held for microseconds, not the full RTT.
+    """
     async with broadcast_lock:
-        dead: list[WebSocket] = []
-        for ws in ws_clients:
-            try:
-                await ws.send_json(payload)
-            except Exception:
-                dead.append(ws)
+        clients = list(ws_clients)
+    if not clients:
+        return
+
+    async def _send_one(ws: WebSocket) -> WebSocket | None:
+        try:
+            await asyncio.wait_for(ws.send_json(payload), timeout=2.0)
+        except Exception:
+            return ws
+        return None
+
+    results = await asyncio.gather(
+        *(_send_one(ws) for ws in clients),
+        return_exceptions=False,  # _send_one swallows its own
+    )
+    dead = [ws for ws in results if ws is not None]
+    if not dead:
+        return
+
+    async with broadcast_lock:
         for ws in dead:
             try:
                 ws_clients.remove(ws)
@@ -319,6 +343,13 @@ async def run_analysis(
         )
     except LLMUnavailableError as e:
         raise HTTPException(503, str(e))
+    except LLMTruncatedError as e:
+        raise HTTPException(
+            502,
+            f"The LLM cut the response off mid-generation ({e}). "
+            "Raise `llm_context_tokens` in Settings, or switch to a model "
+            "with a bigger output budget. Then hit Try again.",
+        )
     except AnalysisEmptyError:
         raise HTTPException(
             502,

@@ -16,7 +16,7 @@ from pydantic import BaseModel
 
 from aurascribe.audio.capture import MicUnavailableError
 from aurascribe.config import AUDIO_DIR, DB_PATH
-from aurascribe.llm.client import LLMUnavailableError
+from aurascribe.llm.client import LLMTruncatedError, LLMUnavailableError
 from aurascribe.routes._shared import (
     PROVISIONAL_LABEL_RE,
     bump_meeting_tag,

@@ -43,12 +43,22 @@ export type WSMessage =
 
 type Handler = (msg: WSMessage) => void;
 
-export function useWebSocket(onMessage: Handler): { connected: boolean } {
+// Exponential backoff schedule — starts snappy so a dev restart reconnects
+// fast, caps at 30s so a dead sidecar doesn't hammer the port every 2s
+// forever. `attempt` is clamped to the last entry, so the delay plateaus
+// at 30s after the 5th retry.
+const _WS_BACKOFF_MS = [1000, 2000, 4000, 8000, 15000, 30000];
+
+export function useWebSocket(onMessage: Handler): { connected: boolean; failedAttempts: number } {
   // Keep a live reference to the handler so onmessage always calls the
   // latest closure, without needing to reattach.
   const handlerRef = useRef(onMessage);
   handlerRef.current = onMessage;
   const [connected, setConnected] = useState(false);
+  // How many consecutive failed reconnect attempts — drives the header
+  // banner that appears after a few failures so the user knows the
+  // sidecar is actually gone vs. a transient reload blip.
+  const [failedAttempts, setFailedAttempts] = useState(0);
 
   useEffect(() => {
     // Using refs here is a trap under React 19 StrictMode — the
@@ -59,6 +69,7 @@ export function useWebSocket(onMessage: Handler): { connected: boolean } {
     let cancelled = false;
     let socket: WebSocket | null = null;
     let retry: number | null = null;
+    let attempt = 0;
 
     const connect = () => {
       if (cancelled) return;
@@ -69,7 +80,11 @@ export function useWebSocket(onMessage: Handler): { connected: boolean } {
       socket = new WebSocket(url);
 
       socket.onopen = () => {
-        if (!cancelled) setConnected(true);
+        if (!cancelled) {
+          setConnected(true);
+          attempt = 0;
+          setFailedAttempts(0);
+        }
       };
 
       socket.onmessage = (e) => {
@@ -83,7 +98,10 @@ export function useWebSocket(onMessage: Handler): { connected: boolean } {
       socket.onclose = () => {
         if (cancelled) return;
         setConnected(false);
-        retry = window.setTimeout(connect, 2000);
+        attempt += 1;
+        setFailedAttempts(attempt);
+        const delay = _WS_BACKOFF_MS[Math.min(attempt - 1, _WS_BACKOFF_MS.length - 1)];
+        retry = window.setTimeout(connect, delay);
       };
     };
 
@@ -96,5 +114,5 @@ export function useWebSocket(onMessage: Handler): { connected: boolean } {
     };
   }, []);
 
-  return { connected };
+  return { connected, failedAttempts };
 }

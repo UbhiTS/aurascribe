@@ -35,7 +35,7 @@ from aurascribe.config import (
     PROMPTS_DIR,
     VAULT_CUSTOMERS,
 )
-from aurascribe.llm.client import LLMUnavailableError, chat
+from aurascribe.llm.client import LLMTruncatedError, LLMUnavailableError, chat
 from aurascribe.llm.sampling import prepare_transcript
 from aurascribe.obsidian.writer import (
     BUCKET_CUSTOMER,
@@ -263,9 +263,18 @@ async def _llm_infer(
             system=system,
             max_tokens=_MAX_OUTPUT_TOKENS,
             temperature=0.2,
+            # Bucket inference runs at finalize as the user is waiting for
+            # the meeting to wrap up — keep the timeout tight so a hung
+            # provider degrades to inbox instead of stalling Stop Recording.
+            timeout=15.0,
         )
     except LLMUnavailableError as e:
         log.warning("Bucket inference: LLM unavailable, defaulting to inbox: %s", e)
+        return InferredBucket(BUCKET_INBOX, None, "fallback-inbox", 0.0, str(e))
+    except LLMTruncatedError as e:
+        # Truncated JSON is unparseable. Inbox is the safe default — the
+        # user can recompute later with a bigger token budget.
+        log.warning("Bucket inference: response truncated, defaulting to inbox: %s", e)
         return InferredBucket(BUCKET_INBOX, None, "fallback-inbox", 0.0, str(e))
 
     text = (raw or "").strip()

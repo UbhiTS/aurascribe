@@ -28,7 +28,7 @@ from aurascribe.config import (
     MY_SPEAKER_LABEL,
     PROMPTS_DIR,
 )
-from aurascribe.llm.client import LLMUnavailableError, chat
+from aurascribe.llm.client import LLMTruncatedError, LLMUnavailableError, chat
 
 log = logging.getLogger("aurascribe.daily_brief")
 
@@ -156,7 +156,11 @@ async def build_brief(brief_date: str) -> dict:
         }
 
     prompt = _render_prompt(brief_date, meetings)
-    raw = await chat(prompt, max_tokens=_DAILY_BRIEF_MAX_TOKENS)
+    # Daily briefs are long — bump the per-call timeout from the
+    # default 60s to 180s so a large brief on a slow local model
+    # doesn't fail spuriously. Truncation still raises (caller
+    # converts it to a visible "LLM cut off" brief stub).
+    raw = await chat(prompt, max_tokens=_DAILY_BRIEF_MAX_TOKENS, timeout=180.0)
     parsed = _parse_json(raw)
     if parsed is None:
         log.warning(

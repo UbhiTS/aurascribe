@@ -31,6 +31,7 @@ SQLite.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
@@ -97,6 +98,48 @@ def time_since_write(meeting_id: str) -> float:
 
 def chunks_since_write(meeting_id: str) -> int:
     return _chunks_since_write.get(meeting_id, 0)
+
+
+# Timeout for vault file writes. Local disk writes land in milliseconds;
+# this cap catches vaults on slow / disconnected network drives (OneDrive,
+# iCloud, SMB share) that would otherwise stall the record loop or intel
+# loop for seconds at a time. 10s is way past any reasonable local write
+# and still tight enough that the user notices a broken vault quickly.
+_VAULT_WRITE_TIMEOUT = 10.0
+
+
+async def _write_text_with_timeout(
+    path: Path,
+    content: str,
+    *,
+    what: str,
+) -> bool:
+    """Write `content` to `path` via aiofiles with a hard timeout.
+
+    Returns True on success, False on timeout / failure. Never raises —
+    vault writes are best-effort augmentation; a failed write must never
+    take down the record loop or intel loop that called it.
+
+    `what` is a short label for the log line so operators can tell which
+    path timed out (meeting-file vs. person-note vs. MOC).
+    """
+    async def _do_write() -> None:
+        async with aiofiles.open(path, "w", encoding="utf-8") as f:
+            await f.write(content)
+
+    try:
+        await asyncio.wait_for(_do_write(), timeout=_VAULT_WRITE_TIMEOUT)
+        return True
+    except asyncio.TimeoutError:
+        log.warning(
+            "Vault write timed out (%s, >%s s): %s. Vault may be on a "
+            "slow/disconnected network drive — check the vault path in Settings.",
+            what, _VAULT_WRITE_TIMEOUT, path,
+        )
+        return False
+    except Exception as e:
+        log.warning("Vault write failed (%s): %s — %s", what, path, e)
+        return False
 
 
 def forget_meeting_throttle(meeting_id: str) -> None:
@@ -240,7 +283,13 @@ def _people_search_roots() -> list[Path]:
     """
     roots: list[Path] = []
     if VAULT_CUSTOMERS and VAULT_CUSTOMERS.exists():
-        for customer_dir in VAULT_CUSTOMERS.iterdir():
+        # Sort so the person-attribution result is deterministic when
+        # the same name exists in two customer folders. `iterdir()`
+        # order is filesystem-dependent (varies across runs on some
+        # platforms) and the audit flagged it as a reproducibility hole.
+        for customer_dir in sorted(
+            VAULT_CUSTOMERS.iterdir(), key=lambda p: p.name.lower(),
+        ):
             if customer_dir.is_dir():
                 people = customer_dir / "People"
                 if people.exists():
@@ -387,9 +436,8 @@ async def bootstrap_customer(customer: str) -> Path | None:
     moc_path = root / f"{safe}.md"
     if not moc_path.exists():
         moc_content = _customer_moc_content(customer)
-        async with aiofiles.open(moc_path, "w", encoding="utf-8") as f:
-            await f.write(moc_content)
-        log.info("Bootstrapped customer MOC at %s", moc_path)
+        if await _write_text_with_timeout(moc_path, moc_content, what="customer-moc"):
+            log.info("Bootstrapped customer MOC at %s", moc_path)
 
     for filename, blurb in _CANONICAL_NOTES:
         note_path = notes_dir / filename
@@ -406,8 +454,7 @@ async def bootstrap_customer(customer: str) -> Path | None:
             f"# {topic}\n\n"
             f"> {blurb}\n"
         )
-        async with aiofiles.open(note_path, "w", encoding="utf-8") as f:
-            await f.write(content)
+        await _write_text_with_timeout(note_path, content, what="customer-note")
 
     return root
 
@@ -575,9 +622,8 @@ async def bootstrap_vault_templates() -> int:
         path = VAULT_TEMPLATES / filename
         if path.exists():
             continue
-        async with aiofiles.open(path, "w", encoding="utf-8") as f:
-            await f.write(body)
-        written += 1
+        if await _write_text_with_timeout(path, body, what="vault-template"):
+            written += 1
     if written:
         log.info("Seeded %d vault template(s)", written)
     return written
@@ -751,8 +797,12 @@ async def write_meeting(
         + transcript_md
     )
 
-    async with aiofiles.open(new_path, "w", encoding="utf-8") as f:
-        await f.write(content)
+    ok = await _write_text_with_timeout(new_path, content, what="meeting")
+    if not ok:
+        # Don't stamp vault_path or bump the throttle counters — keep
+        # the next call to this function as a retry, not a repeat of
+        # the previous skip. Transcripts still live in SQLite.
+        return None
 
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
@@ -1073,8 +1123,8 @@ async def write_daily_brief(
         parts.append("")
 
     content = "\n".join(parts).rstrip() + "\n"
-    async with aiofiles.open(path, "w", encoding="utf-8") as f:
-        await f.write(content)
+    if not await _write_text_with_timeout(path, content, what="daily-brief"):
+        return None
     return path
 
 
@@ -1160,6 +1210,6 @@ async def update_person_note(
         + meetings_section
     )
 
-    async with aiofiles.open(path, "w", encoding="utf-8") as f:
-        await f.write(content)
+    if not await _write_text_with_timeout(path, content, what="person-note"):
+        return None
     return path

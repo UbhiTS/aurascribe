@@ -76,12 +76,19 @@ export function MicAudioProvider({
         if (cancelled) { stream.getTracks().forEach((t) => t.stop()); return; }
 
         const ctx = new AudioContext();
+        // Re-check cancellation after every async hop — without this,
+        // a deviceName change mid-open would leak the new context
+        // because teardown already fired with stale refs.
+        if (cancelled) { stream.getTracks().forEach((t) => t.stop()); ctx.close().catch(() => {}); return; }
         if (ctx.state === "suspended") await ctx.resume();
+        if (cancelled) { stream.getTracks().forEach((t) => t.stop()); ctx.close().catch(() => {}); return; }
         const analyser = ctx.createAnalyser();
         analyser.fftSize = 1024;
         analyser.smoothingTimeConstant = 0.3;
         ctx.createMediaStreamSource(stream).connect(analyser);
 
+        // Commit to the refs atomically so teardown on next re-run sees
+        // a consistent pair (not half-stream/half-ctx).
         streamRef.current = stream;
         ctxRef.current = ctx;
         setState({ analyser, error: false });

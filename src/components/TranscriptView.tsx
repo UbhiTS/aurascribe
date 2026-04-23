@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Check, Pencil, Plus, Scissors, GitBranch,
   ArrowUpToLine, ArrowDownToLine, Play, Pause,
@@ -28,23 +28,29 @@ interface BubbleGroup {
 }
 
 function groupUtterances(utterances: Utterance[]): BubbleGroup[] {
+  // O(n) — track the previous utterance (for gap + distance checks) as
+  // we walk the list, and assemble each group's text via an array that
+  // gets joined once. The old impl ran `utterances.find(...)` per entry
+  // to look up `prevLast`, which is O(n²) and fires at ~30Hz on live
+  // meetings — a 2000-utterance meeting was doing 4M lookups per frame.
   const groups: BubbleGroup[] = [];
+  const groupParts: string[][] = [];
+  let prevUtterance: Utterance | null = null;
   for (const u of utterances) {
     const prev = groups[groups.length - 1];
-    const prevLast = prev ? utterances.find((x) => x.id === prev.ids[prev.ids.length - 1]) : null;
     const canMerge =
       prev != null &&
-      prevLast != null &&
+      prevUtterance != null &&
       prev.speaker === u.speaker &&
       prev.speaker !== "Unknown" &&
-      u.start_time - prevLast.end_time <= MERGE_MAX_GAP_SEC &&
-      prevLast.match_distance != null &&
+      u.start_time - prevUtterance.end_time <= MERGE_MAX_GAP_SEC &&
+      prevUtterance.match_distance != null &&
       u.match_distance != null &&
-      prevLast.match_distance <= MERGE_DIST_THRESHOLD &&
+      prevUtterance.match_distance <= MERGE_DIST_THRESHOLD &&
       u.match_distance <= MERGE_DIST_THRESHOLD;
     if (canMerge) {
       if (u.id !== undefined) prev!.ids.push(u.id);
-      prev!.text = `${prev!.text} ${u.text}`.trim();
+      groupParts[groupParts.length - 1].push(u.text);
       prev!.end_time = u.end_time;
     } else {
       groups.push({
@@ -55,6 +61,14 @@ function groupUtterances(utterances: Utterance[]): BubbleGroup[] {
         end_time: u.end_time,
         audio_start: u.audio_start ?? null,
       });
+      groupParts.push([u.text]);
+    }
+    prevUtterance = u;
+  }
+  // Collapse parts once at the end — avoids O(n) string concat per merge.
+  for (let i = 0; i < groups.length; i++) {
+    if (groupParts[i].length > 1) {
+      groups[i].text = groupParts[i].join(" ").replace(/\s+/g, " ").trim();
     }
   }
   return groups;
@@ -218,11 +232,15 @@ export function TranscriptView({
   // The live partial updates multiple times per second as characters stream
   // in. Smooth-scrolling on every tick looks jittery even when pinned; use
   // an instant jump so pinned-tail users stay glued to the bottom without
-  // the viewport wobbling.
+  // the viewport wobbling. Debounced to ~10Hz so we don't pay for a
+  // scrollIntoView call (which triggers layout) on every character.
   useEffect(() => {
     if (!isRecording) return;
     if (!isPinnedRef.current) return;
-    bottomRef.current?.scrollIntoView({ behavior: "instant" as ScrollBehavior });
+    const handle = window.setTimeout(() => {
+      bottomRef.current?.scrollIntoView({ behavior: "instant" as ScrollBehavior });
+    }, 100);
+    return () => window.clearTimeout(handle);
   }, [livePartial, isRecording]);
 
   // Switching meetings always snaps to the bottom, regardless of prior
@@ -485,7 +503,7 @@ interface BubbleProps {
   onTogglePlay: () => void;
 }
 
-function Bubble({
+function _Bubble({
   u, mine, color, voices, meetingRoster, selfSpeaker, assignOpen,
   onOpenAssign, onAssign, newSpeakerDraft, onNewSpeakerDraft,
   editable, toolsOpen, onOpenTools, onTrimBefore, onTrimAfter, onSplitHere,
@@ -666,6 +684,33 @@ function Bubble({
     </div>
   );
 }
+
+// Custom equality: ignore the inline callback props. The parent builds
+// fresh `onOpenAssign` / `onAssign` / `onTogglePlay` / ... closures on
+// every render (one per row inside the `.map`) so a default shallow
+// compare would re-render every bubble on every transcript tick. The
+// callbacks dispatch setState against the live parent closure, so a
+// "stale" ref called later still produces correct behavior.
+// Everything that actually affects rendered output — the group, speaker
+// list, voices, open-menu flags, play state — IS compared.
+export const Bubble = memo(_Bubble, (prev, next) => {
+  return (
+    prev.u === next.u
+    && prev.mine === next.mine
+    && prev.color === next.color
+    && prev.voices === next.voices
+    && prev.meetingRoster === next.meetingRoster
+    && prev.selfSpeaker === next.selfSpeaker
+    && prev.assignOpen === next.assignOpen
+    && prev.newSpeakerDraft === next.newSpeakerDraft
+    && prev.editable === next.editable
+    && prev.toolsOpen === next.toolsOpen
+    && prev.isFirst === next.isFirst
+    && prev.isLast === next.isLast
+    && prev.canPlay === next.canPlay
+    && prev.isPlaying === next.isPlaying
+  );
+});
 
 function LivePartialBubble({ speaker, text, mine, color, voices }: { speaker: string; text: string; mine: boolean; color: SpeakerColor; voices: Voice[] }) {
   return (

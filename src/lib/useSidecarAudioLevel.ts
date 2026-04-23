@@ -27,26 +27,31 @@ export function useSidecarAudioLevel(): {
   const [active, setActive] = useState(false);
 
   useEffect(() => {
+    // Event-driven freshness timer. Arming on each audio_level arrival
+    // means the only setState calls happen at the active↔idle edges,
+    // not 4× per second while idle. The timer auto-extends as long as
+    // events keep flowing, and expires (flipping active=false) once
+    // the stream has been quiet for FRESHNESS_MS.
+    let idleTimer: number | null = null;
+    const armIdle = () => {
+      if (idleTimer !== null) window.clearTimeout(idleTimer);
+      idleTimer = window.setTimeout(() => {
+        setActive((prev) => (prev ? false : prev));
+        idleTimer = null;
+      }, FRESHNESS_MS);
+    };
+
     const onLevel = (e: Event) => {
       const ce = e as CustomEvent<AudioLevelDetail>;
       ref.current = ce.detail;
-      setActive(true);
+      setActive((prev) => (prev ? prev : true));
+      armIdle();
     };
     window.addEventListener("aurascribe:audio-level", onLevel);
 
-    // Flip `active` back off when no event has arrived within the
-    // freshness window — cheap 4Hz poll, well below any meaningful
-    // re-render cost.
-    const interval = window.setInterval(() => {
-      const cur = ref.current;
-      if (!cur || performance.now() - cur.t >= FRESHNESS_MS) {
-        setActive((prev) => (prev ? false : prev));
-      }
-    }, 250);
-
     return () => {
       window.removeEventListener("aurascribe:audio-level", onLevel);
-      window.clearInterval(interval);
+      if (idleTimer !== null) window.clearTimeout(idleTimer);
       ref.current = null;
     };
   }, []);

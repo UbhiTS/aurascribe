@@ -140,6 +140,11 @@ export interface VoiceDetail {
 
 export interface AppStatus {
   engine_ready: boolean;
+  // Populated when `engine.load()` failed (Whisper download interrupted,
+  // pyannote 401 for an un-accepted HF licence, GPU OOM, missing CUDA
+  // DLL). When set, engine_ready is false and the splash / welcome UI
+  // surfaces this string with a Retry button that POSTs to /api/system/retry-init.
+  engine_load_error: string | null;
   is_recording: boolean;
   current_meeting_id: string | null;
   audio_devices: { index: number; name: string; channels: number; host_api?: string }[];
@@ -388,6 +393,13 @@ export const api = {
   system: {
     openMicSettings: () =>
       request<{ ok: boolean; reason?: string }>("/system/open-mic-settings", {
+        method: "POST",
+      }),
+    // Kick off a retry of the failed engine init. Returns immediately;
+    // progress streams via WS status events. Used by the splash's
+    // engine-load-error dialog.
+    retryInit: () =>
+      request<{ ok: boolean; message?: string }>("/system/retry-init", {
         method: "POST",
       }),
   },

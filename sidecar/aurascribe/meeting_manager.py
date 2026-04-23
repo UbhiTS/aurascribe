@@ -39,6 +39,7 @@ from aurascribe.llm.prompts import (
     people_notes_prompt,
 )
 from aurascribe.llm.realtime import RealtimeIntelligence
+from aurascribe.tasks import safe_task
 from aurascribe.obsidian.writer import (
     BUCKET_CUSTOMER,
     BUCKET_INBOX,
@@ -117,6 +118,11 @@ class MeetingManager:
         self._level_callbacks: list[LevelCallback] = []
         self._running = False
         self._ready = False
+        # Populated by initialize() if engine.load() fails (Whisper
+        # download interrupted, HF token rejected, OOM, etc). Surfaced
+        # via /api/status so the UI can show the user a useful message
+        # with a Retry button instead of spinning on "Loading…" forever.
+        self._load_error: str | None = None
         # Friendly name of the mic currently feeding AudioCapture. None when
         # idle. Surfaced via /api/status so the UI can show which device is
         # actually recording, not just what was picked in the dropdown.
@@ -168,6 +174,7 @@ class MeetingManager:
 
     async def initialize(self) -> None:
         self._event_loop = asyncio.get_running_loop()
+        self._load_error = None
         await self._emit_status("loading", {"message": "Loading transcription models..."})
 
         async def _on_stage(message: str) -> None:
@@ -177,12 +184,32 @@ class MeetingManager:
         # show "Downloading Whisper …" / "Loading diarization …" rather than
         # a single opaque "Loading…" for 1–5 minutes on first run.
         try:
-            await self.engine.load(on_stage=_on_stage)
-        except TypeError:
-            # Back-compat for engines that don't accept on_stage.
-            await self.engine.load()
+            try:
+                await self.engine.load(on_stage=_on_stage)
+            except TypeError:
+                # Back-compat for engines that don't accept on_stage.
+                await self.engine.load()
+        except Exception as e:
+            # Engine failed to load — record it so /api/status surfaces the
+            # error, and emit an "error" event so the UI can show a Retry
+            # button instead of spinning on "Loading…" forever. Common causes:
+            # Whisper download interrupted, pyannote 401 (HF token rejected
+            # or licence not accepted), GPU OOM, missing CUDA DLL.
+            log.exception("Engine load failed")
+            self._load_error = f"{type(e).__name__}: {e}"
+            await self._emit_status(
+                "error",
+                {"message": f"Could not load transcription models: {self._load_error}"},
+            )
+            return
         self._ready = True
         await self._emit_status("ready", {"message": "Models loaded. Ready to record."})
+
+    @property
+    def load_error(self) -> str | None:
+        """Last engine-load failure message, or None if the engine loaded
+        cleanly. Cleared on the next `initialize()` call."""
+        return self._load_error
 
     async def start_meeting(
         self,
@@ -261,8 +288,8 @@ class MeetingManager:
         # monitor-mode audio that preceded the Start button shouldn't bleed
         # into the partial bubble.
         self._partial_anchor_wall = self.capture.wall_clock_seconds()
-        self._task = asyncio.create_task(self._record_loop(meeting_id))
-        self._spec_task = asyncio.create_task(self._speculative_loop(meeting_id))
+        self._task = safe_task(self._record_loop(meeting_id), name=f"record_loop[{meeting_id}]")
+        self._spec_task = safe_task(self._speculative_loop(meeting_id), name=f"spec_loop[{meeting_id}]")
         await self._emit_status("recording", {"meeting_id": meeting_id, "title": title})
         return meeting_id
 
@@ -320,85 +347,112 @@ class MeetingManager:
         started_at = datetime.fromisoformat(started_at_str)
         all_utterances: list[Utterance] = []
 
-        async for audio_chunk in self.capture.stream_speech_chunks():
-            if len(audio_chunk) < int(SAMPLE_RATE * 0.3):
-                continue
-            chunk_duration = len(audio_chunk) / SAMPLE_RATE
-            # Snapshot the wall-clock position of the chunk's start in the
-            # Opus file — read *before* the transcribe await so a few more
-            # audio blocks landing meanwhile don't drift our anchor. The
-            # recorder advances on the audio thread; `- chunk_duration`
-            # walks back to the first sample of this chunk.
-            chunk_wall_end = self.capture.wall_clock_seconds()
-            chunk_wall_start = max(0.0, chunk_wall_end - chunk_duration)
-            # Advance the partial anchor so the speculative loop's next
-            # pass looks at audio AFTER this chunk, not audio this chunk
-            # already consumed. Set before the await so a slow transcribe
-            # doesn't leave the partial window straddling the chunk.
-            self._partial_anchor_wall = chunk_wall_end
-            log.info(f"Transcribing chunk: {chunk_duration:.1f}s of audio")
-            try:
-                async with self._transcribe_sem:
-                    utterances = await self.engine.transcribe(audio_chunk)
-                for u in utterances:
-                    # Preserve the pre-elapsed within-chunk offset so we can
-                    # map into the wall-clock file. Speech-time (`u.start`)
-                    # drives display; `u.audio_start` drives playback.
-                    if chunk_wall_start > 0.0 or chunk_wall_end > 0.0:
-                        u.audio_start = chunk_wall_start + u.start
-                    u.start += elapsed
-                    u.end += elapsed
-                elapsed += chunk_duration
-                self._relabel_unknowns(meeting_id, utterances)
-                log.info(f"Got {len(utterances)} utterances")
-                if utterances:
-                    all_utterances.extend(utterances)
-                    await self._save_utterances(meeting_id, utterances)
-                    for cb in self._utterance_callbacks:
-                        await cb(meeting_id, utterances)
-                    # Realtime intelligence runs on a debounced timer — this
-                    # call only schedules; it doesn't block the record loop.
-                    # The same call also handles live title refinement
-                    # (entity + topic in the JSON), gated on title_locked.
-                    await self.intel.note_utterances(meeting_id, utterances)
+        # Outer error boundary — catches failures in capture.stream_speech_chunks
+        # (mic unplugged, driver crash), the transcription pipeline, or any
+        # other unhandled exception. Without this, the record task dies silently
+        # and the meeting keeps "recording" from the user's POV but no transcript
+        # is being produced. On fatal error we broadcast a status:error event so
+        # the UI can show the user, and let the caller stop the meeting cleanly.
+        try:
+            async for audio_chunk in self.capture.stream_speech_chunks():
+                if len(audio_chunk) < int(SAMPLE_RATE * 0.3):
+                    continue
+                chunk_duration = len(audio_chunk) / SAMPLE_RATE
+                # Snapshot the wall-clock position of the chunk's start in the
+                # Opus file — read *before* the transcribe await so a few more
+                # audio blocks landing meanwhile don't drift our anchor. The
+                # recorder advances on the audio thread; `- chunk_duration`
+                # walks back to the first sample of this chunk.
+                chunk_wall_end = self.capture.wall_clock_seconds()
+                chunk_wall_start = max(0.0, chunk_wall_end - chunk_duration)
+                # Advance the partial anchor so the speculative loop's next
+                # pass looks at audio AFTER this chunk, not audio this chunk
+                # already consumed. Set before the await so a slow transcribe
+                # doesn't leave the partial window straddling the chunk.
+                self._partial_anchor_wall = chunk_wall_end
+                log.info(f"Transcribing chunk: {chunk_duration:.1f}s of audio")
+                try:
+                    async with self._transcribe_sem:
+                        utterances = await self.engine.transcribe(audio_chunk)
+                    for u in utterances:
+                        # Preserve the pre-elapsed within-chunk offset so we can
+                        # map into the wall-clock file. Speech-time (`u.start`)
+                        # drives display; `u.audio_start` drives playback.
+                        if chunk_wall_start > 0.0 or chunk_wall_end > 0.0:
+                            u.audio_start = chunk_wall_start + u.start
+                        u.start += elapsed
+                        u.end += elapsed
+                    elapsed += chunk_duration
+                    self._relabel_unknowns(meeting_id, utterances)
+                    log.info(f"Got {len(utterances)} utterances")
+                    if utterances:
+                        all_utterances.extend(utterances)
+                        await self._save_utterances(meeting_id, utterances)
+                        for cb in self._utterance_callbacks:
+                            await cb(meeting_id, utterances)
+                        # Realtime intelligence runs on a debounced timer — this
+                        # call only schedules; it doesn't block the record loop.
+                        # The same call also handles live title refinement
+                        # (entity + topic in the JSON), gated on title_locked.
+                        await self.intel.note_utterances(meeting_id, utterances)
 
-                    # Throttled vault write: skip unless we've hit either
-                    # gate. The intel loop's writes also reset these counters
-                    # via the writer module's shared state, so a recent
-                    # intel-driven write keeps the chunk loop quiet.
-                    pending_chunks = note_chunk_arrived(meeting_id)
-                    elapsed_since_write = time_since_write(meeting_id)
-                    should_write = (
-                        pending_chunks >= _VAULT_WRITE_CHUNKS
-                        or elapsed_since_write >= _VAULT_WRITE_INTERVAL_SEC
-                    )
-                    if should_write:
-                        try:
-                            # Re-fetch the title on every write — user can
-                            # rename mid-recording and we must write to the
-                            # new filename. write_meeting reads the prior
-                            # `vault_path` from the DB and unlinks it if
-                            # the path changes (rename, or bucket reclassify),
-                            # so no separate cleanup step is needed here.
-                            async with aiosqlite.connect(DB_PATH) as db:
-                                cursor = await db.execute(
-                                    "SELECT title FROM meetings WHERE id = ?", (meeting_id,)
+                        # Throttled vault write: skip unless we've hit either
+                        # gate. The intel loop's writes also reset these counters
+                        # via the writer module's shared state, so a recent
+                        # intel-driven write keeps the chunk loop quiet.
+                        pending_chunks = note_chunk_arrived(meeting_id)
+                        elapsed_since_write = time_since_write(meeting_id)
+                        should_write = (
+                            pending_chunks >= _VAULT_WRITE_CHUNKS
+                            or elapsed_since_write >= _VAULT_WRITE_INTERVAL_SEC
+                        )
+                        if should_write:
+                            try:
+                                # Re-fetch the title on every write — user can
+                                # rename mid-recording and we must write to the
+                                # new filename. write_meeting reads the prior
+                                # `vault_path` from the DB and unlinks it if
+                                # the path changes (rename, or bucket reclassify),
+                                # so no separate cleanup step is needed here.
+                                async with aiosqlite.connect(DB_PATH) as db:
+                                    cursor = await db.execute(
+                                        "SELECT title FROM meetings WHERE id = ?", (meeting_id,)
+                                    )
+                                    title_row = await cursor.fetchone()
+                                current_title = title_row[0] if title_row else _initial_title
+                                await write_meeting(
+                                    meeting_id=meeting_id,
+                                    title=current_title,
+                                    started_at=started_at,
+                                    utterances=all_utterances,
+                                    summary="",
+                                    action_items=[],
                                 )
-                                title_row = await cursor.fetchone()
-                            current_title = title_row[0] if title_row else _initial_title
-                            await write_meeting(
-                                meeting_id=meeting_id,
-                                title=current_title,
-                                started_at=started_at,
-                                utterances=all_utterances,
-                                summary="",
-                                action_items=[],
-                            )
-                        except Exception as e:
-                            log.warning(f"Live Obsidian write failed: {e}")
-            except Exception as e:
-                log.error(f"Transcription error: {e}", exc_info=True)
-                await self._emit_status("error", {"message": str(e), "meeting_id": meeting_id})
+                            except Exception as e:
+                                log.warning(f"Live Obsidian write failed: {e}")
+                except Exception as e:
+                    log.error(f"Transcription error: {e}", exc_info=True)
+                    await self._emit_status(
+                        "error", {"message": str(e), "meeting_id": meeting_id},
+                    )
+        except asyncio.CancelledError:
+            raise  # normal stop_meeting path — let it propagate
+        except Exception as e:
+            # Something below the per-chunk try/except failed (capture
+            # stream error, callback misbehaving, DB dropped). Persist
+            # what we have, broadcast so the UI can surface it, and
+            # exit — stop_meeting() will finalize from here.
+            log.exception("Record loop crashed — recording halted")
+            await self._emit_status(
+                "error",
+                {
+                    "message": (
+                        f"Recording stopped unexpectedly: {e}. "
+                        f"The transcript so far has been saved."
+                    ),
+                    "meeting_id": meeting_id,
+                },
+            )
 
     async def _speculative_loop(self, meeting_id: str) -> None:
         """Periodically re-transcribe everything since the last committed
@@ -551,14 +605,26 @@ class MeetingManager:
     async def _save_utterances(self, meeting_id: str, utterances: list[Utterance]) -> None:
         # Generate a uuid per utterance so the WS broadcast + the frontend's
         # assign flow can reference rows by stable id before the commit.
+        if not utterances:
+            return
+        # Batched executemany — one round-trip covers every utterance in
+        # the chunk instead of N sequential INSERTs. Saves ~5-10ms per
+        # utterance at the DB layer, which adds up over a long meeting.
+        created_at = datetime.now().isoformat()
+        rows: list[tuple] = []
+        for u in utterances:
+            u.id = str(uuid.uuid4())
+            rows.append(
+                (u.id, meeting_id, u.speaker, u.text, u.start, u.end,
+                 u.audio_start, u.embedding, u.match_distance, created_at),
+            )
         async with aiosqlite.connect(DB_PATH) as db:
-            for u in utterances:
-                u.id = str(uuid.uuid4())
-                await db.execute(
-                    "INSERT INTO utterances (id, meeting_id, speaker, text, start_time, end_time, audio_start, embedding, match_distance, created_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    (u.id, meeting_id, u.speaker, u.text, u.start, u.end, u.audio_start, u.embedding, u.match_distance, datetime.now().isoformat()),
-                )
+            await db.executemany(
+                "INSERT INTO utterances (id, meeting_id, speaker, text, start_time, "
+                "end_time, audio_start, embedding, match_distance, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                rows,
+            )
             await db.commit()
 
     # ── Finalization ──────────────────────────────────────────────────────────
@@ -824,7 +890,10 @@ class MeetingManager:
             # Background task drains the VAD queue so the ring doesn't
             # back up with un-consumed blocks while we're monitoring.
             # Blocks are discarded — monitor doesn't transcribe.
-            self._monitor_drain_task = asyncio.create_task(self._monitor_drain_loop())
+            self._monitor_drain_task = safe_task(
+                self._monitor_drain_loop(),
+                name="monitor_drain_loop",
+            )
 
     async def stop_monitor(self) -> None:
         async with self._monitor_lock:
@@ -838,15 +907,25 @@ class MeetingManager:
         if not self._monitoring:
             return
         self._monitoring = False
+        # Always cancel + null the drain task — even if capture.stop()
+        # below raises. Previously a capture-stop exception left the
+        # drain task running against a closed queue, pinning a coroutine
+        # and leaking memory on repeated monitor toggles.
         drain = getattr(self, "_monitor_drain_task", None)
-        if drain is not None:
-            drain.cancel()
+        self._monitor_drain_task = None
+        try:
+            if drain is not None:
+                drain.cancel()
+                try:
+                    await drain
+                except (asyncio.CancelledError, Exception):
+                    pass
+        finally:
+            # capture.stop() must run even if drain cancellation errored.
             try:
-                await drain
-            except (asyncio.CancelledError, Exception):
-                pass
-            self._monitor_drain_task = None
-        await self.capture.stop()
+                await self.capture.stop()
+            except Exception as e:
+                log.warning("Monitor capture.stop() failed: %s", e)
 
     async def _monitor_drain_loop(self) -> None:
         """Pull-and-drop loop that keeps the capture's internal queue from

@@ -1,3 +1,4 @@
+import { memo } from "react";
 import { Book, Brain, Cpu, Plug, PlugZap, Users, Zap } from "lucide-react";
 import type { LLMHealth } from "../lib/useLLMHealth";
 import type { AppStatus, AutoCaptureState } from "../lib/api";
@@ -68,7 +69,7 @@ function ErrorIndicator({ message }: { message: string }) {
   );
 }
 
-export function Header({
+function _Header({
   wsConnected, llm,
   obsidianConfigured, systemStatus, statusMessage,
   hardware, asr, diarization, autoCaptureState, setAutoCaptureState,
@@ -225,3 +226,11 @@ export function Header({
     </header>
   );
 }
+
+// Memoize the header. Props are stable-by-ref from App.tsx (appStatus
+// slices are recomputed on each /api/status poll but only change
+// identity when content changes; setAutoCaptureState is a stable
+// setState ref). Without memoization, every WS message that touches
+// App state (audio_level is now bypassed via CustomEvent but title,
+// status, utterances still flow through) rebuilds every header chip.
+export const Header = memo(_Header);

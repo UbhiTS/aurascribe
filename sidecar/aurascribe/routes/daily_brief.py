@@ -15,7 +15,7 @@ from fastapi import APIRouter, HTTPException, Query
 
 from aurascribe.config import DB_PATH
 from aurascribe.llm import daily_brief as daily_brief_mod
-from aurascribe.llm.client import LLMUnavailableError
+from aurascribe.llm.client import LLMTruncatedError, LLMUnavailableError
 from aurascribe.routes._shared import broadcast
 
 log = logging.getLogger("aurascribe")
@@ -140,6 +140,17 @@ async def refresh_daily_brief(date_param: str | None = Query(None, alias="date")
             "status": "stale",
         })
         raise HTTPException(503, str(e))
+    except LLMTruncatedError as e:
+        await broadcast({
+            "type": "daily_brief_updated",
+            "date": brief_date,
+            "status": "stale",
+        })
+        raise HTTPException(
+            502,
+            f"Daily brief was cut off mid-generation ({e}). "
+            "Raise `llm_context_tokens` or use a larger model.",
+        )
 
     await broadcast({
         "type": "daily_brief_updated",

@@ -40,6 +40,15 @@ from aurascribe.config import (
     SILENCE_DURATION,
     VAD_THRESHOLD,
 )
+from aurascribe.tasks import BlockingCallTimeout, run_sync_with_timeout
+
+# Timeouts for sync audio-device calls. These wrap sounddevice +
+# soundcard APIs which block on WASAPI / CoreAudio — on a wedged
+# driver they can hang indefinitely and freeze the event loop. We
+# choose timeouts generous enough for a healthy system but tight
+# enough that "my mic is stuck" isn't hidden behind a 30s stall.
+_DEVICE_QUERY_TIMEOUT = 3.0
+_DEVICE_OPEN_TIMEOUT = 5.0
 
 log = logging.getLogger("aurascribe")
 
@@ -106,6 +115,12 @@ class AudioCapture:
         self._mic_fifo: deque[np.ndarray] = deque()
         self._lb_fifo: deque[np.ndarray] = deque()
         self._fifo_lock = threading.Lock()
+        # Signalled whenever either FIFO receives a new chunk. The mixer
+        # worker waits on this instead of sleep-polling — replaces a 5ms
+        # busy-wait with an event-driven wakeup so an idle mixer thread
+        # costs nothing and doesn't compete for CPU with the audio
+        # callback.
+        self._fifo_event = threading.Event()
         self._aec = None                  # pyaec.Aec instance (Windows only)
         self._aec_cancel = None           # direct lib.AecCancelEcho bound for ctypes fast-path
         self._aec_handle = None           # raw AecHandle pointer
@@ -176,6 +191,7 @@ class AudioCapture:
         if self._lb_active:
             with self._fifo_lock:
                 self._mic_fifo.append(chunk)
+            self._fifo_event.set()
             return
 
         # Mic-only fast path — emit 512-sample blocks directly.
@@ -257,6 +273,7 @@ class AudioCapture:
                     else:
                         with self._fifo_lock:
                             self._lb_fifo.append(chunk)
+                        self._fifo_event.set()
         except Exception as e:
             log.warning("soundcard loopback recorder exited: %s", e)
         finally:
@@ -321,6 +338,7 @@ class AudioCapture:
                     else:
                         with self._fifo_lock:
                             self._lb_fifo.append(chunk)
+                        self._fifo_event.set()
         except Exception as e:
             log.warning("coreaudio loopback recorder exited: %s", e)
 
@@ -366,9 +384,14 @@ class AudioCapture:
 
             n_frames = min(mic_buf.size, lb_buf.size) // _AEC_FRAME
             if n_frames == 0:
-                # Nothing aligned yet — don't spin. 5ms roughly matches
-                # half an AEC frame so we wake up near the next arrival.
-                _time.sleep(0.005)
+                # Nothing aligned yet — block on the FIFO event instead of
+                # sleep-polling. Both audio-thread feeds (`_audio_callback`
+                # and the loopback recorder) `.set()` the event when they
+                # append, so the mixer wakes within microseconds of new
+                # data arriving. 20ms fallback timeout keeps the stop flag
+                # responsive if a FIFO-feeder thread dies silently.
+                self._fifo_event.wait(timeout=0.020)
+                self._fifo_event.clear()
                 continue
 
             mixed_out = np.empty(n_frames * _AEC_FRAME, dtype=np.float32)
@@ -655,7 +678,26 @@ class AudioCapture:
             # auto-convert from 16kHz; MME does. We always open at native
             # rate and resample to 16kHz ourselves — same pipeline regardless
             # of API.
-            info = sd.query_devices(device, kind="input") if device is not None else sd.query_devices(kind="input")
+            #
+            # Wrap the sync query in a thread+timeout: on a wedged Windows
+            # audio driver (stale USB, bad endpoint) this call can block
+            # 10+ seconds, freezing the entire event loop including the
+            # UI heartbeat. 3s is generous for a healthy system.
+            try:
+                info = await run_sync_with_timeout(
+                    lambda: sd.query_devices(device, kind="input")
+                    if device is not None
+                    else sd.query_devices(kind="input"),
+                    timeout=_DEVICE_QUERY_TIMEOUT,
+                    name="sd.query_devices",
+                )
+            except BlockingCallTimeout as e:
+                raise MicUnavailableError(
+                    "Audio device query timed out — the mic driver may be "
+                    "wedged. Try unplugging/replugging the device, or "
+                    "restart the app.",
+                    kind="unknown",
+                ) from e
             native_sr = int(info["default_samplerate"]) or SAMPLE_RATE
 
             if native_sr == SAMPLE_RATE:
@@ -672,9 +714,10 @@ class AudioCapture:
             # permission denial manifests — sounddevice surfaces it as a
             # PortAudioError with an opaque "Unanticipated host error" /
             # error-code message. Translate it into a structured error the
-            # API layer can return as 403 + kind.
-            try:
-                self._stream = sd.InputStream(
+            # API layer can return as 403 + kind. Also wrap in a timeout
+            # so a stuck-open WASAPI endpoint doesn't hang the event loop.
+            def _open_stream() -> object:
+                s = sd.InputStream(
                     device=device,
                     samplerate=native_sr,
                     channels=CHANNELS,
@@ -682,7 +725,22 @@ class AudioCapture:
                     blocksize=blocksize,
                     callback=self._audio_callback,
                 )
-                self._stream.start()
+                s.start()
+                return s
+            try:
+                self._stream = await run_sync_with_timeout(
+                    _open_stream,
+                    timeout=_DEVICE_OPEN_TIMEOUT,
+                    name="sd.InputStream.start",
+                )
+            except BlockingCallTimeout as e:
+                self._stream = None
+                raise MicUnavailableError(
+                    "Microphone could not be opened within 5 seconds. The "
+                    "audio driver may be wedged — try reconnecting the "
+                    "device or restarting the app.",
+                    kind="unknown",
+                ) from e
             except Exception as e:
                 self._stream = None
                 msg = str(e).lower()
@@ -824,6 +882,9 @@ class AudioCapture:
         `_start_loopback` or from `stop()` with no loopback active."""
         self._lb_active = False
         self._worker_stop.set()
+        # Wake the mixer if it's parked on `_fifo_event.wait()` so it
+        # sees the stop flag immediately instead of waiting up to 20ms.
+        self._fifo_event.set()
         self._lb_thread_stop.set()
         if self._worker is not None:
             self._worker.join(timeout=2.0)

@@ -14,6 +14,7 @@ import { useLLMHealth } from "./lib/useLLMHealth";
 import { Shell } from "./components/Shell";
 import type { Page } from "./components/Sidebar";
 import { WelcomeDialog } from "./components/WelcomeDialog";
+import { EngineErrorDialog } from "./components/EngineErrorDialog";
 
 // Pages lazy-loaded so the initial bundle only carries the Live page. Every
 // other page is a separate chunk fetched when the user navigates to it.
@@ -192,6 +193,11 @@ export default function App() {
   }, [systemStatus]);
 
   const handleWsMessage = useCallback((msg: any) => {
+    // Wrap the whole dispatch — a malformed message that throws here
+    // would otherwise propagate out of the WS onmessage handler and up
+    // to the root error boundary, which tears down the entire app for
+    // what's usually a harmless schema drift. Log + move on instead.
+    try {
     if (msg.type === "partial_utterance" && msg.meeting_id === liveMeetingIdRef.current) {
       if (!msg.text) setLivePartial(null);
       else setLivePartial((prev) =>
@@ -201,7 +207,20 @@ export default function App() {
     }
     if (msg.type === "utterances" && msg.meeting_id === liveMeetingIdRef.current) {
       setLivePartial(null);
-      setLiveUtterances((prev) => [...prev, ...msg.data]);
+      setLiveUtterances((prev) => {
+        const next = prev.concat(msg.data);
+        // Cap the in-memory transcript at ~2000 utterances (≈ 2 hours
+        // of dense conversation). The DB has the full record, and the
+        // Review page re-fetches from there if the user wants to see
+        // the whole thing. Without the cap, a multi-hour meeting grows
+        // React state without bound and the transcript view slows to
+        // a crawl despite the Bubble memoization.
+        const MAX_LIVE_UTTERANCES = 2000;
+        if (next.length > MAX_LIVE_UTTERANCES) {
+          return next.slice(next.length - MAX_LIVE_UTTERANCES);
+        }
+        return next;
+      });
     }
     if (msg.type === "realtime_intelligence" && msg.meeting_id === liveMeetingIdRef.current) {
       setLiveIntel({
@@ -280,6 +299,9 @@ export default function App() {
       // place so the UI picks up the new value without a full refetch.
       setLiveMeeting((prev) => prev ? { ...prev, title: msg.title } : prev);
     }
+    } catch (err) {
+      console.warn("WS handler threw, message dropped:", err, msg);
+    }
   }, []);
   const { connected: wsConnected } = useWebSocket(handleWsMessage);
   const llm = useLLMHealth();
@@ -325,10 +347,24 @@ export default function App() {
       {/* Only render once the engine has finished loading — the welcome
           dialog displays the detected hardware, so we want the status
           poll to have brought in appStatus.hardware first. */}
-      {systemStatus !== "loading" && appStatus?.hardware && (
+      {systemStatus !== "loading" && !appStatus?.engine_load_error && appStatus?.hardware && (
         <WelcomeDialog
           hardware={appStatus.hardware}
           onOpenSettings={() => setPage("settings")}
+        />
+      )}
+      {/* Surface engine-load failures as a blocking dialog with a Retry
+          button. Previously these silently stranded the app on the
+          "Loading…" splash until the user force-quit. */}
+      {appStatus?.engine_load_error && (
+        <EngineErrorDialog
+          error={appStatus.engine_load_error}
+          reloading={systemStatus === "loading"}
+          onDismiss={() => {
+            // Optimistic clear — the next /api/status poll (or the WS
+            // status:ready event) brings the authoritative value back.
+            setAppStatus((s) => s ? { ...s, engine_load_error: null } : s);
+          }}
         />
       )}
       <Suspense fallback={null}>

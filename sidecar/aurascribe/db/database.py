@@ -120,15 +120,28 @@ CREATE TABLE IF NOT EXISTS daily_briefs (
 );
 
 CREATE INDEX IF NOT EXISTS idx_utterances_meeting ON utterances(meeting_id);
+-- Composite index for the realtime-intel transcript window query
+-- (SELECT ... WHERE meeting_id = ? AND end_time >= ? ORDER BY start_time).
+-- Without it, every intel refresh (every 5-20s during a live meeting)
+-- does a full scan of the meeting's utterances. A 90-minute meeting
+-- can have 2000+ rows, so the scan cost shows up as a visible delay
+-- before the Live Intel panel updates.
+CREATE INDEX IF NOT EXISTS idx_utterances_meeting_time
+    ON utterances(meeting_id, start_time);
 CREATE INDEX IF NOT EXISTS idx_voice_embeddings_voice ON voice_embeddings(voice_id);
 CREATE INDEX IF NOT EXISTS idx_voice_embeddings_meeting ON voice_embeddings(meeting_id);
 CREATE INDEX IF NOT EXISTS idx_voice_embeddings_utterance ON voice_embeddings(utterance_id);
+-- Speeds up Daily Brief regeneration + the Meeting Library list, both
+-- of which scan by date range + status. Without this index, each call
+-- does a full-table scan once there are more than a few days of meetings.
+CREATE INDEX IF NOT EXISTS idx_meetings_started_status
+    ON meetings(started_at, status);
 """
 
 # Bump this any time the SCHEMA block above changes shape. On mismatch,
 # `init_db` drops every table and recreates from scratch — see the
 # policy note at the top of this module.
-_CURRENT_SCHEMA_VERSION = "vault-bucket-1"
+_CURRENT_SCHEMA_VERSION = "perf-indices-1"
 
 
 async def init_db() -> None:
