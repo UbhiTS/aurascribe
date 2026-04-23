@@ -80,8 +80,11 @@ export async function discoverSidecarPort(): Promise<number> {
   return _sidecarDiscoveryPromise;
 }
 
+// Kept for import compatibility — resolved at module load (dev: "",
+// prod: http://127.0.0.1:<preferred-port>). Runtime call sites use
+// `sidecarHttpBase()` instead so a mid-session port switch via the
+// discovery flow is picked up without a reload.
 export const SIDECAR_HTTP_BASE = sidecarHttpBase();
-const BASE = `${SIDECAR_HTTP_BASE}/api`;
 
 export interface Utterance {
   id?: string;
