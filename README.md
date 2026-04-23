@@ -52,7 +52,7 @@ First launch shows a welcome dialog with your detected hardware and the chosen W
 
 **Adaptive hardware** — sidecar probes `ctranslate2` + `torch.cuda` at boot; picks `large-v3-turbo + cuda + float16` on ≥8 GB VRAM, scales down to `small + cpu + int8` if no GPU. Header chips show where each pipeline runs (Whisper, Diarize). Override any default in Settings.
 
-**Hands-free auto-capture** — opens a lightweight VAD stream when idle; auto-starts a meeting on sustained speech, auto-stops after sustained silence. Once silence has lasted past a configurable gate (default 5s), the Stop button morphs into a live `Stop in MM:SS` countdown so you know exactly how long until auto-stop fires — click to stop now, or let it run out. Manual recordings ignore auto-stop.
+**Hands-free auto-capture** — opens a lightweight VAD stream when idle; auto-starts a meeting on sustained speech (3s default gate), auto-stops after sustained silence. Once silence has lasted past a configurable gate (default 5s), the Stop button morphs into a live `Stop in MM:SS` countdown so you know exactly how long until auto-stop fires — click to stop now, or let it run out. Manual recordings ignore auto-stop. The toggle is usable mid-recording (off = "don't auto-start next time"; the active recording continues). Meetings with zero captured utterances are discarded on stop instead of polluting the library with empty rows.
 
 **Three audio sources** — **Microphone**, **System Audio** (WASAPI loopback / BlackHole captures Zoom/Teams/Meet participants), or **Mix** with Speex-AEC cancelling the loopback echo out of the mic so speakers-in-room don't double up. Last-used source persists by device name. Pre-recording VU + waveform animate the *selected* source so you can verify before hitting Start. Mic-permission failures surface a one-click "Open mic settings" modal.
 
@@ -75,11 +75,13 @@ People notes are keyed by `voice_id` in frontmatter, not filename — rename a n
 
 **Daily Brief** — end-of-day rollup of every meeting on a date: tl;dr, highlights, decisions, open threads, action items, per-person takeaways, themes, tomorrow's focus. Marked stale and rebuilt in the background when a meeting finishes (toggleable).
 
+**Meeting Library** — day-scoped browser: prev/next + native date picker match Daily Brief. Each card carries inline Summarize / Recompute / Delete icons; select multiple (or Select-all) and the bulk bar sweeps newest→oldest with an amber ring tracking the current card. Summarize is strictly sequential to avoid parallel LLM calls; Recompute fans out (DB-only). Live Feed keeps the last stopped meeting on screen until the next recording starts, so you never lose context mid-thought.
+
 **Meeting editing** — rename (Obsidian file moves to match), trim before/after a timestamp, split at a timestamp (both halves get their own files), bulk-delete by id list or "last N days", click-to-play any utterance into the Opus recording at that exact offset, summarize + suggest title in one LLM pass.
 
 **Editable prompts** — `live_intelligence.md`, `daily_brief.md`, `meeting_analysis.md` live under `APP_DATA/prompts/` (seeded from bundled defaults). One-click open from Settings; edits picked up on the next call.
 
-**Diagnostics** — React error boundary catches blank-screen renders; sidecar `sys.excepthook` writes `crash-YYYYMMDD-HHMMSS.log`; Rust panic hook writes `crash-<unix>-rust.log`; rotating file log (5 × 5 MB). Heartbeat polls `/api/status` every 30s — header flips to `Sidecar unreachable` if the process dies.
+**Diagnostics** — React error boundary catches blank-screen renders; sidecar `sys.excepthook` writes `crash-YYYYMMDD-HHMMSS.log`; Rust panic hook writes `crash-<unix>-rust.log`; rotating file log (5 × 5 MB). Heartbeat polls `/api/status` every 30s — header flips to `Sidecar unreachable` if the process dies. On launch the Rust shell sweeps the process table and kills any orphan sidecars from a prior crash so the fresh child always owns the canonical port.
 
 ---
 
@@ -100,7 +102,7 @@ Everything sits under one **data directory** (default `%APPDATA%\AuraScribe`). T
 | `obsidian_vault` | — | Vault root; empty disables Obsidian writes |
 | `rt_highlights_debounce_sec` / `_max_interval_sec` / `_window_sec` | `20` / `60` / `180` | Live-intel cadence + transcript window |
 | `auto_capture_enabled` | `true` | Master switch for hands-free start/stop |
-| `auto_capture_start_speech_sec` | `1.5` | Sustained speech before auto-start |
+| `auto_capture_start_speech_sec` | `3.0` | Sustained speech before auto-start |
 | `auto_capture_stop_silence_sec` | `30` | Sustained silence before auto-stop |
 | `auto_capture_countdown_after_silence_sec` | `5` | Silence before the Stop button shows the countdown |
 | `auto_capture_vad_threshold` | `0.5` | Listening sensitivity (raise in noisy rooms) |
@@ -227,7 +229,7 @@ Sidecar logs (incl. uvicorn) → stdout *and* `%APPDATA%\AuraScribe\logs\sidecar
 
 ## Roadmap
 
-- **Done** — Tauri + React + sidecar; SQLite + Obsidian writer; live transcription + speculative partials; pyannote 3.1 diarization; tag-as-you-go Voices + provisional clustering + per-utterance re-assignment; recompute; live intel (highlights + action items + support coaching) with same-call title refinement + freeze; daily brief with auto-refresh; meeting trim / split; mid-recording re-adoption; NSIS installer + PyInstaller bundling; CI matrix for CUDA/CPU; hardware auto-detect + user-overridable; first-run welcome dialog; file-based logs + crash dumps; mic-permission detection; error boundaries; follow-tail scroll pinning; persistent globally-unique speaker colors + custom avatar upload; WASAPI loopback + Speex-AEC mix; macOS arm64 support; auto-capture (sustained-speech start, sustained-silence stop) with countdown-on-Stop-button; **generic Obsidian layout (Meetings/People/Daily) with voice_id-keyed People notes + filename disambiguation on display-name collisions**.
+- **Done** — Tauri + React + sidecar; SQLite + Obsidian writer; live transcription + speculative partials; pyannote 3.1 diarization; tag-as-you-go Voices + provisional clustering + per-utterance re-assignment; recompute; live intel (highlights + action items + support coaching) with same-call title refinement + freeze; daily brief with auto-refresh; meeting trim / split; mid-recording re-adoption; NSIS installer + PyInstaller bundling; CI matrix for CUDA/CPU; hardware auto-detect + user-overridable; first-run welcome dialog; file-based logs + crash dumps; mic-permission detection; error boundaries; follow-tail scroll pinning; persistent globally-unique speaker colors + custom avatar upload; WASAPI loopback + Speex-AEC mix; macOS arm64 support; auto-capture (sustained-speech start, sustained-silence stop) with countdown-on-Stop-button + mid-recording toggle; generic Obsidian layout (Meetings/People/Daily) with voice_id-keyed People notes + filename disambiguation on display-name collisions; **Meeting Library date picker + per-card and sweep-highlighted bulk actions; Live Feed continuity across stop→start; empty-meeting drop on stop; orphan sidecar cleanup at startup**.
 - **Next** — Code-signing for the installer (kill the SmartScreen "Unknown publisher" warning).
 - **Backlog** — NVIDIA Parakeet-TDT 0.6B v3 as an optional ASR backend (NeMo on Windows is painful; deferred). Multi-vault routing. Scheduled meeting pre-briefs (calendar + prior-meeting context). Opt-in telemetry / crash uploader. MCP server (expose meetings / voices / intel to external agents). In-Settings mic test panel.
 
