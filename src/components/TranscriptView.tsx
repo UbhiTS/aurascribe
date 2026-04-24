@@ -1,6 +1,6 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
-  Check, Pencil, Plus, Scissors, GitBranch,
+  Pencil, Plus, Scissors, GitBranch,
   ArrowUpToLine, ArrowDownToLine, Play, Pause,
 } from "lucide-react";
 import { api } from "../lib/api";
@@ -107,7 +107,6 @@ export function TranscriptView({
   const [utterances, setUtterances] = useState<Utterance[]>([]);
   const [assignOpen, setAssignOpen] = useState<string | null>(null);
   const [toolsOpen, setToolsOpen] = useState<string | null>(null);
-  const [newSpeakerDraft, setNewSpeakerDraft] = useState("");
   const bottomRef = useRef<HTMLDivElement>(null);
 
   // Follow-tail scrolling — only auto-scroll to the bottom when the user is
@@ -343,7 +342,6 @@ export function TranscriptView({
       console.error("assign failed", e);
     }
     setAssignOpen(null);
-    setNewSpeakerDraft("");
     onVoicesChanged?.();
   };
 
@@ -430,8 +428,6 @@ export function TranscriptView({
                 anchorId !== undefined && setAssignOpen(assignOpen === anchorId ? null : anchorId)
               }
               onAssign={(speaker) => handleAssign(g.ids, g.speaker, speaker)}
-              newSpeakerDraft={newSpeakerDraft}
-              onNewSpeakerDraft={setNewSpeakerDraft}
               editable={editable}
               toolsOpen={anchorId !== undefined && toolsOpen === anchorId}
               onOpenTools={() =>
@@ -488,8 +484,6 @@ interface BubbleProps {
   assignOpen: boolean;
   onOpenAssign: () => void;
   onAssign: (speaker: string) => void;
-  newSpeakerDraft: string;
-  onNewSpeakerDraft: (v: string) => void;
   editable: boolean;
   toolsOpen: boolean;
   onOpenTools: () => void;
@@ -505,7 +499,7 @@ interface BubbleProps {
 
 function _Bubble({
   u, mine, color, voices, meetingRoster, selfSpeaker, assignOpen,
-  onOpenAssign, onAssign, newSpeakerDraft, onNewSpeakerDraft,
+  onOpenAssign, onAssign,
   editable, toolsOpen, onOpenTools, onTrimBefore, onTrimAfter, onSplitHere,
   isFirst, isLast, canPlay, isPlaying, onTogglePlay,
 }: BubbleProps) {
@@ -616,28 +610,31 @@ function _Bubble({
               <div className="px-2 py-1 text-[10px] uppercase tracking-wider text-gray-500">
                 {/^Speaker \d+$/.test(u.speaker) ? `Tag all ${u.speaker} lines as` : "Assign this line to"}
               </div>
-              {showVoiceSearch && (
-                <div className="px-1.5 pb-1">
-                  <input
-                    autoFocus
-                    value={voiceSearch}
-                    onChange={(e) => setVoiceSearch(e.target.value)}
-                    onKeyDown={(e) => {
-                      if (e.key === "Enter" && q && filteredVoices.length > 0) {
-                        e.preventDefault();
-                        onAssign(filteredVoices[0].name);
-                      }
-                    }}
-                    placeholder="Search voices…"
-                    className="w-full text-sm bg-gray-800/60 border border-gray-700 focus:border-gray-500 rounded px-2 py-1 outline-none text-gray-200 placeholder:text-gray-500"
-                  />
-                </div>
-              )}
-              {voices.length === 0 && (
-                <div className="px-2 py-2 text-xs text-gray-500 italic">No voices yet — add one below</div>
-              )}
-              {q && filteredVoices.length === 0 && (
-                <div className="px-2 py-2 text-xs text-gray-500 italic">No matches — add as new voice below</div>
+              {/* Unified search + create: if the query matches an existing voice,
+                  Enter picks it (or click). If there's no match, Enter adds the
+                  trimmed query as a new voice and assigns this pill to it. */}
+              <div className="px-1.5 pb-1">
+                <input
+                  autoFocus
+                  value={voiceSearch}
+                  onChange={(e) => setVoiceSearch(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key !== "Enter") return;
+                    const trimmed = voiceSearch.trim();
+                    if (filteredVoices.length > 0) {
+                      e.preventDefault();
+                      onAssign(filteredVoices[0].name);
+                    } else if (trimmed) {
+                      e.preventDefault();
+                      onAssign(trimmed);
+                    }
+                  }}
+                  placeholder={voices.length === 0 ? "Type name, press Enter to add" : "Search or add voice…"}
+                  className="w-full text-sm bg-gray-800/60 border border-gray-700 focus:border-gray-500 rounded px-2 py-1 outline-none text-gray-200 placeholder:text-gray-500"
+                />
+              </div>
+              {voices.length === 0 && !q && (
+                <div className="px-2 py-2 text-xs text-gray-500 italic">No voices yet — type a name and press Enter.</div>
               )}
               {filteredVoices.map((v) => (
                 <button
@@ -655,28 +652,15 @@ function _Bubble({
               >
                 Unknown
               </button>
-              <div className="border-t border-gray-800 mt-1 pt-1">
-                <div className="flex items-center gap-1 px-2">
-                  <Plus size={12} className="text-gray-500" />
-                  <input
-                    value={newSpeakerDraft}
-                    onChange={(e) => onNewSpeakerDraft(e.target.value)}
-                    onKeyDown={(e) => {
-                      if (e.key === "Enter" && newSpeakerDraft.trim()) onAssign(newSpeakerDraft.trim());
-                    }}
-                    placeholder="New voice"
-                    className="flex-1 text-sm bg-transparent outline-none text-gray-200 py-1"
-                  />
-                  {newSpeakerDraft.trim() && (
-                    <button
-                      onClick={() => onAssign(newSpeakerDraft.trim())}
-                      className="text-emerald-400 hover:text-emerald-300"
-                    >
-                      <Check size={14} />
-                    </button>
-                  )}
-                </div>
-              </div>
+              {q && filteredVoices.length === 0 && (
+                <button
+                  onClick={() => onAssign(voiceSearch.trim())}
+                  className="w-full text-left px-2 py-1 text-sm rounded border-t border-gray-800 mt-1 pt-2 hover:bg-gray-800 flex items-center gap-1.5 text-gray-300"
+                >
+                  <Plus size={12} className="text-emerald-400" />
+                  Add <span className="text-emerald-400 font-medium">"{voiceSearch.trim()}"</span> as new voice
+                </button>
+              )}
             </div>
           )}
         </div>
@@ -702,7 +686,6 @@ export const Bubble = memo(_Bubble, (prev, next) => {
     && prev.meetingRoster === next.meetingRoster
     && prev.selfSpeaker === next.selfSpeaker
     && prev.assignOpen === next.assignOpen
-    && prev.newSpeakerDraft === next.newSpeakerDraft
     && prev.editable === next.editable
     && prev.toolsOpen === next.toolsOpen
     && prev.isFirst === next.isFirst

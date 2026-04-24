@@ -1,0 +1,524 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>LLM Endpoint Explorer</title>
+<style>
+  :root {
+    --bg: #0b0b0f;
+    --panel: #151520;
+    --panel2: #1c1c28;
+    --border: #27272a;
+    --text: #e5e7eb;
+    --muted: #71717a;
+    --subtle: #a1a1aa;
+    --ok: #10b981;
+    --err: #ef4444;
+    --pending: #f59e0b;
+    --accent: #38bdf8;
+  }
+  * { box-sizing: border-box; }
+  body {
+    font: 14px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    max-width: 1080px;
+    margin: 32px auto;
+    padding: 0 20px;
+  }
+  h1 { font-size: 22px; margin: 0 0 6px; }
+  .sub { color: var(--muted); font-size: 13px; margin-bottom: 22px; }
+  code { font: 12px ui-monospace, SFMono-Regular, Consolas, monospace; color: var(--accent); }
+
+  .controls { display: grid; grid-template-columns: 2fr 1fr auto; gap: 10px; align-items: end; }
+  .controls.second { grid-template-columns: 1fr 1fr auto auto; margin-top: 10px; }
+  label { display: block; font-size: 11px; color: var(--muted); margin-bottom: 4px; text-transform: uppercase; letter-spacing: 0.04em; }
+  input, select {
+    width: 100%;
+    padding: 9px 11px;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    color: var(--text);
+    font: 13px ui-monospace, SFMono-Regular, Consolas, monospace;
+  }
+  input:focus, select:focus { outline: none; border-color: var(--ok); }
+  button {
+    padding: 9px 16px;
+    background: var(--ok);
+    color: var(--bg);
+    border: none;
+    border-radius: 6px;
+    font-weight: 600;
+    cursor: pointer;
+    font-size: 13px;
+  }
+  button.secondary {
+    background: var(--panel2);
+    color: var(--text);
+    border: 1px solid var(--border);
+  }
+  button:disabled { opacity: 0.45; cursor: default; }
+
+  #summary {
+    margin-top: 22px;
+    padding: 12px 14px;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    font-size: 13px;
+    display: none;
+  }
+  #summary.show { display: block; }
+  #summary .stat { display: inline-block; margin-right: 18px; color: var(--subtle); }
+  #summary .stat b { color: var(--text); font-weight: 600; }
+  #summary .status-ok  { color: var(--ok); }
+  #summary .status-err { color: var(--err); }
+
+  #models { margin-top: 14px; display: grid; grid-template-columns: 1fr; gap: 8px; }
+  .model {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 12px 14px;
+  }
+  .model .row1 {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    flex-wrap: wrap;
+  }
+  .model .id {
+    font: 13px ui-monospace, monospace;
+    font-weight: 600;
+    color: var(--text);
+    flex: 1;
+    min-width: 180px;
+    word-break: break-all;
+  }
+  .model .stats {
+    display: flex;
+    gap: 14px;
+    flex-wrap: wrap;
+    font-size: 12px;
+    color: var(--subtle);
+  }
+  .model .stat-pill {
+    font: 12px ui-monospace, monospace;
+  }
+  .model .stat-pill b { color: var(--text); font-weight: 600; }
+  .model .actions { display: flex; gap: 6px; }
+  .model .actions button { padding: 5px 10px; font-size: 11px; }
+  .model .more {
+    display: none;
+    margin-top: 10px;
+    padding-top: 10px;
+    border-top: 1px dashed var(--border);
+  }
+  .model.open .more { display: block; }
+  .model pre {
+    background: #0f0f15;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 10px;
+    font: 11px ui-monospace, monospace;
+    color: #d4d4d8;
+    overflow: auto;
+    max-height: 260px;
+    margin: 0;
+    white-space: pre-wrap;
+    word-break: break-all;
+  }
+  .model .chat-result {
+    margin-top: 8px;
+    padding: 8px 10px;
+    background: #0f0f15;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    font: 12px ui-monospace, monospace;
+  }
+  .model .chat-result.ok  { border-color: color-mix(in srgb, var(--ok)  40%, var(--border)); }
+  .model .chat-result.err { border-color: color-mix(in srgb, var(--err) 40%, var(--border)); }
+
+  #error {
+    margin-top: 18px;
+    padding: 12px 14px;
+    background: color-mix(in srgb, var(--err) 10%, var(--panel));
+    border: 1px solid color-mix(in srgb, var(--err) 40%, var(--border));
+    border-radius: 6px;
+    font-size: 13px;
+    display: none;
+  }
+  #error.show { display: block; }
+  #error pre {
+    margin: 8px 0 0;
+    font: 11px ui-monospace, monospace;
+    color: #fca5a5;
+    background: transparent;
+    border: none;
+    padding: 0;
+    white-space: pre-wrap;
+    word-break: break-all;
+    max-height: 260px;
+    overflow: auto;
+  }
+
+  .hint { color: var(--muted); font-size: 12px; margin-top: 24px; line-height: 1.6; }
+</style>
+</head>
+<body>
+  <h1>LLM Endpoint Explorer</h1>
+  <div class="sub">Queries an OpenAI-compatible <code>/models</code> endpoint and surfaces every stat it returns — context window, output cap, pricing, modality, ownership. Run a per-model chat round-trip to confirm the full path works.</div>
+
+  <div class="controls">
+    <div>
+      <label>Base URL</label>
+      <input id="base" type="text" placeholder="http://127.0.0.1:1234/v1" value="http://127.0.0.1:1234/v1" autocomplete="off" />
+    </div>
+    <div>
+      <label>API Key</label>
+      <input id="key" type="password" placeholder="any non-empty for LM Studio" value="lm-studio" autocomplete="off" />
+    </div>
+    <button id="run">Discover</button>
+  </div>
+
+  <div class="controls second">
+    <div>
+      <label>Filter</label>
+      <input id="filter" type="text" placeholder="substring match on model id" autocomplete="off" />
+    </div>
+    <div>
+      <label>Sort by</label>
+      <select id="sort">
+        <option value="id">Model id (A→Z)</option>
+        <option value="context">Context window (desc)</option>
+        <option value="output">Output cap (desc)</option>
+        <option value="created">Created (newest first)</option>
+      </select>
+    </div>
+    <button class="secondary" id="expand-all">Expand all</button>
+    <button class="secondary" id="collapse-all">Collapse all</button>
+  </div>
+
+  <div id="summary"></div>
+  <div id="error"></div>
+  <div id="models"></div>
+
+  <div class="hint">
+    Runs entirely in the browser. Not every provider populates every field via <code>/models</code> — OpenAI returns only <code>id/created/owned_by</code>; LM Studio returns just <code>id</code>; OpenRouter returns the richest data (context, pricing, modality). Use <code>Test</code> on any model to confirm <code>/chat/completions</code> actually works end-to-end. If a provider blocks cross-origin (Anthropic direct API, Gemini native) you'll see a network error — use a local relay or CLI in that case.
+  </div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const elModels  = $('models');
+const elSummary = $('summary');
+const elError   = $('error');
+
+let lastModels = []; // keep the raw list around for filter/sort without refetching
+
+// ─── Helpers ──────────────────────────────────────────────────────────────
+
+function normBase(s) { return s.trim().replace(/\/+$/, ''); }
+
+function fmtNum(n) {
+  if (n == null) return null;
+  if (n >= 1_000_000) return (n / 1_000_000).toFixed(n % 1_000_000 === 0 ? 0 : 2) + 'M';
+  if (n >= 1_000)     return (n / 1_000).toFixed(n % 1_000 === 0 ? 0 : 1) + 'K';
+  return String(n);
+}
+
+function fmtDate(t) {
+  if (!t) return null;
+  // Unix seconds vs ms heuristic
+  const ms = t < 1e12 ? t * 1000 : t;
+  try { return new Date(ms).toISOString().slice(0, 10); } catch { return null; }
+}
+
+function fmtPrice(v) {
+  // OpenRouter returns pricing as dollars-per-token strings, e.g. "0.0000025"
+  if (v == null) return null;
+  const num = typeof v === 'string' ? parseFloat(v) : v;
+  if (!Number.isFinite(num)) return null;
+  if (num === 0) return '$0';
+  const perM = num * 1_000_000;
+  if (perM >= 1)   return `$${perM.toFixed(2)}/MTok`;
+  if (perM >= 0.01) return `$${perM.toFixed(3)}/MTok`;
+  return `$${perM.toExponential(1)}/MTok`;
+}
+
+// Pull known stat fields from the many shapes different providers use.
+function statsFor(m) {
+  const out = { raw: m };
+  out.id = m.id || m.name || '(no id)';
+  out.created = m.created ?? null;
+  out.owned_by = m.owned_by || m.owned_by_name || m.publisher || null;
+  out.context =
+    m.context_length ??
+    m.context_window ??
+    m.max_context_length ??
+    m?.top_provider?.context_length ??
+    null;
+  out.output =
+    m.max_completion_tokens ??
+    m.max_output_tokens ??
+    m.output_token_limit ??
+    m?.top_provider?.max_completion_tokens ??
+    null;
+  out.modality = m?.architecture?.modality ?? m?.modality ?? null;
+  out.tokenizer = m?.architecture?.tokenizer ?? null;
+  out.price_in  = m?.pricing?.prompt ?? m?.pricing?.input ?? null;
+  out.price_out = m?.pricing?.completion ?? m?.pricing?.output ?? null;
+  out.description = m.description || null;
+  return out;
+}
+
+function showError(title, detail) {
+  elError.innerHTML = '';
+  const h = document.createElement('div');
+  h.innerHTML = `<b>${title}</b>`;
+  elError.appendChild(h);
+  if (detail) {
+    const pre = document.createElement('pre');
+    pre.textContent = typeof detail === 'string' ? detail : JSON.stringify(detail, null, 2);
+    elError.appendChild(pre);
+  }
+  elError.classList.add('show');
+}
+function clearError() {
+  elError.classList.remove('show');
+  elError.innerHTML = '';
+}
+
+// ─── Discovery ────────────────────────────────────────────────────────────
+
+async function discover() {
+  clearError();
+  elModels.innerHTML = '';
+  elSummary.classList.remove('show');
+  const base = normBase($('base').value);
+  const key  = $('key').value.trim();
+  if (!base || !key) { showError('Base URL and API Key are required.'); return; }
+
+  $('run').disabled = true;
+  const t0 = performance.now();
+  try {
+    const res = await fetch(`${base}/models`, {
+      headers: { 'Authorization': `Bearer ${key}` },
+    });
+    const dt = Math.round(performance.now() - t0);
+    const text = await res.text();
+    if (!res.ok) {
+      showError(`${base}/models → ${res.status} ${res.statusText} (${dt} ms)`, text);
+      return;
+    }
+    let data;
+    try { data = JSON.parse(text); }
+    catch { showError(`${base}/models → non-JSON response (${dt} ms)`, text); return; }
+
+    const arr = Array.isArray(data) ? data : (data.data || data.models || []);
+    if (!Array.isArray(arr) || arr.length === 0) {
+      showError('No models returned.', data);
+      return;
+    }
+    lastModels = arr.map(statsFor);
+    renderSummary(dt);
+    applyViewAndRender();
+  } catch (e) {
+    showError('Network error reaching endpoint.', e.message || String(e));
+  } finally {
+    $('run').disabled = false;
+  }
+}
+
+function renderSummary(fetchMs) {
+  const withCtx = lastModels.filter((m) => m.context != null);
+  const withOut = lastModels.filter((m) => m.output != null);
+  const withPx  = lastModels.filter((m) => m.price_in != null || m.price_out != null);
+  const maxCtx  = withCtx.reduce((a, m) => Math.max(a, m.context), 0);
+  const minCtx  = withCtx.length ? withCtx.reduce((a, m) => Math.min(a, m.context), Infinity) : null;
+
+  const parts = [];
+  parts.push(`<span class="stat">Models: <b>${lastModels.length}</b></span>`);
+  parts.push(`<span class="stat">Fetch: <b>${fetchMs} ms</b></span>`);
+  if (withCtx.length) parts.push(`<span class="stat">Context reported: <b>${withCtx.length}/${lastModels.length}</b> (${fmtNum(minCtx)}–${fmtNum(maxCtx)})</span>`);
+  if (withOut.length) parts.push(`<span class="stat">Output cap reported: <b>${withOut.length}/${lastModels.length}</b></span>`);
+  if (withPx.length)  parts.push(`<span class="stat">Pricing reported: <b>${withPx.length}/${lastModels.length}</b></span>`);
+  elSummary.innerHTML = parts.join('');
+  elSummary.classList.add('show');
+}
+
+// ─── View ─────────────────────────────────────────────────────────────────
+
+function applyViewAndRender() {
+  const q = $('filter').value.trim().toLowerCase();
+  const sort = $('sort').value;
+  let view = q ? lastModels.filter((m) => m.id.toLowerCase().includes(q)) : lastModels.slice();
+  const cmpNumDesc = (key) => (a, b) => (b[key] ?? -1) - (a[key] ?? -1);
+  if      (sort === 'id')      view.sort((a, b) => a.id.localeCompare(b.id));
+  else if (sort === 'context') view.sort(cmpNumDesc('context'));
+  else if (sort === 'output')  view.sort(cmpNumDesc('output'));
+  else if (sort === 'created') view.sort(cmpNumDesc('created'));
+  renderModels(view);
+}
+
+function renderModels(view) {
+  elModels.innerHTML = '';
+  for (const m of view) {
+    elModels.appendChild(renderOne(m));
+  }
+  if (!view.length) {
+    const empty = document.createElement('div');
+    empty.className = 'model';
+    empty.style.color = 'var(--muted)';
+    empty.textContent = 'No models match the filter.';
+    elModels.appendChild(empty);
+  }
+}
+
+function renderOne(m) {
+  const el = document.createElement('div');
+  el.className = 'model';
+
+  const row1 = document.createElement('div');
+  row1.className = 'row1';
+
+  const id = document.createElement('div');
+  id.className = 'id';
+  id.textContent = m.id;
+  row1.appendChild(id);
+
+  const stats = document.createElement('div');
+  stats.className = 'stats';
+  const pill = (label, val) => {
+    const d = document.createElement('div');
+    d.className = 'stat-pill';
+    d.innerHTML = `${label}: <b>${val}</b>`;
+    return d;
+  };
+  if (m.context != null) stats.appendChild(pill('ctx', fmtNum(m.context)));
+  if (m.output  != null) stats.appendChild(pill('out', fmtNum(m.output)));
+  if (m.modality)        stats.appendChild(pill('mode', m.modality));
+  if (m.price_in  != null) {
+    const p = fmtPrice(m.price_in);
+    if (p) stats.appendChild(pill('in', p));
+  }
+  if (m.price_out != null) {
+    const p = fmtPrice(m.price_out);
+    if (p) stats.appendChild(pill('out $', p));
+  }
+  if (m.owned_by)        stats.appendChild(pill('by', m.owned_by));
+  const d = fmtDate(m.created);
+  if (d)                 stats.appendChild(pill('created', d));
+  row1.appendChild(stats);
+
+  const actions = document.createElement('div');
+  actions.className = 'actions';
+  const rawBtn  = document.createElement('button');
+  rawBtn.className = 'secondary';
+  rawBtn.textContent = 'Raw';
+  rawBtn.addEventListener('click', () => el.classList.toggle('open'));
+  const testBtn = document.createElement('button');
+  testBtn.textContent = 'Test';
+  testBtn.addEventListener('click', () => runChatTest(m, el, testBtn));
+  actions.appendChild(rawBtn);
+  actions.appendChild(testBtn);
+  row1.appendChild(actions);
+
+  el.appendChild(row1);
+
+  const more = document.createElement('div');
+  more.className = 'more';
+  if (m.description) {
+    const desc = document.createElement('div');
+    desc.style.cssText = 'margin-bottom: 8px; color: var(--subtle); font-size: 12px;';
+    desc.textContent = m.description;
+    more.appendChild(desc);
+  }
+  const pre = document.createElement('pre');
+  pre.textContent = JSON.stringify(m.raw, null, 2);
+  more.appendChild(pre);
+  el.appendChild(more);
+
+  return el;
+}
+
+// ─── Chat round-trip ──────────────────────────────────────────────────────
+
+async function runChatTest(m, container, btn) {
+  const base = normBase($('base').value);
+  const key  = $('key').value.trim();
+  if (!base || !key) return;
+
+  // Replace / create a result block for this model
+  let out = container.querySelector('.chat-result');
+  if (!out) {
+    out = document.createElement('div');
+    out.className = 'chat-result';
+    container.appendChild(out);
+  }
+  out.className = 'chat-result';
+  out.textContent = 'sending "ping"...';
+
+  btn.disabled = true;
+  const t0 = performance.now();
+  try {
+    const res = await fetch(`${base}/chat/completions`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${key}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        model: m.id,
+        messages: [
+          { role: 'system', content: 'You reply with exactly one word.' },
+          { role: 'user',   content: 'Say: pong' },
+        ],
+        max_tokens: 16,
+        temperature: 0,
+      }),
+    });
+    const dt = Math.round(performance.now() - t0);
+    const text = await res.text();
+    if (!res.ok) {
+      out.className = 'chat-result err';
+      out.textContent = `✗ ${res.status} ${res.statusText} (${dt} ms)\n${text.slice(0, 600)}`;
+      return;
+    }
+    let data;
+    try { data = JSON.parse(text); }
+    catch { out.className = 'chat-result err'; out.textContent = `✗ non-JSON response (${dt} ms)\n${text.slice(0, 600)}`; return; }
+    const reply = data?.choices?.[0]?.message?.content?.trim();
+    const usage = data?.usage;
+    const usageStr = usage
+      ? ` · prompt=${usage.prompt_tokens ?? '?'}, completion=${usage.completion_tokens ?? '?'}, total=${usage.total_tokens ?? '?'}`
+      : '';
+    if (!reply) {
+      out.className = 'chat-result err';
+      out.textContent = `✗ empty choices (${dt} ms)${usageStr}\n${text.slice(0, 600)}`;
+      return;
+    }
+    out.className = 'chat-result ok';
+    out.textContent = `✓ "${reply}" (${dt} ms)${usageStr}`;
+  } catch (e) {
+    out.className = 'chat-result err';
+    out.textContent = `✗ ${e.message || 'network error'}`;
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+// ─── Wiring ───────────────────────────────────────────────────────────────
+
+$('run').addEventListener('click', discover);
+for (const id of ['base', 'key']) {
+  $(id).addEventListener('keydown', (e) => { if (e.key === 'Enter') discover(); });
+}
+$('filter').addEventListener('input', () => { if (lastModels.length) applyViewAndRender(); });
+$('sort'  ).addEventListener('change', () => { if (lastModels.length) applyViewAndRender(); });
+$('expand-all'  ).addEventListener('click', () => elModels.querySelectorAll('.model').forEach((el) => el.classList.add('open')));
+$('collapse-all').addEventListener('click', () => elModels.querySelectorAll('.model').forEach((el) => el.classList.remove('open')));
+</script>
+</body>
+</html>
