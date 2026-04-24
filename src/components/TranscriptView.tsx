@@ -515,7 +515,6 @@ function _Bubble({
   const filteredVoices = q
     ? voices.filter((v) => v.name.toLowerCase().includes(q))
     : voices.filter((v) => meetingRoster.has(v.name));
-  const showVoiceSearch = voices.length > 0;
   return (
     <div className={`flex gap-3 items-start group/bubble ${mine ? "flex-row-reverse" : ""}`}>
       <Avatar name={u.speaker} size="md" gradient={color.avatar} src={avatarSrcFor(u.speaker, voices)} />
