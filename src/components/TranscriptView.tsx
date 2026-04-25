@@ -306,33 +306,40 @@ export function TranscriptView({
 
   const handleAssign = async (utteranceIds: string[], oldSpeaker: string, speaker: string) => {
     if (!meetingId || utteranceIds.length === 0) return;
-    // Provisional labels ("Speaker 1", "Speaker 2"...) always rename in bulk:
-    // the user is telling us who the mystery speaker is, so every line tagged
-    // with that number should flip — and the embeddings get folded into the
-    // Voice so future chunks match automatically. Clearing to "Unknown" stays
-    // per-utterance (single-line fix, not "forget them").
+    // "1 click on a speaker chip = 1 voice sample enrolled" — regardless of
+    // how many sentences ride along on the relabel. The first id in
+    // `utteranceIds` is the user-clicked anchor; only that one folds into
+    // the Voice's pool. The rest update display-only.
+    //
+    // - Provisional ("Speaker N") → Voice : rename whole cluster, enroll anchor
+    // - Voice → Voice on merged bubble    : rename every underlying pill,
+    //                                       enroll anchor, others enroll=false
+    // - Per-pill assign                   : single utterance, single sample
+    // - Clear → Unknown                   : narrow to anchor only
     const isProvisional = /^Speaker \d+$/.test(oldSpeaker);
     const isClear = !speaker || speaker.toLowerCase() === "unknown";
     const idSet = new Set(utteranceIds);
+    const anchor = utteranceIds[0];
     try {
       if (isProvisional && !isClear) {
-        await api.meetings.renameSpeaker(meetingId, oldSpeaker, speaker);
+        await api.meetings.renameSpeaker(meetingId, oldSpeaker, speaker, anchor);
         setUtterances((prev) =>
           prev.map((u) => (u.speaker === oldSpeaker ? { ...u, speaker } : u))
         );
       } else if (isClear) {
         // Clearing: only the anchor utterance — keep the "lose the ability to
         // re-learn from one mistagged line" behavior scoped narrowly.
-        const anchor = utteranceIds[0];
         const res = await api.meetings.assignSpeaker(meetingId, anchor, speaker);
         setUtterances((prev) =>
           prev.map((u) => (u.id === anchor ? { ...u, speaker: res.speaker } : u))
         );
       } else {
-        // Voice assignment on a merged bubble — apply to every underlying
-        // utterance so the whole pill flips (and every embedding folds in).
-        for (const id of utteranceIds) {
-          await api.meetings.assignSpeaker(meetingId, id, speaker);
+        // Merged-bubble voice assignment: enroll the anchor (1 sample), then
+        // relabel the rest with enroll=false so the pill flips uniformly
+        // without manufacturing N-1 extra samples for the same click.
+        await api.meetings.assignSpeaker(meetingId, anchor, speaker, true, true);
+        for (const id of utteranceIds.slice(1)) {
+          await api.meetings.assignSpeaker(meetingId, id, speaker, true, false);
         }
         setUtterances((prev) =>
           prev.map((u) => (u.id && idSet.has(u.id) ? { ...u, speaker } : u))
@@ -620,10 +627,23 @@ function _Bubble({
                   onKeyDown={(e) => {
                     if (e.key !== "Enter") return;
                     const trimmed = voiceSearch.trim();
+                    if (!trimmed) return;
+                    // Exact case-insensitive name match wins over partial
+                    // matches — typing "me" / "ME" / "Me" all resolve to the
+                    // existing "Me" voice rather than alphabetically-earlier
+                    // partial hits like "Mehmet".
+                    const exact = voices.find(
+                      (v) => v.name.toLowerCase() === trimmed.toLowerCase(),
+                    );
+                    if (exact) {
+                      e.preventDefault();
+                      onAssign(exact.name);
+                      return;
+                    }
                     if (filteredVoices.length > 0) {
                       e.preventDefault();
                       onAssign(filteredVoices[0].name);
-                    } else if (trimmed) {
+                    } else {
                       e.preventDefault();
                       onAssign(trimmed);
                     }

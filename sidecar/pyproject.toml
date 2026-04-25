@@ -40,6 +40,13 @@ asr = [
     "soundcard>=0.4.6; sys_platform == 'win32'",
     # soxr is used for resampling on both platforms.
     "soxr>=0.3.7",
+    # Bundles a static ffmpeg binary inside the wheel and exposes its
+    # path via `imageio_ffmpeg.get_ffmpeg_exe()`. We use it for the
+    # /api/meetings/import endpoint so users on a fresh install can
+    # convert mp3/m4a/wav/mp4 to opus without having to install ffmpeg
+    # themselves. PyInstaller's collect_all picks the binary up so it
+    # rides along in the packaged sidecar.
+    "imageio-ffmpeg>=0.5",
 ]
 diarization = [
     "torch>=2.5",

@@ -29,6 +29,11 @@ from pathlib import Path
 import aiosqlite
 from fastapi import HTTPException, WebSocket
 
+from aurascribe.audio.naming import (
+    desired_audio_filename,
+    find_meeting_audio_file,
+    sync_meeting_audio_filename,
+)
 from aurascribe.config import AUDIO_DIR, DB_PATH
 from aurascribe.llm.analysis import (
     AnalysisEmptyError,
@@ -192,14 +197,24 @@ async def backfill_voice_colors(db: aiosqlite.Connection) -> None:
     await db.commit()
 
 
-async def get_or_create_voice(db: aiosqlite.Connection, name: str) -> str:
-    """Return voice_id for `name`, creating the row with a fresh color if new.
-    Works whether or not the caller has set a row_factory — positional [0]
-    access is supported by both tuples and aiosqlite.Row."""
-    cursor = await db.execute("SELECT id FROM voices WHERE name = ?", (name,))
+async def get_or_create_voice(
+    db: aiosqlite.Connection, name: str
+) -> tuple[str, str]:
+    """Return (voice_id, canonical_name) for `name`, creating with a fresh
+    color when new. Lookup is case-insensitive against the stored display
+    name — typing "me", "ME", or " Me " all resolve to the existing "Me"
+    voice if one is present, and the caller gets back the canonical "Me"
+    so the transcript pill stays consistent. New voices are stored with
+    `name` as typed (stripped). Works whether or not the caller has set
+    a row_factory — positional [0]/[1] access is supported by both tuples
+    and aiosqlite.Row."""
+    name = name.strip()
+    cursor = await db.execute(
+        "SELECT id, name FROM voices WHERE LOWER(name) = LOWER(?)", (name,)
+    )
     row = await cursor.fetchone()
     if row is not None:
-        return str(row[0])
+        return str(row[0]), str(row[1])
     voice_id = str(uuid.uuid4())
     color = await next_voice_color(db)
     now = datetime.now().isoformat()
@@ -208,7 +223,7 @@ async def get_or_create_voice(db: aiosqlite.Connection, name: str) -> str:
         "VALUES (?, ?, ?, ?, ?)",
         (voice_id, name, color, now, now),
     )
-    return voice_id
+    return voice_id, name
 
 
 async def bump_meeting_tag(db: aiosqlite.Connection, meeting_id: str) -> None:
@@ -249,12 +264,13 @@ def delete_audio_files(meeting_ids: list[str]) -> None:
     """Remove the .opus recording for each id. Best-effort — the meeting rows
     are already gone, so a lingering file would just waste disk."""
     for mid in meeting_ids:
-        p = AUDIO_DIR / f"{mid}.opus"
-        if p.exists():
-            try:
-                p.unlink()
-            except Exception as e:
-                log.warning("could not delete audio file %s: %s", p, e)
+        p = find_meeting_audio_file(mid)
+        if p is None:
+            continue
+        try:
+            p.unlink()
+        except Exception as e:
+            log.warning("could not delete audio file %s: %s", p, e)
 
 
 def delete_vault_files(vault_paths: list[str | None]) -> None:
@@ -378,7 +394,8 @@ async def rename_with_vault_move(
 ) -> None:
     """Apply a rename and move the Obsidian file to match — same machinery
     the /rename endpoint uses, factored out so the auto-rename path
-    doesn't duplicate it."""
+    doesn't duplicate it. Also renames the on-disk .opus to match the new
+    title so the audio folder stays browsable."""
     new_title = new_title.strip()
     if not new_title:
         return
@@ -386,6 +403,7 @@ async def rename_with_vault_move(
         await db.execute(
             "UPDATE meetings SET title = ? WHERE id = ?", (new_title, meeting_id)
         )
+        await sync_meeting_audio_filename(db, meeting_id)
         await db.commit()
     if old_vault_path:
         old_file = Path(old_vault_path)

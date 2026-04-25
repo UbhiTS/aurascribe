@@ -20,6 +20,11 @@ import aiosqlite
 import numpy as np
 
 from aurascribe.audio.capture import AudioCapture
+from aurascribe.audio.naming import (
+    desired_audio_filename,
+    find_meeting_audio_file,
+    sync_meeting_audio_filename,
+)
 from aurascribe.config import (
     AUDIO_DIR,
     DB_PATH,
@@ -656,6 +661,123 @@ class MeetingManager:
             )
             await db.commit()
 
+    # ── File import ───────────────────────────────────────────────────────────
+
+    async def import_audio_file(
+        self,
+        opus_src: Path,
+        title: str,
+        started_at: str,
+        summarize: bool = True,
+    ) -> dict:
+        """Import an already-transcoded 16 kHz mono Opus file as a new
+        completed meeting. The route layer (`/api/meetings/import`) runs
+        the upload through ffmpeg first, then hands the temp .opus path
+        here. We:
+
+        1. Move the file into AUDIO_DIR with the canonical
+           "<uuid> - <title>.opus" name.
+        2. INSERT a meetings row with the supplied `started_at` (the file
+           mtime from the upload, so old recordings show up at their
+           original date in the library + Daily Brief).
+        3. Decode to numpy and run the engine's full transcribe + diarize
+           pipeline — single chunk, audio_start mirrors u.start.
+        4. Cluster leftover Unknowns into provisional Speaker N labels
+           (same in-memory machinery the live path uses) so the user can
+           tag them in the transcript.
+        5. Save utterances + run the existing `_finalize_meeting` path,
+           which handles status='done', vault write, AI summary, and the
+           audio-file rename for any title the AI suggests.
+
+        Returns the finalize-result dict (same shape as a stopped recording).
+        Raises RuntimeError on failure with the meeting row + file cleaned
+        up so the import is fully rolled back.
+        """
+        if not self._ready:
+            raise RuntimeError("Models still loading — try again in a moment")
+
+        title = (title or "").strip() or "Imported Audio"
+        meeting_id = str(uuid.uuid4())
+        final_path = AUDIO_DIR / desired_audio_filename(meeting_id, title)
+
+        try:
+            # Move (cheap rename when src + dst are on the same volume).
+            opus_src.rename(final_path)
+        except OSError:
+            # Fallback for cross-volume case (Windows can't rename across drives).
+            import shutil
+            shutil.move(str(opus_src), str(final_path))
+
+        try:
+            async with aiosqlite.connect(DB_PATH) as db:
+                await db.execute(
+                    "INSERT INTO meetings (id, title, started_at, status, audio_path) "
+                    "VALUES (?, ?, ?, 'recording', ?)",
+                    (meeting_id, title, started_at, str(final_path)),
+                )
+                await db.commit()
+
+            # Decode the freshly-encoded opus back to a numpy array so
+            # whisper/pyannote can run on it. Reuses the same loader the
+            # recompute endpoint uses for offline audio.
+            import soundfile as sf
+            loop = asyncio.get_running_loop()
+
+            def _decode() -> np.ndarray:
+                data, sr = sf.read(str(final_path), dtype="float32", always_2d=False)
+                if data.ndim > 1:
+                    data = data.mean(axis=1)
+                # ffmpeg already resampled to 16 kHz, but be defensive in
+                # case a future code path skips the transcode step.
+                if sr != 16_000:
+                    from scipy.signal import resample_poly
+                    g = np.gcd(sr, 16_000)
+                    data = resample_poly(data, 16_000 // g, sr // g).astype(np.float32)
+                return np.ascontiguousarray(data, dtype=np.float32)
+
+            audio = await loop.run_in_executor(None, _decode)
+
+            # Single-shot full-audio transcribe: pyannote runs once across
+            # the whole file (no live-recording chunk loop), so audio_start
+            # for each utterance == u.start (no per-chunk elapsed offset).
+            utterances = await self.engine.transcribe(audio, diarize=True)
+            for u in utterances:
+                u.audio_start = u.start
+
+            # Cluster the leftover Unknowns into provisional "Speaker N"
+            # labels just like the live path does, so the user can tag them
+            # in the transcript and the cluster fold (one click → one
+            # voice sample) works on imported meetings too.
+            self._provisional_pools[meeting_id] = {}
+            self._provisional_next_n[meeting_id] = 1
+            self._relabel_unknowns(meeting_id, utterances)
+
+            if utterances:
+                await self._save_utterances(meeting_id, utterances)
+
+            return await self._finalize_meeting(meeting_id, summarize=summarize)
+
+        except Exception:
+            # Roll back so a failed import doesn't leave a half-formed
+            # meeting + orphan opus on disk for the user to clean up.
+            try:
+                async with aiosqlite.connect(DB_PATH) as db:
+                    await db.execute("DELETE FROM utterances WHERE meeting_id = ?", (meeting_id,))
+                    await db.execute("DELETE FROM meetings WHERE id = ?", (meeting_id,))
+                    await db.commit()
+            except Exception as cleanup_err:
+                log.warning(
+                    "Could not roll back failed import %s: %s", meeting_id, cleanup_err,
+                )
+            if final_path.exists():
+                try:
+                    final_path.unlink()
+                except Exception:
+                    pass
+            self._provisional_pools.pop(meeting_id, None)
+            self._provisional_next_n.pop(meeting_id, None)
+            raise
+
     # ── Finalization ──────────────────────────────────────────────────────────
 
     async def _finalize_meeting(self, meeting_id: str, summarize: bool = False) -> dict:
@@ -669,8 +791,8 @@ class MeetingManager:
                 await db.execute("DELETE FROM utterances WHERE meeting_id = ?", (meeting_id,))
                 await db.execute("DELETE FROM meetings WHERE id = ?", (meeting_id,))
                 await db.commit()
-            audio_path = AUDIO_DIR / f"{meeting_id}.opus"
-            if audio_path.exists():
+            audio_path = find_meeting_audio_file(meeting_id)
+            if audio_path is not None:
                 try:
                     audio_path.unlink()
                 except Exception as e:
@@ -791,6 +913,10 @@ class MeetingManager:
                     meeting_id,
                 ),
             )
+            # Now that the recording is fully closed and the title may have
+            # been refined by the AI summary above, bring the on-disk
+            # filename in line with "<uuid> - <title>.opus".
+            await sync_meeting_audio_filename(db, meeting_id)
             await db.commit()
 
         return {

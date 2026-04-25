@@ -45,6 +45,10 @@ _base_packages = [
     # ASR + audio
     "faster_whisper", "ctranslate2", "sounddevice", "soundfile", "soxr",
     "scipy", "librosa", "numba", "numpy",
+    # Static ffmpeg binary used by the audio-import endpoint. collect_all
+    # picks up the bundled exe so `imageio_ffmpeg.get_ffmpeg_exe()`
+    # resolves inside the frozen sidecar without a system install.
+    "imageio_ffmpeg",
     # Diarization
     "torch", "torchaudio", "pyannote", "pyannote.audio",
     "speechbrain", "omegaconf", "lightning_fabric", "pytorch_lightning",

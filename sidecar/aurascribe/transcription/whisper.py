@@ -334,6 +334,76 @@ class WhisperEngine:
         turns.sort(key=lambda t: t[0])
         return turns
 
+    async def extract_segment_embedding(
+        self, audio: np.ndarray
+    ) -> bytes | None:
+        """Re-extract a pyannote centroid for a single audio slice.
+
+        Used by the rename-speaker / assign endpoints to recover an enrollable
+        sample when the stored utterance.embedding is None — pyannote's live
+        path attaches a chunk's centroid to one turn per label, so a "follower"
+        turn from the same speaker has no embedding even though the audio is
+        perfectly usable. Pickled and ready to drop into voice_embeddings.
+        Returns None when no usable centroid can be harvested (pipeline
+        unavailable, slice too quiet, degenerate output).
+        """
+        if self._diarization_pipeline is None:
+            return None
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, self._extract_segment_embedding_sync, audio)
+
+    def _extract_segment_embedding_sync(self, audio: np.ndarray) -> bytes | None:
+        import torch
+
+        waveform = torch.from_numpy(audio).unsqueeze(0)
+        try:
+            result = self._diarization_pipeline(
+                {"waveform": waveform, "sample_rate": SAMPLE_RATE}
+            )
+        except Exception as e:
+            log.warning("Segment embedding extraction failed: %s", e)
+            return None
+
+        emb_matrix = getattr(result, "speaker_embeddings", None)
+        if emb_matrix is None:
+            return None
+        arr = np.asarray(emb_matrix)
+        if arr.shape[0] == 0:
+            return None
+
+        # Pick the centroid with the most assigned audio in this slice.
+        # Single-speaker slices produce one row; mixed slices fall back to
+        # the longest-active speaker, which is the user's intent — they
+        # tagged the dominant voice in this sentence.
+        annotation = result
+        for attr in ("exclusive_speaker_diarization", "speaker_diarization", "annotation"):
+            if hasattr(result, attr):
+                annotation = getattr(result, attr)
+                break
+
+        best_idx = 0
+        if hasattr(annotation, "itertracks"):
+            try:
+                source = getattr(result, "speaker_diarization", annotation)
+                labels = list(source.labels())
+                durations: dict[str, float] = {lbl: 0.0 for lbl in labels}
+                for segment, _track, label in annotation.itertracks(yield_label=True):
+                    if str(label) in durations:
+                        durations[str(label)] += float(segment.end - segment.start)
+                if durations:
+                    dominant = max(durations.items(), key=lambda kv: kv[1])[0]
+                    best_idx = labels.index(dominant)
+            except Exception as e:
+                log.warning("Could not pick dominant speaker for slice: %s", e)
+                best_idx = 0
+
+        if best_idx >= arr.shape[0]:
+            best_idx = 0
+        embedding = arr[best_idx]
+        if not _valid_embedding(embedding):
+            return None
+        return pickle.dumps(embedding)
+
     def _transcribe_sync(
         self,
         audio: np.ndarray,
@@ -480,11 +550,13 @@ class WhisperEngine:
             label_resolution[local_label] = (speaker, embedding, distance)
 
         # Phase 2 — emit utterances in timeline order. A turn's speaker comes
-        # from Phase 1 when the label resolved; otherwise "Unknown". Embedding
-        # is attached to exactly one turn per label (the first) so cross-chunk
-        # clustering doesn't double-count the same centroid.
+        # from Phase 1 when the label resolved; otherwise "Unknown". The
+        # chunk-level centroid is attached to every same-label turn so the
+        # user can later tag any sentence and have something to enroll —
+        # not just the first turn of the cluster. Cross-chunk dedup is
+        # already handled by voice_embeddings.utterance_id, so duplicating
+        # the embedding here doesn't double-count.
         utterances: list[Utterance] = []
-        embedding_emitted: set[str] = set()
         for start, end, local_label in turns:
             if end - start < self._MIN_TURN_SEC:
                 continue
@@ -497,15 +569,11 @@ class WhisperEngine:
             resolved = label_resolution.get(local_label)
             if resolved is None:
                 speaker = "Unknown"
-                embedding_bytes = None
+                embedding_bytes: bytes | None = None
                 match_distance: float | None = None
             else:
                 speaker, embedding, match_distance = resolved
-                if local_label in embedding_emitted:
-                    embedding_bytes = None
-                else:
-                    embedding_bytes = pickle.dumps(embedding)
-                    embedding_emitted.add(local_label)
+                embedding_bytes = pickle.dumps(embedding)
                 if end - start < self._MIN_EMBED_TURN_SEC:
                     log.info(
                         "inherited %s for short turn %s (%.2f-%.2f)",
@@ -535,9 +603,6 @@ class WhisperEngine:
                         match_distance=match_distance,
                     )
                 )
-                # Embedding belongs to the first emitted utterance of this
-                # label, not to every ASR segment within it.
-                embedding_bytes = None
                 if on_partial:
                     on_partial(speaker, text)
         return utterances

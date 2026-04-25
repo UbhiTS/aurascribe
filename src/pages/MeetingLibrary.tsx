@@ -1,7 +1,7 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Search, Clock, FileText, Trash2, Loader, CheckSquare, Square,
-  ChevronLeft, ChevronRight, Sparkles, Speech,
+  ChevronLeft, ChevronRight, Sparkles, Speech, Upload,
 } from "lucide-react";
 import { api } from "../lib/api";
 import type { Meeting } from "../lib/api";
@@ -28,6 +28,15 @@ export function MeetingLibrary({ activeMeetingId, refreshKey, onOpen, selectedId
   // Which meeting the bulk loop is currently hitting the API for. Drives a
   // ring on the card so the user can see progress sweep top→down.
   const [processingId, setProcessingId] = useState<string | null>(null);
+  // Audio import (ffmpeg → opus → transcribe → finalize). Disabled while
+  // the upload + transcription is in flight; the file picker re-opens via
+  // the hidden <input ref={importInputRef}>.
+  const importInputRef = useRef<HTMLInputElement | null>(null);
+  const [importBusy, setImportBusy] = useState(false);
+  // ID of the most recently imported (or otherwise programmatically focused)
+  // meeting — gets a brief amber ring so the user can spot where their
+  // import landed, especially when we auto-jump to a different date.
+  const [highlightId, setHighlightId] = useState<string | null>(null);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -201,6 +210,46 @@ export function MeetingLibrary({ activeMeetingId, refreshKey, onOpen, selectedId
 
   const isToday = selectedDate === todayIso();
 
+  const handleImportClick = () => {
+    if (importBusy) return;
+    importInputRef.current?.click();
+  };
+
+  const handleImportFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    // Reset input so picking the same filename again still fires onChange.
+    e.target.value = "";
+    if (!file || importBusy) return;
+    setImportBusy(true);
+    try {
+      const meeting = await api.meetings.importAudio(file);
+      // Auto-navigate the date selector if the import landed on a
+      // different day (file mtime older than today, etc.) — otherwise
+      // the new card would be invisible until the user manually picks
+      // the right date. `started_at` is full ISO; trim to YYYY-MM-DD.
+      const importedDate = meeting.started_at.slice(0, 10);
+      if (importedDate !== selectedDate) {
+        setSelected(new Set());
+        setSelectedDate(importedDate);
+      } else {
+        // Same date — just refresh so the new card shows up.
+        load();
+      }
+      // Drop a transient highlight so the user can spot the import,
+      // especially after a date jump where the list otherwise looks
+      // unchanged. Cleared after 4s.
+      setHighlightId(meeting.id);
+      window.setTimeout(() => {
+        setHighlightId((curr) => (curr === meeting.id ? null : curr));
+      }, 4000);
+    } catch (err: any) {
+      const detail = err?.message || String(err);
+      alert(`Import failed:\n\n${detail}`);
+    } finally {
+      setImportBusy(false);
+    }
+  };
+
   return (
     <div className="h-full flex flex-col min-h-0">
       <div className="flex items-center gap-2 px-5 py-3 border-b border-gray-800/60">
@@ -236,6 +285,27 @@ export function MeetingLibrary({ activeMeetingId, refreshKey, onOpen, selectedId
           className="p-1.5 rounded-lg border border-gray-800 bg-gray-900/60 text-gray-300 hover:text-gray-100 hover:border-gray-700 transition-colors disabled:opacity-40"
         >
           <ChevronRight size={14} />
+        </button>
+
+        {/* Import audio file: ffmpeg-decoded → transcribed → summarized.
+            File picker is hidden; the visible button just delegates to it.
+            Disabled mid-import so a second file can't queue behind the
+            first (transcription holds the engine for tens of seconds). */}
+        <input
+          ref={importInputRef}
+          type="file"
+          accept=".opus,.ogg,.wav,.flac,.mp3,.m4a,.aac,.wma,.webm,.mp4,.mkv,.mov,audio/*,video/*"
+          className="hidden"
+          onChange={handleImportFile}
+        />
+        <button
+          onClick={handleImportClick}
+          disabled={importBusy || anyBusy}
+          title="Import an existing audio file as a new meeting"
+          className="flex items-center gap-1.5 px-2.5 py-1.5 text-xs rounded-lg border border-gray-800 bg-gray-900/60 text-gray-300 hover:text-gray-100 hover:border-gray-700 transition-colors disabled:opacity-40"
+        >
+          {importBusy ? <Loader size={12} className="animate-spin" /> : <Upload size={12} />}
+          {importBusy ? "Importing…" : "Import"}
         </button>
 
         <button
@@ -296,7 +366,7 @@ export function MeetingLibrary({ activeMeetingId, refreshKey, onOpen, selectedId
               m={m}
               active={m.id === activeMeetingId}
               selected={selected.has(m.id)}
-              highlighted={selectedId === m.id}
+              highlighted={selectedId === m.id || highlightId === m.id}
               processing={processingId === m.id}
               busy={cardBusy[m.id]}
               disabled={anyBusy}

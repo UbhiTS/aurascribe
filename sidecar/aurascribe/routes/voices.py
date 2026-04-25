@@ -128,9 +128,15 @@ async def update_voice(voice_id: str, req: VoicePatch) -> dict:
 
         new_name = req.name.strip() if req.name else None
         if new_name and new_name != old_name:
-            # Prevent collision with an existing voice.
+            # Case-insensitive collision check — voice tagging treats names
+            # case-insensitively (typing "bob" matches an existing "Bob"),
+            # so two rows that differ only in casing would just confuse
+            # downstream lookups. Renaming "Bob" → "BOB" is allowed (it's
+            # the same row, excluded by `id != ?`); "Bob" → "alice" is a
+            # collision when "Alice" already exists.
             cursor = await db.execute(
-                "SELECT id FROM voices WHERE name = ? AND id != ?", (new_name, voice_id)
+                "SELECT id FROM voices WHERE LOWER(name) = LOWER(?) AND id != ?",
+                (new_name, voice_id),
             )
             if await cursor.fetchone() is not None:
                 raise HTTPException(409, f"A voice named '{new_name}' already exists")

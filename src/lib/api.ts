@@ -558,19 +558,56 @@ export const api = {
       }),
     monitorStop: () =>
       request<{ ok: boolean }>("/meetings/monitor/stop", { method: "POST" }),
-    renameSpeaker: (meetingId: string, oldName: string, newName: string) =>
+    // `enrollUtteranceId` (provisional cluster fold only): enroll just that
+    // single anchor utterance's embedding into the target voice's pool.
+    // Without it, the cluster is relabeled for transcript display but no
+    // sample is added to the voice library — keeping "1 click = 1 sample".
+    renameSpeaker: (
+      meetingId: string,
+      oldName: string,
+      newName: string,
+      enrollUtteranceId?: string,
+    ) =>
       request<{ ok: boolean }>(`/meetings/${meetingId}/rename-speaker`, {
         method: "POST",
-        body: JSON.stringify({ meeting_id: meetingId, old_name: oldName, new_name: newName }),
+        body: JSON.stringify({
+          meeting_id: meetingId,
+          old_name: oldName,
+          new_name: newName,
+          enroll_utterance_id: enrollUtteranceId,
+        }),
       }),
-    assignSpeaker: (meetingId: string, utteranceId: string, speaker: string, createIfNew = true) =>
+    // `enroll=false` updates the speaker label without folding the embedding
+    // into the voice's pool. Used for the trailing utterances of a merged
+    // bubble where the user's single click should produce a single sample.
+    assignSpeaker: (
+      meetingId: string,
+      utteranceId: string,
+      speaker: string,
+      createIfNew = true,
+      enroll = true,
+    ) =>
       request<{ ok: boolean; speaker: string }>(
         `/meetings/${meetingId}/utterances/${utteranceId}/assign`,
         {
           method: "POST",
-          body: JSON.stringify({ speaker, create_if_new: createIfNew }),
+          body: JSON.stringify({ speaker, create_if_new: createIfNew, enroll }),
         },
       ),
+    // Import an audio file as a new completed meeting. The sidecar runs
+    // ffmpeg → 16 kHz mono Opus → transcribe + diarize → AI summary, then
+    // returns the new meeting's `started_at` so the library can navigate
+    // to its date (imported recordings keep their original timestamp via
+    // File.lastModified, so a week-old file appears at its real date).
+    importAudio: (file: File) => {
+      const fd = new FormData();
+      fd.append("file", file);
+      fd.append("last_modified_ms", String(file.lastModified || Date.now()));
+      return request<Meeting & { started_at: string }>("/meetings/import", {
+        method: "POST",
+        body: fd,
+      });
+    },
     delete: (id: string) =>
       request<{ ok: boolean }>(`/meetings/${id}`, { method: "DELETE" }),
     rename: (id: string, title: string) =>

@@ -4,17 +4,23 @@ speaker tagging, and full-meeting recompute.
 from __future__ import annotations
 
 import asyncio
+import logging
 import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
 
 import aiosqlite
 import numpy as np
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
 from aurascribe.audio.capture import MicUnavailableError
+from aurascribe.audio.ffmpeg import (
+    FFmpegFailedError,
+    FFmpegMissingError,
+    transcode_to_opus,
+)
 from aurascribe.config import AUDIO_DIR, DB_PATH
 from aurascribe.llm.client import LLMTruncatedError, LLMUnavailableError
 from aurascribe.routes._shared import (
@@ -23,6 +29,7 @@ from aurascribe.routes._shared import (
     delete_audio_files,
     delete_vault_files,
     fetch_meeting_row,
+    find_meeting_audio_file,
     get_or_create_voice,
     manager,
     normalize_meeting_row,
@@ -30,6 +37,7 @@ from aurascribe.routes._shared import (
     rename_with_vault_move,
     rewrite_vault,
     run_analysis,
+    sync_meeting_audio_filename,
 )
 
 router = APIRouter(prefix="/api/meetings")
@@ -121,6 +129,136 @@ async def monitor_start(req: MonitorStartRequest) -> dict:
 async def monitor_stop() -> dict:
     await manager.stop_monitor()
     return {"ok": True}
+
+
+# ── Audio file import ──────────────────────────────────────────────────────
+
+
+# Generous upper bound — a 4-hour 24 kbps Opus is ~40 MB, but users may
+# import lossless WAV (~700 MB/h). Anything bigger is almost certainly an
+# accident; rejecting early avoids streaming gigabytes to disk first.
+_IMPORT_MAX_BYTES = 2 * 1024 * 1024 * 1024  # 2 GB
+
+# All formats we'll accept. ffmpeg can decode far more than this; the
+# allow-list just guards against the user dropping random files (PDFs,
+# zips, jpegs) into the import dialog.
+_IMPORT_EXTENSIONS = (
+    ".opus", ".ogg", ".wav", ".flac", ".mp3", ".m4a", ".aac",
+    ".wma", ".webm", ".mp4", ".mkv", ".mov",
+)
+
+
+@router.post("/import")
+async def import_audio_file(
+    file: UploadFile = File(...),
+    last_modified_ms: int | None = Form(None),
+) -> dict:
+    """Import an audio (or video) file as a new completed meeting.
+
+    Pipeline: ffmpeg → 16 kHz mono Opus → meeting_manager.import_audio_file
+    → engine.transcribe → finalize. The finalize step writes the Obsidian
+    note, runs the AI summary (which may auto-rename the meeting), and
+    syncs the on-disk filename to "<uuid> - <title>.opus".
+
+    `last_modified_ms` (epoch milliseconds, taken from the browser's
+    File.lastModified on upload) becomes the meeting's `started_at` so
+    week-old recordings show up at their natural date in the library +
+    Daily Brief instead of clustering on today.
+    """
+    import tempfile
+
+    if not file.filename:
+        raise HTTPException(400, "Missing filename")
+    suffix = Path(file.filename).suffix.lower()
+    if suffix and suffix not in _IMPORT_EXTENSIONS:
+        raise HTTPException(
+            400,
+            f"Unsupported file extension '{suffix}'. Supported: "
+            + ", ".join(_IMPORT_EXTENSIONS),
+        )
+
+    # Title defaults to the filename stem; AI summary may refine it later.
+    title = (Path(file.filename).stem or "Imported Audio").strip() or "Imported Audio"
+
+    # started_at: prefer the upload's lastModified (so a recording made
+    # last Tuesday lands on Tuesday in the library); otherwise "now".
+    if last_modified_ms is not None and last_modified_ms > 0:
+        try:
+            started_at = datetime.fromtimestamp(
+                last_modified_ms / 1000.0
+            ).isoformat()
+        except (OverflowError, OSError, ValueError):
+            started_at = datetime.now().isoformat()
+    else:
+        started_at = datetime.now().isoformat()
+
+    tmp_dir = Path(tempfile.gettempdir())
+    upload_token = uuid.uuid4().hex
+    tmp_in = tmp_dir / f"aurascribe-import-{upload_token}{suffix or '.bin'}"
+    tmp_out = tmp_dir / f"aurascribe-import-{upload_token}.opus"
+
+    bytes_received = 0
+    try:
+        # Stream upload to disk in 1 MB chunks so we don't buffer the whole
+        # file in RAM. Reject early once we exceed the size limit.
+        with open(tmp_in, "wb") as out:
+            while True:
+                chunk = await file.read(1 << 20)
+                if not chunk:
+                    break
+                bytes_received += len(chunk)
+                if bytes_received > _IMPORT_MAX_BYTES:
+                    raise HTTPException(
+                        413,
+                        f"File exceeds {_IMPORT_MAX_BYTES // (1024 * 1024)} MB limit",
+                    )
+                out.write(chunk)
+
+        if bytes_received == 0:
+            raise HTTPException(400, "Uploaded file is empty")
+
+        # Transcode to canonical Opus. Raises if ffmpeg isn't installed
+        # or the input is unreadable.
+        try:
+            await transcode_to_opus(tmp_in, tmp_out)
+        except FFmpegMissingError as e:
+            raise HTTPException(503, str(e))
+        except FFmpegFailedError as e:
+            detail = str(e)
+            if e.stderr_tail:
+                detail += f" — ffmpeg said: {e.stderr_tail}"
+            raise HTTPException(400, detail)
+
+        # Hand off to the manager — it owns the meeting row, transcription,
+        # and finalize. import_audio_file moves tmp_out into AUDIO_DIR.
+        result = await manager.import_audio_file(
+            opus_src=tmp_out,
+            title=title,
+            started_at=started_at,
+            summarize=True,
+        )
+        return {**result, "started_at": started_at}
+
+    except HTTPException:
+        raise
+    except RuntimeError as e:
+        # Most likely "Models still loading" — surfaced to the UI as a
+        # retry-soon message.
+        raise HTTPException(503, str(e))
+    except Exception as e:
+        logging.getLogger("aurascribe").exception(
+            "Import failed for %s: %s", file.filename, e,
+        )
+        raise HTTPException(500, f"Import failed: {e}")
+    finally:
+        # tmp_in is always ours to delete; tmp_out is gone once
+        # import_audio_file succeeds (it gets moved into AUDIO_DIR).
+        for p in (tmp_in, tmp_out):
+            if p.exists():
+                try:
+                    p.unlink()
+                except Exception:
+                    pass
 
 
 # ── List / bulk delete / clear ──────────────────────────────────────────────
@@ -268,6 +406,10 @@ async def rename_meeting(meeting_id: str, req: RenameMeetingRequest) -> dict:
             "UPDATE meetings SET title = ?, title_locked = 1 WHERE id = ?",
             (req.title.strip(), meeting_id),
         )
+        # Keep the .opus filename in lock-step with the title — only fires
+        # when the meeting is no longer recording (the file is held open
+        # during capture, so the rename would either fail or just no-op).
+        await sync_meeting_audio_filename(db, meeting_id)
         await db.commit()
     if old_vault_path:
         old_file = Path(old_vault_path)
@@ -567,18 +709,26 @@ async def get_meeting_audio(meeting_id: str) -> FileResponse:
     if not row:
         raise HTTPException(404, "Meeting not found")
     audio_path_s = row[0]
-    # Fall back to the canonical location even if the DB row is missing
-    # an audio_path (e.g. the UPDATE raced a crash). The file is the truth.
-    candidates = [Path(audio_path_s)] if audio_path_s else []
-    candidates.append(AUDIO_DIR / f"{meeting_id}.opus")
-    for p in candidates:
-        if p.exists():
-            return FileResponse(
-                str(p),
-                media_type="audio/ogg",
-                filename=f"{meeting_id}.opus",
-            )
-    raise HTTPException(404, "No audio recorded for this meeting")
+
+    # Prefer the stored path; fall back to glob so renamed files (legacy
+    # "<uuid>.opus" or new "<uuid> - <title>.opus" if audio_path went
+    # stale after a rename / crash) still resolve.
+    p: Path | None = None
+    if audio_path_s:
+        candidate = Path(audio_path_s)
+        if candidate.exists():
+            p = candidate
+    if p is None:
+        p = find_meeting_audio_file(meeting_id)
+    if p is None:
+        raise HTTPException(404, "No audio recorded for this meeting")
+    # Download filename mirrors the on-disk name so the title shows up
+    # if the user saves the file from the audio element's context menu.
+    return FileResponse(
+        str(p),
+        media_type="audio/ogg",
+        filename=p.name,
+    )
 
 
 # ── Speaker rename / per-utterance assign ───────────────────────────────────
@@ -588,10 +738,103 @@ async def get_meeting_audio(meeting_id: str) -> FileResponse:
 # helpers live in _shared rather than inside voices.py.
 
 
+def _load_audio_slice_sync(
+    audio_path: Path, start_seconds: float, end_seconds: float
+) -> np.ndarray | None:
+    """Decode a slice of an .opus file to 16kHz float32 mono for pyannote.
+
+    Returns None if the file is missing or the slice is empty/invalid. Used
+    by the assign + rename endpoints to recover an embedding when the
+    utterance's stored embedding is None (pyannote attaches a chunk's
+    centroid to one turn per label, so follower turns have no sample).
+    """
+    import soundfile as sf
+
+    if not audio_path.exists():
+        return None
+    try:
+        info = sf.info(str(audio_path))
+    except Exception:
+        return None
+    sr = info.samplerate
+    # Pad slightly so pyannote's segmentation has enough context to land
+    # a valid embedding — its powerset segmentation can refuse to commit
+    # on a bare 1-2s clip with no surrounding silence.
+    pad = 0.5
+    s = max(0.0, start_seconds - pad)
+    e = min(float(info.frames) / sr, end_seconds + pad)
+    if e <= s:
+        return None
+    start_frame = int(s * sr)
+    frames = int((e - s) * sr)
+    if frames <= 0:
+        return None
+    try:
+        data, file_sr = sf.read(
+            str(audio_path), start=start_frame, frames=frames,
+            dtype="float32", always_2d=False,
+        )
+    except Exception:
+        return None
+    if data.size == 0:
+        return None
+    if data.ndim > 1:
+        data = data.mean(axis=1)
+    if file_sr != 16_000:
+        try:
+            from scipy.signal import resample_poly
+            g = np.gcd(file_sr, 16_000)
+            data = resample_poly(data, 16_000 // g, file_sr // g).astype(np.float32)
+        except Exception:
+            return None
+    return np.ascontiguousarray(data, dtype=np.float32)
+
+
+def _resolve_meeting_audio_path(meeting_id: str, stored_audio_path: str | None) -> Path | None:
+    """Resolve a meeting's on-disk recording. Tries the row's stored path
+    first, then falls back to a glob via `find_meeting_audio_file` so
+    renamed files (legacy UUID-only or current "<uuid> - <title>.opus")
+    still resolve. Returns None when nothing on disk matches."""
+    if stored_audio_path:
+        candidate = Path(stored_audio_path)
+        if candidate.exists():
+            return candidate
+    return find_meeting_audio_file(meeting_id)
+
+
+async def _recover_segment_embedding(
+    audio_path: Path | None,
+    audio_start: float | None,
+    duration: float,
+) -> bytes | None:
+    """Re-extract a fresh pyannote centroid for a single utterance from the
+    meeting's recording — used when utterances.embedding is None (pyannote
+    only attaches the chunk centroid to one turn per label, leaving follower
+    turns sample-less). Returns pickled bytes ready for voice_embeddings,
+    or None when the audio is missing / the slice is empty."""
+    if audio_path is None or audio_start is None or duration <= 0:
+        return None
+    loop = asyncio.get_running_loop()
+    audio = await loop.run_in_executor(
+        None, _load_audio_slice_sync, audio_path,
+        float(audio_start), float(audio_start) + float(duration),
+    )
+    if audio is None:
+        return None
+    return await manager.engine.extract_segment_embedding(audio)
+
+
 class RenameSpeakerRequest(BaseModel):
     meeting_id: str
     old_name: str
     new_name: str
+    # When provided AND `old_name` is a provisional cluster, only this single
+    # utterance's embedding is enrolled into the target voice's pool. Other
+    # utterances in the cluster are still relabeled for transcript display
+    # but contribute no samples — so "1 click = 1 sample" holds in the
+    # Voices page. None disables enrollment entirely (used for voice→voice
+    # renames and explicit display-only relabels).
+    enroll_utterance_id: str | None = None
 
 
 @router.post("/{meeting_id}/rename-speaker")
@@ -599,11 +842,14 @@ async def rename_speaker(meeting_id: str, req: RenameSpeakerRequest) -> dict:
     """Bulk-tag every pill in a cluster/name within one meeting to a Voice.
 
     Two modes:
-    - Provisional ("Speaker N") → Voice: create/find the Voice and fold
-      every matching utterance's embedding into its pool, then drop the
-      provisional label so new chunks match via the Voices matcher.
+    - Provisional ("Speaker N") → Voice: create/find the Voice and relabel
+      every utterance with that label, then drop the provisional cluster.
+      Enrollment is scoped to a single anchor utterance (`enroll_utterance_id`)
+      so the user's one click produces one sample, not N. The remaining
+      members of the cluster ride along with the rename for display only.
     - One Voice name → another (existing or new): cascades the rename
       through `utterances.speaker` and creates the target Voice if needed.
+      No enrollment — voice→voice renames don't manufacture new samples.
     """
     new_name = req.new_name.strip()
     if not new_name:
@@ -613,34 +859,69 @@ async def rename_speaker(meeting_id: str, req: RenameSpeakerRequest) -> dict:
 
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
-        voice_id = await get_or_create_voice(db, new_name)
+        # Case-insensitive: typing "me" or "ME" resolves to the existing "Me"
+        # voice. `canonical_new_name` is what we tag utterances with so the
+        # transcript pill reflects the voice's stored display name.
+        voice_id, canonical_new_name = await get_or_create_voice(db, new_name)
 
-        if is_provisional:
+        # Resolve the meeting's audio path up front — needed when we have to
+        # fall back to slice-based embedding extraction. Done inside the same
+        # connection so we avoid nesting another aiosqlite.connect mid-tx.
+        cursor = await db.execute(
+            "SELECT audio_path FROM meetings WHERE id = ?", (meeting_id,)
+        )
+        meeting_row = await cursor.fetchone()
+        audio_path = _resolve_meeting_audio_path(
+            meeting_id, meeting_row["audio_path"] if meeting_row else None,
+        )
+
+        if is_provisional and req.enroll_utterance_id:
+            # Enroll ONLY the user-clicked anchor — never the whole cluster.
+            # Re-tag-safe: drop any prior learning tied to this same utterance
+            # so retagging a mistake is lossless (matches the per-utterance
+            # /assign flow's behavior).
             cursor = await db.execute(
-                "SELECT id, embedding, start_time, end_time FROM utterances "
-                "WHERE meeting_id = ? AND speaker = ?",
-                (meeting_id, req.old_name),
+                "SELECT id, embedding, audio_start, start_time, end_time "
+                "FROM utterances "
+                "WHERE id = ? AND meeting_id = ? AND speaker = ?",
+                (req.enroll_utterance_id, meeting_id, req.old_name),
             )
-            matching = await cursor.fetchall()
+            anchor = await cursor.fetchone()
+            if anchor:
+                anchor_emb = anchor["embedding"]
+                # Stored embedding is None for "follower" turns within the
+                # same chunk-label — pyannote attached the centroid to the
+                # first turn only. Recover by re-extracting from audio.
+                if anchor_emb is None:
+                    duration = float(anchor["end_time"]) - float(anchor["start_time"])
+                    anchor_emb = await _recover_segment_embedding(
+                        audio_path, anchor["audio_start"], duration,
+                    )
+                if anchor_emb is not None:
+                    await db.execute(
+                        "DELETE FROM voice_embeddings WHERE utterance_id = ?",
+                        (req.enroll_utterance_id,),
+                    )
+                    await db.execute(
+                        "INSERT INTO voice_embeddings "
+                        "(id, voice_id, meeting_id, utterance_id, embedding, "
+                        " start_time, end_time, source, created_at) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, 'manual', ?)",
+                        (
+                            str(uuid.uuid4()), voice_id, meeting_id, anchor["id"],
+                            anchor_emb, anchor["start_time"], anchor["end_time"],
+                            datetime.now().isoformat(),
+                        ),
+                    )
 
-            now = datetime.now().isoformat()
-            for row in matching:
-                if row["embedding"] is None:
-                    continue
-                await db.execute(
-                    "INSERT INTO voice_embeddings "
-                    "(id, voice_id, meeting_id, utterance_id, embedding, "
-                    " start_time, end_time, source, created_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, 'manual', ?)",
-                    (
-                        str(uuid.uuid4()), voice_id, meeting_id, row["id"],
-                        row["embedding"], row["start_time"], row["end_time"], now,
-                    ),
-                )
-
+        # Cluster fold + voice→voice rename are both user-asserted: every
+        # affected utterance is now considered verified, so a future recompute
+        # won't silently flip it back. Tagging is the user's explicit ground
+        # truth — only auto-assigned labels remain unverified.
         await db.execute(
-            "UPDATE utterances SET speaker = ? WHERE meeting_id = ? AND speaker = ?",
-            (new_name, meeting_id, req.old_name),
+            "UPDATE utterances SET speaker = ?, verified = 1 "
+            "WHERE meeting_id = ? AND speaker = ?",
+            (canonical_new_name, meeting_id, req.old_name),
         )
         await db.execute(
             "UPDATE voices SET updated_at = ? WHERE id = ?",
@@ -653,12 +934,16 @@ async def rename_speaker(meeting_id: str, req: RenameSpeakerRequest) -> dict:
         manager.release_provisional_label(meeting_id, req.old_name)
     await manager.engine.reload_voices()
     await rewrite_vault(meeting_id)
-    return {"ok": True, "voice_id": voice_id}
+    return {"ok": True, "voice_id": voice_id, "speaker": canonical_new_name}
 
 
 class AssignUtteranceSpeakerRequest(BaseModel):
     speaker: str  # "" or "Unknown" clears the tag + removes learning
     create_if_new: bool = True
+    # When False, only update the speaker label — do NOT add this utterance's
+    # embedding to the voice's pool. Used for the trailing utterances of a
+    # merged display-bubble where one user click should produce one sample.
+    enroll: bool = True
 
 
 @router.post("/{meeting_id}/utterances/{utterance_id}/assign")
@@ -667,9 +952,9 @@ async def assign_utterance_speaker(
 ) -> dict:
     """Tag (or retag, or clear) one utterance.
 
-    Side-effect: folds this utterance's embedding into the Voice's pool.
-    Retagging first removes any prior learning tied to this utterance so
-    mistakes are fully undoable.
+    Side-effect (when `enroll=True`): folds this utterance's embedding into
+    the Voice's pool. Retagging first removes any prior learning tied to
+    this utterance so mistakes are fully undoable.
     """
     new_speaker = req.speaker.strip()
     is_clear = not new_speaker or new_speaker.lower() == "unknown"
@@ -677,7 +962,7 @@ async def assign_utterance_speaker(
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
-            "SELECT embedding, start_time, end_time FROM utterances "
+            "SELECT embedding, audio_start, start_time, end_time FROM utterances "
             "WHERE id = ? AND meeting_id = ?",
             (utterance_id, meeting_id),
         )
@@ -686,6 +971,16 @@ async def assign_utterance_speaker(
             raise HTTPException(404, "Utterance not found")
         embedding = row["embedding"]
 
+        # Resolve audio path inside this same connection so we don't have to
+        # nest another aiosqlite.connect when the slice-based fallback fires.
+        cursor = await db.execute(
+            "SELECT audio_path FROM meetings WHERE id = ?", (meeting_id,)
+        )
+        meeting_row = await cursor.fetchone()
+        audio_path = _resolve_meeting_audio_path(
+            meeting_id, meeting_row["audio_path"] if meeting_row else None,
+        )
+
         # Undo any prior learning from this utterance before applying the
         # new one — guarantees re-tagging mistakes is lossless.
         await db.execute(
@@ -693,32 +988,48 @@ async def assign_utterance_speaker(
             (utterance_id,),
         )
 
+        # Re-extract from audio when the live path didn't attach an embedding
+        # to this turn (pyannote stores the chunk centroid on one turn per
+        # label, so "follower" turns store None). Skipped when the request
+        # won't enroll anyway. Held inside the connection because we want
+        # the rest of this transaction to atomically include the new row.
+        if embedding is None and not is_clear and req.enroll:
+            duration = float(row["end_time"]) - float(row["start_time"])
+            embedding = await _recover_segment_embedding(
+                audio_path, row["audio_start"], duration,
+            )
+
         if is_clear:
+            # Even clearing-to-Unknown is a user-asserted choice; mark
+            # verified so recompute doesn't immediately re-tag it from a
+            # voice's pool the user already rejected.
             await db.execute(
-                "UPDATE utterances SET speaker = 'Unknown' WHERE id = ?",
+                "UPDATE utterances SET speaker = 'Unknown', verified = 1 "
+                "WHERE id = ?",
                 (utterance_id,),
             )
+            canonical_speaker = "Unknown"
         else:
-            # Find or create the Voice (always, so a tag with no embedding
-            # still registers the name and color).
+            # Case-insensitive existence probe — typing "me" or "ME" must
+            # not bypass the create_if_new=false guard when "Me" already
+            # exists. We then call get_or_create_voice to either reuse the
+            # existing row (returning its canonical display name) or create
+            # a new one with the user-typed casing.
             cursor = await db.execute(
-                "SELECT id FROM voices WHERE name = ?", (new_speaker,)
+                "SELECT id FROM voices WHERE LOWER(name) = LOWER(?)", (new_speaker,)
             )
             voice_row = await cursor.fetchone()
-            if voice_row is None:
-                if not req.create_if_new:
-                    raise HTTPException(
-                        400, f"Voice '{new_speaker}' not found and create_if_new=false"
-                    )
-                voice_id = await get_or_create_voice(db, new_speaker)
-            else:
-                voice_id = str(voice_row["id"])
+            if voice_row is None and not req.create_if_new:
+                raise HTTPException(
+                    400, f"Voice '{new_speaker}' not found and create_if_new=false"
+                )
+            voice_id, canonical_speaker = await get_or_create_voice(db, new_speaker)
 
             await db.execute(
-                "UPDATE utterances SET speaker = ? WHERE id = ?",
-                (new_speaker, utterance_id),
+                "UPDATE utterances SET speaker = ?, verified = 1 WHERE id = ?",
+                (canonical_speaker, utterance_id),
             )
-            if embedding is not None:
+            if embedding is not None and req.enroll:
                 await db.execute(
                     "INSERT INTO voice_embeddings "
                     "(id, voice_id, meeting_id, utterance_id, embedding, "
@@ -739,7 +1050,7 @@ async def assign_utterance_speaker(
 
     await manager.engine.reload_voices()
     await rewrite_vault(meeting_id)
-    return {"ok": True, "speaker": "Unknown" if is_clear else new_speaker}
+    return {"ok": True, "speaker": canonical_speaker}
 
 
 # ── Real-time intelligence refresh ──────────────────────────────────────────
@@ -807,9 +1118,13 @@ async def _do_recompute(meeting_id: str) -> dict:
             raise _RecomputeSkipped(400, "Cannot recompute a meeting that is still recording")
         audio_path_s = row["audio_path"]
 
-    candidates = [Path(audio_path_s)] if audio_path_s else []
-    candidates.append(AUDIO_DIR / f"{meeting_id}.opus")
-    audio_path = next((p for p in candidates if p.exists()), None)
+    audio_path: Path | None = None
+    if audio_path_s:
+        candidate = Path(audio_path_s)
+        if candidate.exists():
+            audio_path = candidate
+    if audio_path is None:
+        audio_path = find_meeting_audio_file(meeting_id)
     if audio_path is None:
         raise _RecomputeSkipped(400, "No audio recording found for this meeting")
 
@@ -829,9 +1144,13 @@ async def _do_recompute(meeting_id: str) -> dict:
 
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
+        # Only consider unverified utterances. User-asserted tags (verified=1
+        # set by the assign / rename-speaker / clear paths) are immutable
+        # ground truth — pyannote may disagree with them, but the user is
+        # the source of truth for the labels they've explicitly chosen.
         cursor = await db.execute(
             "SELECT id, audio_start, start_time, end_time FROM utterances "
-            "WHERE meeting_id = ? ORDER BY start_time",
+            "WHERE meeting_id = ? AND verified = 0 ORDER BY start_time",
             (meeting_id,),
         )
         utterances = await cursor.fetchall()
@@ -855,8 +1174,12 @@ async def _do_recompute(meeting_id: str) -> dict:
             if best_overlap <= 0.0:
                 best_speaker = "Unknown"
                 best_distance = None
+            # Defense-in-depth: re-check verified=0 in the UPDATE. Cheap, and
+            # protects against any future code path that might race with a
+            # concurrent tag landing during this loop.
             await db.execute(
-                "UPDATE utterances SET speaker = ?, match_distance = ? WHERE id = ?",
+                "UPDATE utterances SET speaker = ?, match_distance = ? "
+                "WHERE id = ? AND verified = 0",
                 (best_speaker, best_distance, u["id"]),
             )
             updated += 1

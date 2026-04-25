@@ -70,6 +70,12 @@ CREATE TABLE IF NOT EXISTS utterances (
     audio_start    REAL,
     embedding      BLOB,
     match_distance REAL,
+    -- 1 = the speaker label was user-asserted (tag/assign/cluster-fold/clear).
+    -- Recompute leaves these alone so a user's manual "Me" tag isn't silently
+    -- flipped back to "Unknown" by pyannote on the next run. Auto-assigned
+    -- live labels and provisional Speaker N stay 0 → recompute is free to
+    -- improve them.
+    verified       INTEGER NOT NULL DEFAULT 0,
     created_at     TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
@@ -139,7 +145,7 @@ CREATE INDEX IF NOT EXISTS idx_meetings_started_status
 # Bump this any time the SCHEMA block above changes shape. On mismatch,
 # `init_db` drops every table and recreates from scratch — see the
 # policy note at the top of this module.
-_CURRENT_SCHEMA_VERSION = "generic-vault-1"
+_CURRENT_SCHEMA_VERSION = "verified-utterances-1"
 
 
 async def init_db() -> None:
