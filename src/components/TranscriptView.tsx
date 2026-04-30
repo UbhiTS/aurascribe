@@ -74,10 +74,20 @@ function groupUtterances(utterances: Utterance[]): BubbleGroup[] {
   return groups;
 }
 
-function fmtTime(s: number): string {
-  const m = Math.floor(s / 60).toString().padStart(2, "0");
-  const sec = Math.floor(s % 60).toString().padStart(2, "0");
-  return `${m}:${sec}`;
+// Wall-clock time for the utterance pill. The server stores `started_at`
+// as a naive local ISO string (datetime.now().isoformat()), so adding the
+// offset and formatting via `toLocaleTimeString` yields the user's local
+// time without any UTC conversion. Falls back to mm:ss when we don't yet
+// have the meeting's start time (e.g. first paint before the metadata
+// fetch resolves).
+function fmtTime(offsetSec: number, startedAtIso: string | null): string {
+  if (!startedAtIso) {
+    const m = Math.floor(offsetSec / 60).toString().padStart(2, "0");
+    const sec = Math.floor(offsetSec % 60).toString().padStart(2, "0");
+    return `${m}:${sec}`;
+  }
+  const d = new Date(new Date(startedAtIso).getTime() + offsetSec * 1000);
+  return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hour12: false });
 }
 
 
@@ -105,6 +115,9 @@ export function TranscriptView({
   editable = false, onTrim, onSplit, refreshToken = 0,
 }: Props) {
   const [utterances, setUtterances] = useState<Utterance[]>([]);
+  // Meeting start (naive-local ISO from the server). Used by the pill's
+  // wall-clock formatter; null until the metadata fetch resolves.
+  const [startedAt, setStartedAt] = useState<string | null>(null);
   const [assignOpen, setAssignOpen] = useState<string | null>(null);
   const [toolsOpen, setToolsOpen] = useState<string | null>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
@@ -207,8 +220,11 @@ export function TranscriptView({
   }, [meetingId, stopPlayback]);
 
   useEffect(() => {
-    if (!meetingId) { setUtterances([]); return; }
-    api.meetings.get(meetingId).then((m) => setUtterances(m.utterances ?? []));
+    if (!meetingId) { setUtterances([]); setStartedAt(null); return; }
+    api.meetings.get(meetingId).then((m) => {
+      setUtterances(m.utterances ?? []);
+      setStartedAt(m.started_at ?? null);
+    });
   }, [meetingId, refreshToken]);
 
   useEffect(() => {
@@ -447,6 +463,7 @@ export function TranscriptView({
               isLast={i === groups.length - 1}
               canPlay={canPlay}
               isPlaying={isPlaying}
+              startedAt={startedAt}
               onTogglePlay={() => {
                 if (!canPlay || anchorId === undefined || g.audio_start == null) return;
                 playSegment(anchorId, g.audio_start, g.end_time - g.start_time);
@@ -502,13 +519,16 @@ interface BubbleProps {
   canPlay: boolean;
   isPlaying: boolean;
   onTogglePlay: () => void;
+  // Meeting start (naive-local ISO) — drives the wall-clock pill. Null while
+  // the meeting metadata fetch is in flight; the pill falls back to mm:ss.
+  startedAt: string | null;
 }
 
 function _Bubble({
   u, mine, color, voices, meetingRoster, selfSpeaker, assignOpen,
   onOpenAssign, onAssign,
   editable, toolsOpen, onOpenTools, onTrimBefore, onTrimAfter, onSplitHere,
-  isFirst, isLast, canPlay, isPlaying, onTogglePlay,
+  isFirst, isLast, canPlay, isPlaying, onTogglePlay, startedAt,
 }: BubbleProps) {
   const [voiceSearch, setVoiceSearch] = useState("");
   useEffect(() => {
@@ -545,10 +565,10 @@ function _Bubble({
                   : "border-transparent text-gray-600 hover:text-gray-200 hover:border-gray-700"}`}
             >
               {isPlaying ? <Pause size={9} /> : <Play size={9} />}
-              {fmtTime(u.start_time)}
+              {fmtTime(u.start_time, startedAt)}
             </button>
           ) : (
-            <span className="text-[10px] font-mono text-gray-600">{fmtTime(u.start_time)}</span>
+            <span className="text-[10px] font-mono text-gray-600">{fmtTime(u.start_time, startedAt)}</span>
           )}
           {editable && u.id !== undefined && (
             <div className="relative">
@@ -711,6 +731,7 @@ export const Bubble = memo(_Bubble, (prev, next) => {
     && prev.isLast === next.isLast
     && prev.canPlay === next.canPlay
     && prev.isPlaying === next.isPlaying
+    && prev.startedAt === next.startedAt
   );
 });
 
