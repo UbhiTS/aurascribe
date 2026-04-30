@@ -87,7 +87,9 @@ function fmtTime(offsetSec: number, startedAtIso: string | null): string {
     return `${m}:${sec}`;
   }
   const d = new Date(new Date(startedAtIso).getTime() + offsetSec * 1000);
-  return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hour12: false });
+  return d.toLocaleTimeString([], {
+    hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: true,
+  });
 }
 
 
