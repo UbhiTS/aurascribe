@@ -8,6 +8,7 @@ import { TranscriptView } from "../components/TranscriptView";
 import { TitleSuggestPopover } from "../components/TitleSuggestPopover";
 import { Avatar } from "../components/Avatar";
 import { avatarSrcFor, colorForSpeaker } from "../lib/speakerColors";
+import { fmtDateTime } from "../lib/time";
 
 interface Props {
   appStatus: AppStatus | null;
@@ -187,7 +188,7 @@ export function LiveFeed({
                 )}
                 {meeting?.started_at && (
                   <p className="text-xs text-gray-500 truncate mt-0.5">
-                    {new Date(meeting.started_at).toLocaleString()}
+                    {fmtDateTime(meeting.started_at)}
                   </p>
                 )}
               </div>

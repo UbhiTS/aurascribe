@@ -3,6 +3,7 @@ import { Clock, FileText, Loader, CheckSquare, Square, Trash2 } from "lucide-rea
 import { api, tagsPending } from "../lib/api";
 import type { Meeting } from "../lib/api";
 import { useEscapeKey } from "../lib/useEscapeKey";
+import { fmtClockTime } from "../lib/time";
 
 const PAGE_SIZE = 20;
 const DAY_OPTIONS = [1, 2, 3, 5, 7];
@@ -335,8 +336,8 @@ const MeetingRow = memo(function MeetingRow({
         </div>
         <div className="flex items-center gap-1 mt-0.5 text-xs text-gray-500">
           <Clock size={10} />
-          {m.started_at.slice(11, 16)}
-          {m.ended_at && ` – ${m.ended_at.slice(11, 16)}`}
+          {fmtClockTime(m.started_at)}
+          {m.ended_at && ` – ${fmtClockTime(m.ended_at)}`}
         </div>
       </button>
     </div>

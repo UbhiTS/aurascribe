@@ -7,6 +7,7 @@ import { api } from "../lib/api";
 import type { Utterance, Voice } from "../lib/api";
 import { Avatar } from "./Avatar";
 import { avatarSrcFor, colorForSpeaker, type SpeakerColor } from "../lib/speakerColors";
+import { fmtClockTime } from "../lib/time";
 
 // Distance threshold below which we consider a speaker match confident enough
 // to visually merge into the previous bubble. Empirically, same-speaker
@@ -74,22 +75,17 @@ function groupUtterances(utterances: Utterance[]): BubbleGroup[] {
   return groups;
 }
 
-// Wall-clock time for the utterance pill. The server stores `started_at`
-// as a naive local ISO string (datetime.now().isoformat()), so adding the
-// offset and formatting via `toLocaleTimeString` yields the user's local
-// time without any UTC conversion. Falls back to mm:ss when we don't yet
-// have the meeting's start time (e.g. first paint before the metadata
-// fetch resolves).
+// Wall-clock time for the utterance pill. Adds the utterance's offset to
+// the meeting's `started_at` and routes through the shared clock formatter
+// so the pill matches every other time render in the app. Falls back to
+// mm:ss while the meeting metadata fetch is still in flight.
 function fmtTime(offsetSec: number, startedAtIso: string | null): string {
   if (!startedAtIso) {
     const m = Math.floor(offsetSec / 60).toString().padStart(2, "0");
     const sec = Math.floor(offsetSec % 60).toString().padStart(2, "0");
     return `${m}:${sec}`;
   }
-  const d = new Date(new Date(startedAtIso).getTime() + offsetSec * 1000);
-  return d.toLocaleTimeString([], {
-    hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: true,
-  });
+  return fmtClockTime(new Date(new Date(startedAtIso).getTime() + offsetSec * 1000));
 }
 
 

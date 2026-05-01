@@ -7,6 +7,7 @@ import { TitleSuggestPopover } from "../components/TitleSuggestPopover";
 import { Avatar } from "../components/Avatar";
 import { avatarSrcFor, colorForSpeaker } from "../lib/speakerColors";
 import { useEscapeKey } from "../lib/useEscapeKey";
+import { fmtDateTime } from "../lib/time";
 
 interface Props {
   meeting: Meeting | null;
@@ -299,7 +300,7 @@ export function Review({
                 )}
                 {meeting.started_at && (
                   <p className="text-xs text-gray-500 truncate mt-0.5">
-                    {new Date(meeting.started_at).toLocaleString()}
+                    {fmtDateTime(meeting.started_at)}
                   </p>
                 )}
               </div>

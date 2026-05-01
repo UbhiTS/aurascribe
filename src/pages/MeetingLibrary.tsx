@@ -6,6 +6,8 @@ import {
 import { api } from "../lib/api";
 import type { Meeting } from "../lib/api";
 import { Avatar } from "../components/Avatar";
+import { fmtClockTime } from "../lib/time";
+import { useEscapeKey } from "../lib/useEscapeKey";
 
 interface Props {
   activeMeetingId: string | null;
@@ -37,6 +39,15 @@ export function MeetingLibrary({ activeMeetingId, refreshKey, onOpen, selectedId
   // meeting — gets a brief amber ring so the user can spot where their
   // import landed, especially when we auto-jump to a different date.
   const [highlightId, setHighlightId] = useState<string | null>(null);
+  // Pending delete confirmation. `single` carries the meeting whose card
+  // trash button was clicked (we keep the title for a personable prompt);
+  // `bulk` carries the snapshot of selected ids at the moment the toolbar
+  // Delete was clicked. Null when no modal is showing. Mirrors the
+  // sidebar's confirm pattern in MeetingList.tsx.
+  type ConfirmDelete =
+    | { kind: "single"; id: string; title: string }
+    | { kind: "bulk"; ids: string[] };
+  const [confirmDelete, setConfirmDelete] = useState<ConfirmDelete | null>(null);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -86,6 +97,15 @@ export function MeetingLibrary({ activeMeetingId, refreshKey, onOpen, selectedId
   }, [selected.size, selectableIds]);
 
   const anyBusy = bulkBusy !== null || Object.values(cardBusy).some(Boolean);
+  // True while a delete is in flight — used to prevent the modal closing
+  // mid-operation (Escape, click-outside, or Cancel button).
+  const deleteInFlight =
+    bulkBusy === "delete"
+    || Object.values(cardBusy).some((a) => a === "delete");
+  useEscapeKey(
+    () => setConfirmDelete(null),
+    confirmDelete !== null && !deleteInFlight,
+  );
 
   // Ref-backed re-entry guard. React state flips on the next render, so a
   // rapid double-click (or an event bubbling through both the card and its
@@ -94,16 +114,44 @@ export function MeetingLibrary({ activeMeetingId, refreshKey, onOpen, selectedId
   // across the whole page, period.
   const actionInFlight = useRef(false);
 
+  // The actual API hit for a single-card delete. Split out from the
+  // dispatcher below so the confirm modal can call it on user approval
+  // without re-routing through the action switch (which would pop the
+  // modal again on the next click).
+  const performSingleDelete = useCallback(async (id: string) => {
+    if (actionInFlight.current) return;
+    actionInFlight.current = true;
+    setCardBusy((p) => ({ ...p, [id]: "delete" }));
+    try {
+      await api.meetings.delete(id);
+      setMeetings((m) => m.filter((x) => x.id !== id));
+      setSelected((s) => { const n = new Set(s); n.delete(id); return n; });
+    } catch {
+      // swallow; a future toast system can surface this
+    } finally {
+      setCardBusy((p) => {
+        const next = { ...p };
+        delete next[id];
+        return next;
+      });
+      actionInFlight.current = false;
+      setConfirmDelete(null);
+    }
+  }, []);
+
   const handleCardAction = useCallback(async (id: string, action: CardAction) => {
+    // Delete is destructive — route through the confirm modal instead of
+    // hitting the API immediately. The other actions stay synchronous.
+    if (action === "delete") {
+      const m = meetings.find((x) => x.id === id);
+      setConfirmDelete({ kind: "single", id, title: m?.title ?? "this meeting" });
+      return;
+    }
     if (actionInFlight.current) return;
     actionInFlight.current = true;
     setCardBusy((p) => ({ ...p, [id]: action }));
     try {
-      if (action === "delete") {
-        await api.meetings.delete(id);
-        setMeetings((m) => m.filter((x) => x.id !== id));
-        setSelected((s) => { const n = new Set(s); n.delete(id); return n; });
-      } else if (action === "recompute") {
+      if (action === "recompute") {
         await api.meetings.recompute(id);
         // No visible row change from recompute — skip refetch.
       } else if (action === "summarize") {
@@ -120,7 +168,7 @@ export function MeetingLibrary({ activeMeetingId, refreshKey, onOpen, selectedId
       });
       actionInFlight.current = false;
     }
-  }, []);
+  }, [meetings]);
 
   // Order the current selection newest-first by started_at so the bulk
   // loop processes the most recent meeting first and works backwards —
@@ -133,21 +181,31 @@ export function MeetingLibrary({ activeMeetingId, refreshKey, onOpen, selectedId
       .map((m) => m.id);
   }, [meetings, selected]);
 
-  const handleBulkDelete = useCallback(async () => {
+  // Open the confirm modal with a snapshot of the current selection. The
+  // ids are captured here so the user can keep clicking around while the
+  // modal is up without changing what gets deleted on confirm.
+  const handleBulkDelete = useCallback(() => {
     if (actionInFlight.current) return;
     const ids = orderedSelection();
     if (!ids.length) return;
+    setConfirmDelete({ kind: "bulk", ids });
+  }, [orderedSelection]);
+
+  const performBulkDelete = useCallback(async (ids: string[]) => {
+    if (actionInFlight.current || !ids.length) return;
     actionInFlight.current = true;
     setBulkBusy("delete");
     try {
       await api.meetings.bulkDelete(ids);
-      setMeetings((m) => m.filter((x) => !selected.has(x.id)));
+      const idSet = new Set(ids);
+      setMeetings((m) => m.filter((x) => !idSet.has(x.id)));
       setSelected(new Set());
     } finally {
       setBulkBusy(null);
       actionInFlight.current = false;
+      setConfirmDelete(null);
     }
-  }, [selected, orderedSelection]);
+  }, []);
 
   const handleBulkRecompute = useCallback(async () => {
     if (actionInFlight.current) return;
@@ -377,6 +435,63 @@ export function MeetingLibrary({ activeMeetingId, refreshKey, onOpen, selectedId
           ))}
         </div>
       </div>
+
+      {/* ── Delete confirmation modal ────────────────────────────────────────
+          Same dialog UX as the sidebar's MeetingList — fixed-position
+          backdrop, single Cancel/Delete button row. The destructive button
+          stays enabled while the API request is in flight (showing
+          "Deleting…") so the user can see progress; Cancel disables to
+          prevent racing with the in-flight request. */}
+      {confirmDelete !== null && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm">
+          <div className="bg-gray-900 border border-gray-700 rounded-xl shadow-2xl p-5 w-80">
+            {confirmDelete.kind === "single" ? (
+              <>
+                <h3 className="text-sm font-semibold text-gray-100 mb-1">
+                  Delete this meeting?
+                </h3>
+                <p className="text-xs text-gray-400 mb-4 leading-relaxed">
+                  <span className="text-gray-200">"{confirmDelete.title}"</span>{" "}
+                  will be removed, along with its audio recording and Obsidian
+                  vault file. This cannot be undone.
+                </p>
+              </>
+            ) : (
+              <>
+                <h3 className="text-sm font-semibold text-gray-100 mb-1">
+                  Delete {confirmDelete.ids.length} meeting{confirmDelete.ids.length !== 1 ? "s" : ""}?
+                </h3>
+                <p className="text-xs text-gray-400 mb-4 leading-relaxed">
+                  Their audio recordings and Obsidian vault files will be
+                  removed too. This cannot be undone.
+                </p>
+              </>
+            )}
+            <div className="flex gap-2 justify-end">
+              <button
+                onClick={() => setConfirmDelete(null)}
+                disabled={deleteInFlight}
+                className="px-3 py-1.5 text-xs text-gray-400 hover:text-gray-200 rounded-lg hover:bg-gray-800 transition-colors disabled:opacity-50"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={() => {
+                  if (confirmDelete.kind === "single") {
+                    void performSingleDelete(confirmDelete.id);
+                  } else {
+                    void performBulkDelete(confirmDelete.ids);
+                  }
+                }}
+                disabled={deleteInFlight}
+                className="px-3 py-1.5 text-xs bg-red-600 hover:bg-red-700 disabled:opacity-50 text-white rounded-lg transition-colors"
+              >
+                {deleteInFlight ? "Deleting…" : "Delete"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -427,7 +542,7 @@ const MeetingCard = memo(function MeetingCard({
       </div>
       <div className="flex items-center gap-1 text-[11px] text-gray-500 mt-0.5">
         <Clock size={10} />
-        {m.started_at.slice(11, 16)}{m.ended_at && ` – ${m.ended_at.slice(11, 16)}`}
+        {fmtClockTime(m.started_at)}{m.ended_at && ` – ${fmtClockTime(m.ended_at)}`}
         <span className="mx-1">·</span>
         {m.started_at.slice(0, 10)}
       </div>
