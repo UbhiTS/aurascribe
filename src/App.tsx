@@ -147,8 +147,23 @@ export default function App() {
         if (s.auto_capture) setAutoCaptureState(s.auto_capture);
         if (s.engine_ready) {
           isReady = true;
-          setSystemStatus((prev) => (prev === "loading" ? "ready" : prev));
-          setStatusMessage((prev) => (prev === "Loading models..." ? "" : prev));
+          // A green poll clears the initial "loading" splash AND any
+          // sticky "error" pill from a previous failed poll. We only flip
+          // those two — never overwrite "recording" / "processing" / "done"
+          // states pushed from the sidecar over WS, which would erase
+          // legitimate in-progress UI state every 30s. Without the
+          // `error → ready` transition, a single dropped tick (laptop
+          // sleep, dev rebuild blip, network hiccup) leaves "Sidecar
+          // unreachable" on screen forever even though every subsequent
+          // poll succeeds and transcription is fine.
+          setSystemStatus((prev) =>
+            prev === "loading" || prev === "error" ? "ready" : prev,
+          );
+          setStatusMessage((prev) =>
+            prev === "Loading models..." || prev === "Sidecar unreachable" || prev.startsWith("Sidecar failed to start")
+              ? ""
+              : prev,
+          );
         }
       } catch {
         // Request failed — sidecar not up yet (startup) or crashed (post-ready).
